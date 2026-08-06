@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="{{ language }}">
+<html lang="fr">
 <head>
 <!-- Google tag (gtag.js) -->
 <script async src="https://www.googletagmanager.com/gtag/js?id=G-1KEG5BVF12"></script>
@@ -13,19 +13,19 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 
-<title>{{ article.title }}</title>
-<meta name="description" content="{{ article.description }}">
+<title>Actualités de Lyon : Meurtres, Canicules et Sport</title>
+<meta name="description" content="Découvrez les dernières actualités concernant la ville de Lyon, incluant des affaires criminelles, l&#39;impact des canicules sur l&#39;économie locale et les performances du club de football local.">
 
-<link rel="canonical" href="{{ site_url }}/trends/{{ article.slug }}.html">
+<link rel="canonical" href="https://trendcurrent-fr.pages.dev/trends/lyon.html">
 
 <meta property="og:type" content="article">
-<meta property="og:title" content="{{ article.title }}">
-<meta property="og:description" content="{{ article.description }}">
-<meta property="og:url" content="{{ site_url }}/trends/{{ article.slug }}.html">
+<meta property="og:title" content="Actualités de Lyon : Meurtres, Canicules et Sport">
+<meta property="og:description" content="Découvrez les dernières actualités concernant la ville de Lyon, incluant des affaires criminelles, l&#39;impact des canicules sur l&#39;économie locale et les performances du club de football local.">
+<meta property="og:url" content="https://trendcurrent-fr.pages.dev/trends/lyon.html">
 
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="{{ article.title }}">
-<meta name="twitter:description" content="{{ article.description }}">
+<meta name="twitter:title" content="Actualités de Lyon : Meurtres, Canicules et Sport">
+<meta name="twitter:description" content="Découvrez les dernières actualités concernant la ville de Lyon, incluant des affaires criminelles, l&#39;impact des canicules sur l&#39;économie locale et les performances du club de football local.">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -313,10 +313,10 @@ font-size:17px;
 {
 "@context":"https://schema.org",
 "@type":"Article",
-"headline":"{{ article.title }}",
-"description":"{{ article.description }}",
-"url":"{{ site_url }}/trends/{{ article.slug }}.html",
-"inLanguage":"{{ language }}"
+"headline":"Actualités de Lyon : Meurtres, Canicules et Sport",
+"description":"Découvrez les dernières actualités concernant la ville de Lyon, incluant des affaires criminelles, l&#39;impact des canicules sur l&#39;économie locale et les performances du club de football local.",
+"url":"https://trendcurrent-fr.pages.dev/trends/lyon.html",
+"inLanguage":"fr"
 }
 </script>
 
@@ -338,7 +338,7 @@ font-size:17px;
 
 <div class="hero-inner">
 
-<h1>{{ article.h1 }}</h1>
+<h1>Actualités de Lyon : Meurtres, Canicules et Sport</h1>
 
 <div class="meta">
 
@@ -346,7 +346,7 @@ font-size:17px;
 
 <span>•</span>
 
-<span>{{ language|upper }}</span>
+<span>FR</span>
 
 </div>
 
@@ -358,39 +358,63 @@ font-size:17px;
 
 <article class="article">
 
-{% if article.intro %}
-<p class="intro">{{ article.intro }}</p>
-{% endif %}
 
-{% for section in article.sections %}
+<p class="intro">La ville de Lyon fait face à une série d&#39;événements marquants cette semaine. Une tragédie impliquant la mort d&#39;une enfant a ému toute la communauté locale tandis que les boutiques et terrasses se vidaient en raison des canicules récurrentes. Parallèlement, l&#39;Olympique Lyonnais est engagé dans une série de matchs cruciaux pour espérer atteindre les barrages de la Ligue des Champions.</p>
+
+
+
 
 <section>
 
-<h2>{{ section.title }}</h2>
+<h2>Une enfant de trois ans retrouvée morte</h2>
 
-<p>{{ section.text }}</p>
+<p>Une tragédie a frappé Lyon cette semaine avec le décès d&#39;une petite fille de trois ans. Sa mère a été placée en garde à vue par les autorités, marquant un moment difficile pour la communauté locale.</p>
 
 </section>
 
-{% endfor %}
 
-{% if article.faq %}
 
-<h2>Questions fréquentes</h2>
+<section>
 
-{% for item in article.faq %}
+<h2>Impact des canicules sur l&#39;économie</h2>
 
-<div class="faq">
+<p>Les boutiques et terrasses lyonnaises ont connu une baisse significative de leur fréquentation en raison des vagues successives de chaleur. Les commerçants se plaignent d&#39;avoir très peu de clients, soulignant les défis économiques liés aux canicules.</p>
 
-<h3>{{ item.q }}</h3>
+</section>
 
-<p>{{ item.a }}</p>
 
-</div>
 
-{% endfor %}
+<section>
 
-{% endif %}
+<h2>Incendie dans un bois près de Lyon</h2>
+
+<p>Un incendie a ravagé une partie d&#39;un bois situé à proximité de Lyon. Les pompiers ont immédiatement réagi pour tenter de maîtriser le feu, soulignant l&#39;importance des interventions rapides en cas de catastrophe naturelle.</p>
+
+</section>
+
+
+
+<section>
+
+<h2>Lyon s&#39;incline face au Sparta Prague</h2>
+
+<p>Dans le cadre du troisième tour préliminaire aller de la Ligue des Champions, Lyon a subi une défaite 2-1 contre le Sparta Prague. Cette défaite complique les chances du club pour atteindre les barrages, nécessitant un retour victorieux lors du match retour.</p>
+
+</section>
+
+
+
+<section>
+
+<h2>Violence politique et enquête</h2>
+
+<p>Une enquête est en cours sur la mort de Quentin Deranque à Lyon. Cette affaire soulève des questions sur la violence politique dans la région, mettant en lumière les défis auxquels la société locale doit faire face.</p>
+
+</section>
+
+
+
+
 
 <a class="back" href="/">← Retour à l’accueil</a>
 

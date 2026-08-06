@@ -13,7 +13,7 @@ LANGUAGE = "fr"
 MODEL = "qwen2.5:14b"
 
 # Website
-SITE_NAME = "Trending France"
+SITE_NAME = "Tendances en France"
 SITE_URL = "https://trendcurrent-fr.pages.dev"
 
 # Directories
