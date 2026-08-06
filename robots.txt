@@ -1,0 +1,4 @@
+User-agent 
+Allow 
+
+Sitemap httpstrendcurrent-fr.pages.devsitemap.xml

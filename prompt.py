@@ -45,6 +45,13 @@ RÈGLES STRICTES :
 - Ne complète jamais les informations manquantes par des suppositions.
 - Si une information n'est pas clairement confirmée, omets-la ou indique explicitement qu'elle n'est pas confirmée.
 - Supprime les informations répétées.
+- Si le sujet concerne un événement sportif ou un match à venir, rédige un aperçu factuel du match en utilisant EXCLUSIVEMENT les informations fournies par les articles Google Actualités.
+- Indique la date et l'heure du match uniquement si elles sont explicitement mentionnées dans les sources.
+- Explique la compétition ou le tournoi uniquement si cette information figure dans les sources.
+- Résume les dernières informations confirmées concernant les deux équipes ou les participants.
+- Explique pourquoi l'événement est important uniquement à partir des informations confirmées présentes dans les sources.
+- Ne fais jamais de pronostic, ne prédis jamais le résultat, le vainqueur ou le score.
+- N'ajoute jamais de statistiques, d'informations historiques ou de détails sur les joueurs s'ils ne figurent pas explicitement dans les articles fournis.
 
 - Les noms de personnes ne doivent jamais être traduits, modifiés ou corrigés.
 - Les noms des clubs ne doivent jamais être traduits, modifiés ou corrigés.
