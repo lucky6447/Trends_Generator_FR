@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-1KEG5BVF12"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-1KEG5BVF12');
+</script>
+<meta name="robots" content="index,follow">
+<meta name="author" content="{{ site_name }}">
+<meta name="theme-color" content="#2563eb">
+<meta name="format-detection" content="telephone=no">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ site_name }} | Tendances actuelles de la France et du monde</title>
+<meta name="description" content="Découvrez les dernières tendances de la France et du monde entier. Notre IA analyse les sujets d’actualité en temps réel et génère automatiquement des articles informatifs de haute qualité.">
+<meta name="keywords" content="tendances actuelles, sujets tendance, actualités tendance, IA, analyse des tendances, sujets viraux, France, tendances mondiales">
+<meta property="og:title" content="{{ site_name }} | Tendances actuelles de la France et du monde">
+<meta property="og:description" content="Découvrez les principaux sujets tendance grâce à des analyses alimentées par l’IA en temps réel.">
+<meta name="twitter:title" content="{{ site_name }} | Tendances actuelles de la France et du monde">
+<meta name="twitter:description" content="Tendances actuelles et analyses IA en temps réel.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#08111f;--card:#0f1b2d;--text:#f3f6ff;--muted:#95a6c7;--primary:#3b82f6}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,sans-serif;background:linear-gradient(180deg,#08111f,#0b1526 45%,#09111d);color:var(--text)}
+header{
+    background:radial-gradient(circle at top,#365dff 0%,#203caa 45%,#111b58 100%);
+    color:#fff;
+    padding:70px 20px 90px;
+    text-align:center;
+    position:relative;
+    overflow:visible;
+    z-index:1000;
+}
+header h1{font-size:54px;margin:0 0 14px}
+header p{max-width:760px;margin:auto;font-size:20px;opacity:.95}
+.stats{
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+    gap:18px;
+    max-width:1100px;
+    margin:65px auto 40px;
+    padding:0 20px;
+    position:relative;
+    z-index:1;
+}.stat{background:#101b2d;border:1px solid rgba(75,130,255,.25);border-radius:18px;padding:22px;text-align:center;box-shadow:0 15px 35px rgba(0,0,0,.35)}
+.container{max-width:1200px;margin:auto;padding:0 20px 70px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:24px}
+.card{display:block;text-decoration:none;color:inherit;background:#0f1b2d;border:1px solid rgba(75,130,255,.2);border-radius:20px;padding:24px;box-shadow:0 18px 45px rgba(0,0,0,.35);transition:.25s}
+.card:hover{transform:translateY(-8px);border-color:#4f8cff;box-shadow:0 25px 55px rgba(59,130,246,.28)}
+.card h2{margin:0 0 12px;font-size:24px}
+.date{color:var(--muted);font-size:14px;margin-bottom:12px}
+.btn{display:inline-block;margin-top:10px;color:var(--primary);font-weight:700}
+.pagination{display:flex;justify-content:center;align-items:center;gap:24px;margin:40px 0}
+.pagination a{color:var(--primary);font-weight:700;text-decoration:none;font-size:18px}
+.pagination a:hover{text-decoration:underline}
+footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1px solid rgba(255,255,255,.08)}
+@media(max-width:768px){header h1{font-size:36px}header p{font-size:17px}}
+</style>
+</head>
+<body>
+<header>
+<h1>{{ site_name }}</h1>
+<p>Découvrez les principales tendances de la France et du monde. Notre IA analyse en continu des sources fiables et crée automatiquement des articles de grande qualité, clairs et faciles à comprendre, en temps réel.</p>
+
+<style>
+.search-hero{max-width:1100px;margin:0 auto;padding:0 20px;position:relative;z-index:20;transform:translateY(30px)}
+.search-hero input{width:100%;height:60px;padding:0 20px 0 56px;border:1px solid #2d5cff;border-radius:18px;font-size:17px;background:#111c2d;color:#fff;box-shadow:0 0 0 1px rgba(59,130,246,.25),0 15px 40px rgba(0,0,0,.35);outline:none;transition:.2s}
+.search-hero input:focus{border-color:#5da2ff;box-shadow:0 0 20px rgba(59,130,246,.45)}
+.search-hero:before{content:"🔍";position:absolute;left:38px;top:50%;transform:translateY(-50%);font-size:20px;opacity:.65;pointer-events:none}
+#search-results{
+    position:absolute;
+    left:20px;
+    right:20px;
+    top:66px;
+    background:#13233a;
+    border:1px solid rgba(59,130,246,.25);
+    border-radius:14px;
+    overflow-y:auto;
+    max-height:420px;
+    z-index:99999;
+    box-shadow:0 16px 40px rgba(0,0,0,.45);
+}
+@media(max-width:768px){
+.search-hero{transform:translateY(20px);padding:0 16px}
+.search-hero input{height:54px;font-size:16px;border-radius:14px;padding-left:50px}
+.search-hero:before{left:32px;font-size:18px}
+#search-results{left:16px;right:16px}
+}
+
+</style>
+<div class="search-hero">
+<input id="global-search" type="search" placeholder="Rechercher dans tous les articles…">
+<div id="search-results"></div>
+</div>
+</header>
+
+<section class="stats">
+<div class="stat"><strong>📰 24/7</strong><br>Surveillance</div>
+<div class="stat"><strong>📈 Live</strong><br>Tendances mondiales</div>
+<div class="stat"><strong>🤖 AI</strong><br>Analyse automatique</div>
+<div class="stat"><strong>⚡ 24/7</strong><br>Mise à jour continue</div>
+</section>
+
+<div class="container">
+<div class="grid">
+{% for article in articles %}
+<a class="card" href="{{ article.url }}">
+<div class="date">{{ article.updated }}</div>
+<h2>{{ article.title }}</h2>
+{% if article.description %}<p>{{ article.description }}</p>{% endif %}
+<span class="btn">Lire la suite →</span>
+</a>
+{% endfor %}
+</div>
+</div>
+
+<div class="pagination">
+{% if page_number > 1 %}
+<a href="../">← Retour</a>
+{% endif %}
+{% if articles|length == 20 %}
+<a href="/page/{{ page_number + 1 }}/">Suivant →</a>
+{% endif %}
+</div>
+
+<footer>
+© {{ site_name }} est un portail d’actualités moderne alimenté par l’intelligence artificielle, proposant les dernières informations, les Google Trends et des analyses approfondies des sujets les plus recherchés en France et dans le monde. Notre technologie intelligente analyse en permanence les évolutions de l’actualité, évalue des sources fiables et génère des articles clairs, précis et régulièrement mis à jour. Les lecteurs accèdent rapidement à des informations fiables sur la politique, l’économie, le sport, la technologie, le divertissement, la santé et bien d’autres domaines. Tous les contenus sont continuellement vérifiés et enrichis automatiquement dès que de nouvelles informations sont disponibles. © 2026 TrendCurrent.
+</footer>
+
+<script>
+(async function(){
+const input=document.getElementById('global-search');
+const box=document.getElementById('search-results');
+if(!input||!box)return;
+let data=[];
+try{
+    data=await fetch('search.json').then(r=>r.json());
+}catch(e){
+    console.error(e);
+}
+function render(items){
+    box.innerHTML='';
+    if(!items.length){
+        box.style.display='none';
+        return;
+    }
+    items.slice(0,10).forEach(it=>{
+        const a=document.createElement('a');
+        a.href=it.url||it.link||'#';
+        a.innerHTML='<div style="font-weight:700">'+(it.title||'')+'</div>'+(it.description?'<div style="font-size:13px;color:#b8c7e8;margin-top:4px">'+it.description+'</div>':'');
+        a.style.display='block';
+        a.style.padding='12px 14px';
+        a.style.textDecoration='none';
+        a.style.borderBottom='1px solid rgba(255,255,255,.08)';
+        a.style.color='#f3f6ff';
+        a.style.background='#13233a';
+        a.onmouseenter=()=>a.style.background='#1c3152';
+        a.onmouseleave=()=>a.style.background='#13233a';
+        box.appendChild(a);
+    });
+    box.style.display='block';
+}
+input.addEventListener('input',()=>{
+    const q=input.value.trim().toLowerCase();
+    if(!q){
+        box.style.display='none';
+        return;
+    }
+    const res=data.filter(x=>((x.title||'')+' '+(x.description||'')).toLowerCase().includes(q));
+    render(res);
+});
+document.addEventListener('click',e=>{
+    if(!box.contains(e.target)&&e.target!==input){
+        box.style.display='none';
+    }
+});
+input.addEventListener('keydown',e=>{
+    if(e.key==='Enter'){
+        const a=box.querySelector('a');
+        if(a){
+            location.href=a.href;
+        }
+    }
+});
+})();
+</script>
+
+</body>
+</html>
