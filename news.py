@@ -60,8 +60,7 @@ def extract_article(url):
 def filter_similar_articles(articles):
     """
     Group Google News results by shared keywords and keep only the
-    dominant cluster. Falls back to the original list if no clear
-    dominant cluster exists.
+    dominant cluster. Skip the trend if no clear dominant cluster exists.
     """
     if len(articles) < 5:
         return []
@@ -75,7 +74,6 @@ def filter_similar_articles(articles):
     }
 
     token_sets = []
-
     for article in articles:
         tokens = {
             t for t in re.findall(r"[a-zA-Z0-9]+", article["title"].lower())
@@ -88,27 +86,20 @@ def filter_similar_articles(articles):
     for idx, tokens in enumerate(token_sets):
         placed = False
         for group in groups:
-            common = len(tokens & group["tokens"])
-            if common >= 2:
+            if len(tokens & group["tokens"]) >= 2:
                 group["items"].append(idx)
                 group["tokens"] |= tokens
                 placed = True
                 break
         if not placed:
-            groups.append({"items":[idx], "tokens":set(tokens)})
+            groups.append({"items": [idx], "tokens": set(tokens)})
 
     largest = max(groups, key=lambda g: len(g["items"]))
 
     if len(largest["items"]) < 3:
-        return articles
+        return []
 
-    filtered = [articles[i] for i in largest["items"]]
-
-    if len(filtered) < 5:
-        return articles[:5]
-
-    return filtered
-
+    return [articles[i] for i in largest["items"]]
 
 def fetch_news(query, limit=10):
 
