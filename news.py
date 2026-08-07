@@ -101,7 +101,7 @@ def filter_similar_articles(articles):
 
     return [articles[i] for i in largest["items"]]
 
-def fetch_news(query, limit=10):
+def fetch_news(query, limit=20):
 
     url = (
         "https://news.google.com/rss/search?"

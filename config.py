@@ -14,7 +14,7 @@ MODEL = "qwen2.5:14b"
 
 # Website
 SITE_NAME = "Tendances en France"
-SITE_URL = "https://trendcurrent-fr.pages.dev"
+SITE_URL = "https://fr.trendcurrent.today/"
 
 # Directories
 TREND_DIR = ROOT / "trends"
