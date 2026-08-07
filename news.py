@@ -2,6 +2,7 @@ import re
 import feedparser
 import requests
 import trafilatura
+from concurrent.futures import ThreadPoolExecutor
 
 from collections import Counter
 from urllib.parse import quote_plus
@@ -57,45 +58,54 @@ def extract_article(url):
 
 
 def filter_similar_articles(articles):
-
+    """
+    Group Google News results by shared keywords and keep only the
+    dominant cluster. Falls back to the original list if no clear
+    dominant cluster exists.
+    """
     if len(articles) < 5:
         return []
 
-    words = []
-
-    for article in articles:
-
-        tokens = re.findall(
-            r"[a-zA-Z0-9]+",
-            article["title"].lower()
-        )
-
-        tokens = [
-            t for t in tokens
-            if len(t) > 3
-        ]
-
-        words.extend(tokens)
-
-    common = Counter(words)
-
-    keywords = {
-        word
-        for word, count in common.items()
-        if count >= 3
+    stopwords = {
+        "the","and","for","with","from","this","that","into","about",
+        "der","die","das","und","mit","von","den","des","ein","eine",
+        "il","lo","la","gli","le","dei","della","delle","del","con",
+        "el","los","las","del","para","una","uno","por","como",
+        "le","les","des","une","dans","avec","pour","sur","aux","est"
     }
 
-    filtered = []
+    token_sets = []
 
     for article in articles:
+        tokens = {
+            t for t in re.findall(r"[a-zA-Z0-9]+", article["title"].lower())
+            if len(t) > 3 and t not in stopwords
+        }
+        token_sets.append(tokens)
 
-        title = article["title"].lower()
+    groups = []
 
-        if any(word in title for word in keywords):
-            filtered.append(article)
+    for idx, tokens in enumerate(token_sets):
+        placed = False
+        for group in groups:
+            common = len(tokens & group["tokens"])
+            if common >= 2:
+                group["items"].append(idx)
+                group["tokens"] |= tokens
+                placed = True
+                break
+        if not placed:
+            groups.append({"items":[idx], "tokens":set(tokens)})
+
+    largest = max(groups, key=lambda g: len(g["items"]))
+
+    if len(largest["items"]) < 3:
+        return articles
+
+    filtered = [articles[i] for i in largest["items"]]
 
     if len(filtered) < 5:
-        return []
+        return articles[:5]
 
     return filtered
 
@@ -112,26 +122,30 @@ def fetch_news(query, limit=10):
 
     feed = feedparser.parse(url)
 
-    articles = []
+    items = feed.entries[:limit]
 
-    for item in feed.entries[:limit]:
+    prepared = []
 
+    for item in items:
         source = ""
-
         if hasattr(item, "source"):
             source = clean(item.source.get("title"))
 
-        link = clean(item.get("link"))
-
-        content = extract_article(link)
-
-        articles.append({
+        prepared.append({
             "title": clean(item.get("title")),
             "summary": clean(item.get("summary")),
-            "content": content,
             "source": source,
-            "link": link,
+            "link": clean(item.get("link")),
             "published": clean(item.get("published")),
         })
+
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(prepared)))) as executor:
+        contents = list(executor.map(lambda a: extract_article(a["link"]), prepared))
+
+    articles = []
+
+    for article, content in zip(prepared, contents):
+        article["content"] = content
+        articles.append(article)
 
     return filter_similar_articles(articles)

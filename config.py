@@ -23,7 +23,7 @@ PROCESSED_FILE = ROOT / "processed.json"
 
 # Generator Settings
 CHECK_INTERVAL = 600
-MAX_ARTICLES_PER_RUN = 3
+MAX_ARTICLES_PER_RUN = 2
 
 # Number of articles displayed on each index page
 ARTICLES_PER_PAGE = 20

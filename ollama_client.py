@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 
@@ -46,7 +47,9 @@ def generate(prompt, retries=3):
     "top_p": 0.8,
     "top_k": 40,
     "num_ctx": 8192,
-    "num_predict": 4096
+    "num_predict": 4096,
+    "num_thread": int(os.getenv("OLLAMA_NUM_THREADS", "16")),
+    "num_gpu": int(os.getenv("OLLAMA_NUM_GPU", "0")),
 },
                 format="json"
             )
