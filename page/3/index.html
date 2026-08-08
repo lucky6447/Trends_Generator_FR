@@ -28,6 +28,27 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
+
+.language-switcher{position:absolute;top:22px;right:24px;z-index:2000}
+.language-switcher-toggle{display:flex;align-items:center;gap:8px;height:42px;padding:0 13px;border:1px solid rgba(255,255,255,.22);border-radius:12px;background:rgba(8,17,31,.34);color:#fff;font:600 14px Inter,sans-serif;cursor:pointer;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);box-shadow:0 8px 25px rgba(0,0,0,.18);transition:.2s}
+.language-switcher-toggle:hover{background:rgba(255,255,255,.12);border-color:rgba(255,255,255,.34)}
+.language-switcher-toggle .flag{font-size:20px;line-height:1}
+.language-switcher-toggle .chevron{font-size:11px;opacity:.8;transition:transform .2s}
+.language-switcher.open .chevron{transform:rotate(180deg)}
+.language-menu{position:absolute;top:calc(100% + 8px);right:0;width:210px;padding:7px;background:#101b2d;border:1px solid rgba(255,255,255,.13);border-radius:14px;box-shadow:0 18px 45px rgba(0,0,0,.45);opacity:0;visibility:hidden;transform:translateY(-5px);transition:.18s ease}
+.language-switcher.open .language-menu{opacity:1;visibility:visible;transform:translateY(0)}
+.language-menu a{display:flex;align-items:center;gap:11px;width:100%;min-height:40px;padding:7px 10px;border-radius:9px;color:#f3f6ff;text-decoration:none;font-size:14px;font-weight:600;transition:.15s}
+.language-menu a:hover{background:#1c3152}
+.language-menu a.active{background:rgba(59,130,246,.18);color:#fff}
+.language-menu .flag{width:25px;text-align:center;font-size:19px;line-height:1}
+@media(max-width:768px){
+.language-switcher{top:12px;right:12px}
+.language-switcher-toggle{height:40px;padding:0 11px;border-radius:11px;font-size:13px}
+.language-switcher-toggle .flag{font-size:19px}
+.language-menu{width:200px;top:calc(100% + 7px);max-height:calc(100vh - 70px);overflow-y:auto;-webkit-overflow-scrolling:touch}
+.language-menu a{min-height:42px}
+}
+
 :root{--bg:#08111f;--card:#0f1b2d;--text:#f3f6ff;--muted:#95a6c7;--primary:#3b82f6}
 *{box-sizing:border-box}body{margin:0;font-family:Inter,sans-serif;background:linear-gradient(180deg,#08111f,#0b1526 45%,#09111d);color:var(--text)}
 header{
@@ -67,6 +88,19 @@ footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1p
 </head>
 <body>
 <header>
+<div class="language-switcher" id="language-switcher">
+<button class="language-switcher-toggle" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Choisir la langue">
+<span class="flag">🇫🇷</span><span>Français</span><span class="chevron">▼</span>
+</button>
+<div class="language-menu" role="menu">
+<a href="https://trendcurrent.today/" role="menuitem"><span class="flag">🇬🇧</span><span>English</span></a>
+<a href="https://de.trendcurrent.today/" role="menuitem"><span class="flag">🇩🇪</span><span>Deutsch</span></a>
+<a href="https://fr.trendcurrent.today/" class="active" role="menuitem"><span class="flag">🇫🇷</span><span>Français</span></a>
+<a href="https://it.trendcurrent.today/" role="menuitem"><span class="flag">🇮🇹</span><span>Italiano</span></a>
+<a href="https://es.trendcurrent.today/" role="menuitem"><span class="flag">🇪🇸</span><span>Español</span></a>
+<a href="https://id.trendcurrent.today/" role="menuitem"><span class="flag">🇮🇩</span><span>Bahasa Indonesia</span></a>
+</div>
+</div>
 <h1>Tendances en France</h1>
 <p>Découvrez les principales tendances de la France et du monde. Notre IA analyse en continu des sources fiables et crée automatiquement des articles de grande qualité, clairs et faciles à comprendre, en temps réel.</p>
 
@@ -111,6 +145,13 @@ footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1p
 
 <div class="container">
 <div class="grid">
+
+<a class="card" href="/trends/nouvelle-canicule.html">
+<div class="date">2026-08-07 23:26</div>
+<h2>Nouvelle Canicule</h2>
+
+<span class="btn">Lire la suite →</span>
+</a>
 
 <a class="card" href="/trends/philippe-etchebest.html">
 <div class="date">2026-08-07 23:26</div>
@@ -245,13 +286,6 @@ footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1p
 <span class="btn">Lire la suite →</span>
 </a>
 
-<a class="card" href="/trends/carburant.html">
-<div class="date">2026-08-07 23:26</div>
-<h2>Carburant</h2>
-
-<span class="btn">Lire la suite →</span>
-</a>
-
 </div>
 </div>
 
@@ -267,6 +301,17 @@ footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1p
 <footer>
 © Tendances en France est un portail d’actualités moderne alimenté par l’intelligence artificielle, proposant les dernières informations, les Google Trends et des analyses approfondies des sujets les plus recherchés en France et dans le monde. Notre technologie intelligente analyse en permanence les évolutions de l’actualité, évalue des sources fiables et génère des articles clairs, précis et régulièrement mis à jour. Les lecteurs accèdent rapidement à des informations fiables sur la politique, l’économie, le sport, la technologie, le divertissement, la santé et bien d’autres domaines. Tous les contenus sont continuellement vérifiés et enrichis automatiquement dès que de nouvelles informations sont disponibles. © 2026 TrendCurrent.
 </footer>
+
+<script>
+(function(){
+const s=document.getElementById('language-switcher'),b=s&&s.querySelector('.language-switcher-toggle');
+if(!s||!b)return;
+function close(){s.classList.remove('open');b.setAttribute('aria-expanded','false')}
+b.addEventListener('click',e=>{e.stopPropagation();const o=s.classList.toggle('open');b.setAttribute('aria-expanded',o?'true':'false')});
+document.addEventListener('click',e=>{if(!s.contains(e.target))close()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')close()});
+})();
+</script>
 
 <script>
 (async function(){
