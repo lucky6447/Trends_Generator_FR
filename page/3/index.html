@@ -88,17 +88,183 @@ footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1p
 </head>
 <body>
 <header>
+<style>
+.language-switcher{
+    position:absolute;
+    top:22px;
+    right:24px;
+    z-index:2000;
+}
+
+.language-switcher-toggle{
+    display:flex;
+    align-items:center;
+    gap:8px;
+    height:42px;
+    padding:0 13px;
+    border:1px solid rgba(255,255,255,.22);
+    border-radius:12px;
+    background:rgba(8,17,31,.34);
+    color:#fff;
+    font:600 14px Inter,sans-serif;
+    cursor:pointer;
+    backdrop-filter:blur(12px);
+    -webkit-backdrop-filter:blur(12px);
+    box-shadow:0 8px 25px rgba(0,0,0,.18);
+    transition:.2s;
+}
+
+.language-switcher-toggle:hover{
+    background:rgba(255,255,255,.12);
+    border-color:rgba(255,255,255,.34);
+}
+
+.language-switcher-toggle .chevron{
+    font-size:11px;
+    opacity:.8;
+    transition:transform .2s;
+}
+
+.language-switcher.open .chevron{
+    transform:rotate(180deg);
+}
+
+.language-menu{
+    position:absolute;
+    top:calc(100% + 8px);
+    right:0;
+    width:210px;
+    padding:7px;
+    background:#101b2d;
+    border:1px solid rgba(255,255,255,.13);
+    border-radius:14px;
+    box-shadow:0 18px 45px rgba(0,0,0,.45);
+    opacity:0;
+    visibility:hidden;
+    transform:translateY(-5px);
+    transition:.18s ease;
+}
+
+.language-switcher.open .language-menu{
+    opacity:1;
+    visibility:visible;
+    transform:translateY(0);
+}
+
+.language-menu a{
+    display:flex;
+    align-items:center;
+    gap:11px;
+    width:100%;
+    min-height:40px;
+    padding:7px 10px;
+    border-radius:9px;
+    color:#f3f6ff;
+    text-decoration:none;
+    font-size:14px;
+    font-weight:600;
+    transition:.15s;
+}
+
+.language-menu a:hover{
+    background:#1c3152;
+}
+
+.language-menu a.active{
+    background:rgba(59,130,246,.18);
+    color:#fff;
+}
+
+.flag-img{
+    width:25px;
+    height:17px;
+    object-fit:cover;
+    display:block;
+    flex-shrink:0;
+}
+
+@media(max-width:768px){
+    .language-switcher{
+        top:12px;
+        right:12px;
+    }
+
+    .language-switcher-toggle{
+        height:40px;
+        padding:0 11px;
+        border-radius:11px;
+        font-size:13px;
+    }
+
+    .language-menu{
+        width:200px;
+        top:calc(100% + 7px);
+        max-height:calc(100vh - 70px);
+        overflow-y:auto;
+        -webkit-overflow-scrolling:touch;
+    }
+
+    .language-menu a{
+        min-height:42px;
+    }
+}
+</style>
+
 <div class="language-switcher" id="language-switcher">
-<button class="language-switcher-toggle" type="button" aria-haspopup="true" aria-expanded="false" aria-label="Choisir la langue">
-<span class="flag">🇫🇷</span><span>Français</span><span class="chevron">▼</span>
+
+<button class="language-switcher-toggle"
+        type="button"
+        aria-haspopup="true"
+        aria-expanded="false"
+        aria-label="Sprache auswählen">
+
+<img class="flag-img"
+     src="https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/1f1eb-1f1f7.svg"
+     alt="">
+
+<span>Français</span>
+<span class="chevron">▼</span>
+
 </button>
+
 <div class="language-menu" role="menu">
-<a href="https://trendcurrent.today/" role="menuitem"><span class="flag">🇬🇧</span><span>English</span></a>
-<a href="https://de.trendcurrent.today/" role="menuitem"><span class="flag">🇩🇪</span><span>Deutsch</span></a>
-<a href="https://fr.trendcurrent.today/" class="active" role="menuitem"><span class="flag">🇫🇷</span><span>Français</span></a>
-<a href="https://it.trendcurrent.today/" role="menuitem"><span class="flag">🇮🇹</span><span>Italiano</span></a>
-<a href="https://es.trendcurrent.today/" role="menuitem"><span class="flag">🇪🇸</span><span>Español</span></a>
-<a href="https://id.trendcurrent.today/" role="menuitem"><span class="flag">🇮🇩</span><span>Bahasa Indonesia</span></a>
+
+<a href="https://trendcurrent.today/" role="menuitem">
+<img class="flag-img" src="https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/1f1ec-1f1e7.svg" alt="">
+<span>English</span>
+</a>
+
+<a href="https://us.trendcurrent.today/" role="menuitem">
+<img class="flag-img" src="https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/1f1fa-1f1f8.svg" alt="">
+<span>English (US)</span>
+</a>
+
+<a href="https://de.trendcurrent.today/" role="menuitem">
+<img class="flag-img" src="https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/1f1e9-1f1ea.svg" alt="">
+<span>Deutsch</span>
+</a>
+
+<a href="https://fr.trendcurrent.today/" class="active" role="menuitem">
+<img class="flag-img" src="https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/1f1eb-1f1f7.svg" alt="">
+<span>Français</span>
+</a>
+
+<a href="https://it.trendcurrent.today/" role="menuitem">
+<img class="flag-img" src="https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/1f1ee-1f1f9.svg" alt="">
+<span>Italiano</span>
+</a>
+
+<a href="https://es.trendcurrent.today/" role="menuitem">
+<img class="flag-img" src="https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/1f1ea-1f1f8.svg" alt="">
+<span>Español</span>
+</a>
+
+<a href="https://id.trendcurrent.today/" role="menuitem">
+<img class="flag-img" src="https://cdn.jsdelivr.net/gh/twitter/twemoji@latest/assets/svg/1f1ee-1f1e9.svg" alt="">
+<span>Bahasa Indonesia</span>
+</a>
+
+</div>
 </div>
 </div>
 <h1>Tendances en France</h1>
@@ -146,6 +312,55 @@ footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1p
 
 <div class="container">
 <div class="grid">
+
+<a class="card" href="/trends/m-t-o-la-carte.html">
+<div class="date">2026-08-07 23:26</div>
+<h2>M T O La Carte</h2>
+
+<span class="btn">Lire la suite →</span>
+</a>
+
+<a class="card" href="/trends/faustine-bollaert.html">
+<div class="date">2026-08-07 23:26</div>
+<h2>Faustine Bollaert</h2>
+
+<span class="btn">Lire la suite →</span>
+</a>
+
+<a class="card" href="/trends/el-nino-meteo.html">
+<div class="date">2026-08-07 23:26</div>
+<h2>El Nino Meteo</h2>
+
+<span class="btn">Lire la suite →</span>
+</a>
+
+<a class="card" href="/trends/anthony-fauci.html">
+<div class="date">2026-08-07 23:26</div>
+<h2>Anthony Fauci</h2>
+
+<span class="btn">Lire la suite →</span>
+</a>
+
+<a class="card" href="/trends/golf.html">
+<div class="date">2026-08-07 23:26</div>
+<h2>Golf</h2>
+
+<span class="btn">Lire la suite →</span>
+</a>
+
+<a class="card" href="/trends/abdul-el-sayed-michigan.html">
+<div class="date">2026-08-07 23:26</div>
+<h2>Abdul El Sayed Michigan</h2>
+
+<span class="btn">Lire la suite →</span>
+</a>
+
+<a class="card" href="/trends/iphone-16.html">
+<div class="date">2026-08-07 23:26</div>
+<h2>Iphone 16</h2>
+
+<span class="btn">Lire la suite →</span>
+</a>
 
 <a class="card" href="/trends/zimbabwe.html">
 <div class="date">2026-08-07 23:26</div>
@@ -224,78 +439,13 @@ footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1p
 <span class="btn">Lire la suite →</span>
 </a>
 
-<a class="card" href="/trends/aryna-sabalenka.html">
-<div class="date">2026-08-07 23:26</div>
-<h2>Aryna Sabalenka</h2>
-
-<span class="btn">Lire la suite →</span>
-</a>
-
-<a class="card" href="/trends/mari-s-au-premier-regard.html">
-<div class="date">2026-08-07 23:26</div>
-<h2>Mari S Au Premier Regard</h2>
-
-<span class="btn">Lire la suite →</span>
-</a>
-
-<a class="card" href="/trends/mcdonald-s.html">
-<div class="date">2026-08-07 23:26</div>
-<h2>Mcdonald S</h2>
-
-<span class="btn">Lire la suite →</span>
-</a>
-
-<a class="card" href="/trends/fusee-spacex.html">
-<div class="date">2026-08-07 23:26</div>
-<h2>Fusee Spacex</h2>
-
-<span class="btn">Lire la suite →</span>
-</a>
-
-<a class="card" href="/trends/secret-story-candidats.html">
-<div class="date">2026-08-07 23:26</div>
-<h2>Secret Story Candidats</h2>
-
-<span class="btn">Lire la suite →</span>
-</a>
-
-<a class="card" href="/trends/ici-tout-commence-en-avance.html">
-<div class="date">2026-08-07 23:26</div>
-<h2>Ici Tout Commence En Avance</h2>
-
-<span class="btn">Lire la suite →</span>
-</a>
-
-<a class="card" href="/trends/jean-luc-reichmann.html">
-<div class="date">2026-08-07 23:26</div>
-<h2>Jean Luc Reichmann</h2>
-
-<span class="btn">Lire la suite →</span>
-</a>
-
-<a class="card" href="/trends/omar-sy.html">
-<div class="date">2026-08-07 23:26</div>
-<h2>Omar Sy</h2>
-
-<span class="btn">Lire la suite →</span>
-</a>
-
-<a class="card" href="/trends/physalies.html">
-<div class="date">2026-08-07 23:26</div>
-<h2>Physalies</h2>
-
-<span class="btn">Lire la suite →</span>
-</a>
-
 </div>
 </div>
 
 <div class="pagination">
 
-<a href="../">← Retour</a>
+<a href="/">← Retour</a>
 
-
-<a href="/page/4/">Suivant →</a>
 
 </div>
 
@@ -322,7 +472,7 @@ const box=document.getElementById('search-results');
 if(!input||!box)return;
 let data=[];
 try{
-    data=await fetch('search.json').then(r=>r.json());
+    data=await fetch('/search.json').then(r=>r.json());
 }catch(e){
     console.error(e);
 }

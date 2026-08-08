@@ -45,8 +45,8 @@ def validate_article(article):
     if not isinstance(article["sections"], list):
         raise Exception("Sections must be a list")
 
-    if len(article["sections"]) != 5:
-        raise Exception("Article should contain 4-7 well-structured sections.")
+    if not 3 <= len(article["sections"]) <= 5:
+        raise Exception("Article should contain 3-5 well-structured sections.")
 
     titles = set()
     words = len(article["intro"].split())

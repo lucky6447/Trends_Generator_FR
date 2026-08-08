@@ -26,4 +26,4 @@ CHECK_INTERVAL = 600
 MAX_ARTICLES_PER_RUN = 1
 
 # Number of articles displayed on each index page
-ARTICLES_PER_PAGE = 20
+ARTICLES_PER_PAGE = 18

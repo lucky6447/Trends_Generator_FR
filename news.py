@@ -76,7 +76,7 @@ def filter_similar_articles(articles):
     generic = {
         "france","français","française","francais","francaise",
         "actualité","actualités","news","nouvelle","nouvelles",
-        "politique","politique","politique","candidat","candidate",
+        "politique","candidat","candidate",
         "candidats","candidates","candidature","candidatures",
         "président","présidente","présidentielle","élection",
         "élections","monde","sport","sports","football","rugby",

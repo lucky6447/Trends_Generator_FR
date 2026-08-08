@@ -87,7 +87,10 @@ STRUCTURE :
 
 Introduction.
 
-Exactement 5 sections.
+De 3 à 5 sections, selon la quantité d'informations pertinentes et vérifiées disponibles.
+- Ne crée pas de sections supplémentaires uniquement pour arriver à cinq sections.
+- Si les informations disponibles sont limitées, utilise moins de sections plutôt que d'ajouter des informations périphériques, répétitives ou insuffisamment étayées.
+- N'invente jamais de faits pour compléter une section.
 
 Courte conclusion factuelle sans nouveaux faits.
 Retourne EXCLUSIVEMENT un JSON valide :
@@ -98,8 +101,6 @@ Retourne EXCLUSIVEMENT un JSON valide :
 "h1":"",
 "intro":"",
 "sections":[
-{{"title":"","text":""}},
-{{"title":"","text":""}},
 {{"title":"","text":""}},
 {{"title":"","text":""}},
 {{"title":"","text":""}}
