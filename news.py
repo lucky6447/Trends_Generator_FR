@@ -2,7 +2,6 @@ import re
 import feedparser
 import requests
 import trafilatura
-from concurrent.futures import ThreadPoolExecutor
 
 from collections import Counter
 from urllib.parse import quote_plus
@@ -59,8 +58,9 @@ def extract_article(url):
 
 def filter_similar_articles(articles):
     """
-    Group Google News results by shared keywords and keep only the
-    dominant cluster. Skip the trend if no clear dominant cluster exists.
+    Group Google News results by meaningful shared keywords and keep only
+    the dominant cluster. Generic words are ignored so unrelated stories
+    are not merged into the same news topic.
     """
     if len(articles) < 5:
         return []
@@ -73,35 +73,75 @@ def filter_similar_articles(articles):
         "le","les","des","une","dans","avec","pour","sur","aux","est"
     }
 
+    generic = {
+        "france","français","française","francais","francaise",
+        "actualité","actualités","news","nouvelle","nouvelles",
+        "politique","politique","politique","candidat","candidate",
+        "candidats","candidates","candidature","candidatures",
+        "président","présidente","présidentielle","élection",
+        "élections","monde","sport","sports","football","rugby",
+        "joueur","joueuse","équipe","club","match","transfert",
+        "transferts","nouveau","nouvelle","nouveaux","nouvelles",
+        "annonce","annonces","rapport","selon","après","avant",
+        "contre","face","parti","partis","gouvernement","ministre"
+    }
+
     token_sets = []
     for article in articles:
         tokens = {
-            t for t in re.findall(r"[a-zA-Z0-9]+", article["title"].lower())
-            if len(t) > 3 and t not in stopwords
+            t for t in re.findall(r"[a-zA-ZÀ-ÿ0-9]+", article["title"].lower())
+            if len(t) > 3 and t not in stopwords and t not in generic
         }
         token_sets.append(tokens)
+
+    frequency = Counter(token for tokens in token_sets for token in tokens)
+
+    def token_weight(token):
+        return 1.0 / frequency[token]
 
     groups = []
 
     for idx, tokens in enumerate(token_sets):
-        placed = False
+        best_group = None
+        best_score = 0.0
+
         for group in groups:
-            if len(tokens & group["tokens"]) >= 2:
-                group["items"].append(idx)
-                group["tokens"] |= tokens
-                placed = True
-                break
-        if not placed:
+            common = tokens & group["tokens"]
+            score = sum(token_weight(t) for t in common)
+
+            if common and score > best_score:
+                best_score = score
+                best_group = group
+
+        if best_group is not None and best_score >= 0.5:
+            best_group["items"].append(idx)
+            best_group["tokens"] |= tokens
+        else:
             groups.append({"items": [idx], "tokens": set(tokens)})
 
-    largest = max(groups, key=lambda g: len(g["items"]))
+    if not groups:
+        return []
+
+    largest = max(
+        groups,
+        key=lambda g: (
+            len(g["items"]),
+            sum(token_weight(t) for t in g["tokens"])
+        )
+    )
 
     if len(largest["items"]) < 3:
         return []
 
-    return [articles[i] for i in largest["items"]]
+    filtered = [articles[i] for i in largest["items"]]
 
-def fetch_news(query, limit=20):
+    if len(filtered) < 5:
+        return []
+
+    return filtered
+
+
+def fetch_news(query, limit=10):
 
     url = (
         "https://news.google.com/rss/search?"
@@ -113,30 +153,26 @@ def fetch_news(query, limit=20):
 
     feed = feedparser.parse(url)
 
-    items = feed.entries[:limit]
+    articles = []
 
-    prepared = []
+    for item in feed.entries[:limit]:
 
-    for item in items:
         source = ""
+
         if hasattr(item, "source"):
             source = clean(item.source.get("title"))
 
-        prepared.append({
+        link = clean(item.get("link"))
+
+        content = extract_article(link)
+
+        articles.append({
             "title": clean(item.get("title")),
             "summary": clean(item.get("summary")),
+            "content": content,
             "source": source,
-            "link": clean(item.get("link")),
+            "link": link,
             "published": clean(item.get("published")),
         })
-
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(prepared)))) as executor:
-        contents = list(executor.map(lambda a: extract_article(a["link"]), prepared))
-
-    articles = []
-
-    for article, content in zip(prepared, contents):
-        article["content"] = content
-        articles.append(article)
 
     return filter_similar_articles(articles)
