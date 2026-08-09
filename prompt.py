@@ -59,6 +59,8 @@ RÈGLES STRICTES :
 - Reprends tous les noms propres exactement comme ils apparaissent dans les articles Google Actualités.
 - N'invente jamais de nationalités, postes, clubs, blessures, détails contractuels ou informations biographiques.
 - Si les sources se contredisent, n'utilise que les informations clairement confirmées.
+- Ne déduis ni ne calcule jamais le jour de la semaine à partir d'une date. N'indique un jour de la semaine que s'il est explicitement mentionné dans les sources fournies.
+- Conserve les dates, les lieux, les fonctions et tous les autres faits exactement tels qu'ils apparaissent dans les sources. Ne les interprète pas et ne les renforce pas.
 - Si une information n'est pas certaine, ne l'écris pas.
 - Avant de répondre, vérifie que tous les noms propres correspondent aux sources.
 
