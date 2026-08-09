@@ -14,27 +14,62 @@ env = Environment(
 template = env.get_template("index.html")
 
 
+def _load_saved_article_times():
+    """
+    Keep the original published date/time from index.json for existing articles.
+    This prevents a regeneration from changing old article timestamps.
+    """
+    path = Path("index.json")
+
+    if not path.exists():
+        return {}
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            return {}
+
+        return {
+            item.get("url"): item
+            for item in data
+            if isinstance(item, dict) and item.get("url")
+        }
+    except Exception:
+        return {}
+
+
 def get_articles():
+    saved = _load_saved_article_times()
     articles = []
 
-    for f in sorted(
-        TREND_DIR.glob("*.html"),
-        key=lambda x: x.stat().st_mtime,
-        reverse=True,
-    ):
+    for f in TREND_DIR.glob("*.html"):
+        url = f"/trends/{f.name}"
+        old = saved.get(url)
+
+        if old and old.get("updated"):
+            updated = old["updated"]
+            lastmod = old.get("lastmod") or updated[:10]
+        else:
+            file_time = datetime.fromtimestamp(f.stat().st_mtime)
+            updated = file_time.strftime("%Y-%m-%d %H:%M")
+            lastmod = file_time.strftime("%Y-%m-%d")
+
         articles.append(
             {
                 "title": f.stem.replace("-", " ").title(),
-                "url": f"/trends/{f.name}",
-                "updated": datetime.fromtimestamp(
-                    f.stat().st_mtime
-                ).strftime("%Y-%m-%d %H:%M"),
-                "lastmod": datetime.fromtimestamp(
-                    f.stat().st_mtime
-                ).strftime("%Y-%m-%d"),
+                "url": url,
+                "updated": updated,
+                "lastmod": lastmod,
             }
         )
 
+    def sort_key(article):
+        try:
+            return datetime.strptime(article["updated"], "%Y-%m-%d %H:%M")
+        except Exception:
+            return datetime.min
+
+    articles.sort(key=sort_key, reverse=True)
     return articles
 
 
@@ -66,7 +101,12 @@ def update_index_json():
 
 
 def update_index_html():
-    articles = get_articles()[:ARTICLES_PER_PAGE]
+    all_articles = get_articles()
+    articles = all_articles[:ARTICLES_PER_PAGE]
+    total_pages = max(
+        1,
+        (len(all_articles) + ARTICLES_PER_PAGE - 1) // ARTICLES_PER_PAGE
+    )
 
     Path("index.html").write_text(
         template.render(
@@ -74,6 +114,7 @@ def update_index_html():
             articles=articles,
             site_url=SITE_URL,
             page_number=1,
+            total_pages=total_pages,
         ),
         encoding="utf-8",
     )
@@ -87,6 +128,8 @@ def update_pagination():
         for i in range(0, len(articles), ARTICLES_PER_PAGE)
     ]
 
+    total_pages = len(pages)
+
     for number, page_articles in enumerate(pages[1:], start=2):
         page_dir = Path(f"page/{number}")
         page_dir.mkdir(parents=True, exist_ok=True)
@@ -97,9 +140,24 @@ def update_pagination():
                 articles=page_articles,
                 site_url=SITE_URL,
                 page_number=number,
+                total_pages=total_pages,
             ),
             encoding="utf-8",
         )
+
+    # Remove pagination directories that no longer correspond to real pages.
+    page_root = Path("page")
+    if page_root.exists():
+        for directory in page_root.iterdir():
+            if directory.is_dir() and directory.name.isdigit():
+                if int(directory.name) > total_pages:
+                    for child in directory.iterdir():
+                        if child.is_file() or child.is_symlink():
+                            child.unlink()
+                    try:
+                        directory.rmdir()
+                    except OSError:
+                        pass
 
 
 def update_sitemap():

@@ -79,9 +79,62 @@ header p{max-width:760px;margin:auto;font-size:20px;opacity:.95}
 .card h2{margin:0 0 12px;font-size:24px}
 .date{color:var(--muted);font-size:14px;margin-bottom:12px}
 .btn{display:inline-block;margin-top:10px;color:var(--primary);font-weight:700}
-.pagination{display:flex;justify-content:center;align-items:center;gap:24px;margin:40px 0}
-.pagination a{color:var(--primary);font-weight:700;text-decoration:none;font-size:18px}
-.pagination a:hover{text-decoration:underline}
+.pagination{
+    display:flex;
+    justify-content:center;
+    align-items:center;
+    flex-wrap:wrap;
+    gap:8px;
+    margin:40px auto;
+    max-width:1200px;
+    padding:0 20px;
+}
+
+.pagination .page-link,
+.pagination .show-more{
+    min-width:48px;
+    height:48px;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    padding:0 14px;
+    border-radius:7px;
+    font-size:16px;
+    font-weight:700;
+    text-decoration:none;
+    box-sizing:border-box;
+}
+
+.pagination .page-link{
+    color:#fff;
+    background:#101b2d;
+    border:1px solid rgba(59,130,246,.35);
+    cursor:pointer;
+}
+
+.pagination .page-link:hover{
+    background:#1c3152;
+    border-color:#4f8cff;
+}
+
+.pagination .page-link.active{
+    color:#fff;
+    background:linear-gradient(135deg,#3b82f6,#2563eb);
+    border-color:#3b82f6;
+    box-shadow:0 8px 22px rgba(59,130,246,.28);
+}
+
+.pagination .show-more{
+    color:#fff;
+    background:#101b2d;
+    border:1px solid rgba(59,130,246,.35);
+    cursor:pointer;
+}
+
+.pagination .show-more:hover{
+    background:#1c3152;
+    border-color:#4f8cff;
+}
 footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1px solid rgba(255,255,255,.08)}
 @media(max-width:768px){header h1{font-size:36px}header p{font-size:17px}}
 </style>
@@ -313,6 +366,13 @@ footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1p
 <div class="container">
 <div class="grid">
 
+<a class="card" href="/trends/orages.html">
+<div class="date">2026-08-08 01:26</div>
+<h2>Orages</h2>
+
+<span class="btn">Lire la suite →</span>
+</a>
+
 <a class="card" href="/trends/caen.html">
 <div class="date">2026-08-08 00:51</div>
 <h2>Caen</h2>
@@ -334,41 +394,6 @@ footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1p
 <span class="btn">Lire la suite →</span>
 </a>
 
-<a class="card" href="/trends/arr-t-maladie.html">
-<div class="date">2026-08-07 23:26</div>
-<h2>Arr T Maladie</h2>
-
-<span class="btn">Lire la suite →</span>
-</a>
-
-<a class="card" href="/trends/frank-mccourt.html">
-<div class="date">2026-08-07 23:26</div>
-<h2>Frank Mccourt</h2>
-
-<span class="btn">Lire la suite →</span>
-</a>
-
-<a class="card" href="/trends/laurent-gerra.html">
-<div class="date">2026-08-07 23:26</div>
-<h2>Laurent Gerra</h2>
-
-<span class="btn">Lire la suite →</span>
-</a>
-
-<a class="card" href="/trends/marine-tondelier.html">
-<div class="date">2026-08-07 23:26</div>
-<h2>Marine Tondelier</h2>
-
-<span class="btn">Lire la suite →</span>
-</a>
-
-<a class="card" href="/trends/nfl.html">
-<div class="date">2026-08-07 23:26</div>
-<h2>Nfl</h2>
-
-<span class="btn">Lire la suite →</span>
-</a>
-
 <a class="card" href="/trends/abdul-el-sayed-michigan.html">
 <div class="date">2026-08-07 23:26</div>
 <h2>Abdul El Sayed Michigan</h2>
@@ -386,6 +411,13 @@ footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1p
 <a class="card" href="/trends/anthony-fauci.html">
 <div class="date">2026-08-07 23:26</div>
 <h2>Anthony Fauci</h2>
+
+<span class="btn">Lire la suite →</span>
+</a>
+
+<a class="card" href="/trends/arr-t-maladie.html">
+<div class="date">2026-08-07 23:26</div>
+<h2>Arr T Maladie</h2>
 
 <span class="btn">Lire la suite →</span>
 </a>
@@ -432,6 +464,13 @@ footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1p
 <span class="btn">Lire la suite →</span>
 </a>
 
+<a class="card" href="/trends/frank-mccourt.html">
+<div class="date">2026-08-07 23:26</div>
+<h2>Frank Mccourt</h2>
+
+<span class="btn">Lire la suite →</span>
+</a>
+
 <a class="card" href="/trends/fusee-spacex.html">
 <div class="date">2026-08-07 23:26</div>
 <h2>Fusee Spacex</h2>
@@ -439,15 +478,72 @@ footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1p
 <span class="btn">Lire la suite →</span>
 </a>
 
+<a class="card" href="/trends/golf.html">
+<div class="date">2026-08-07 23:26</div>
+<h2>Golf</h2>
+
+<span class="btn">Lire la suite →</span>
+</a>
+
+<a class="card" href="/trends/guerre.html">
+<div class="date">2026-08-07 23:26</div>
+<h2>Guerre</h2>
+
+<span class="btn">Lire la suite →</span>
+</a>
+
 </div>
 </div>
 
-<div class="pagination">
-
-<a href="/">← Retour</a>
-
-
+<div class="pagination"
+     id="pagination"
+     data-total-pages="6"
+     data-current-page="4">
 </div>
+
+<script>
+(function(){
+    const pagination = document.getElementById('pagination');
+    if(!pagination) return;
+
+    const totalPages = Number(pagination.dataset.totalPages || 1);
+    const currentPage = Number(pagination.dataset.currentPage || 1);
+    let visiblePages = Math.min(
+        totalPages,
+        Math.max(10, Math.ceil(currentPage / 10) * 10)
+    );
+
+    function pageUrl(number){
+        return number === 1 ? '/' : '/page/' + number + '/';
+    }
+
+    function render(){
+        pagination.innerHTML = '';
+
+        for(let number = 1; number <= visiblePages; number++){
+            const link = document.createElement('a');
+            link.className = 'page-link' + (number === currentPage ? ' active' : '');
+            link.href = pageUrl(number);
+            link.textContent = number;
+            pagination.appendChild(link);
+        }
+
+        if(visiblePages < totalPages){
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'show-more';
+            button.textContent = 'Afficher plus';
+            button.addEventListener('click', function(){
+                visiblePages = Math.min(totalPages, visiblePages + 10);
+                render();
+            });
+            pagination.appendChild(button);
+        }
+    }
+
+    render();
+})();
+</script>
 
 <footer>
 © TrendCurrent est une plateforme d’actualités innovante basée sur l’intelligence artificielle, dédiée à fournir une information actuelle, précise et facile à comprendre sur les sujets les plus recherchés et suivis en France. En combinant des sources d’information fiables avec une technologie éditoriale avancée basée sur l’IA, TrendCurrent analyse en continu l’évolution de l’actualité et met à jour les articles dès que de nouvelles informations vérifiées sont disponibles. De la politique et de l’économie au sport, à la technologie, au divertissement, à la santé et à de nombreux autres domaines, TrendCurrent réunit les actualités les plus importantes de France en un seul endroit. Notre objectif est d’offrir aux lecteurs une manière innovante, pratique et efficace de découvrir, suivre et comprendre ce qui se passe en France. © 2026 TrendCurrent.
