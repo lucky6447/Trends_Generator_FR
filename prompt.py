@@ -166,13 +166,47 @@ Avant de renvoyer le JSON, vérifie encore :
 
 VÉRIFICATION FACTUELLE FINALE :
 
-Avant de renvoyer le JSON final, vérifie chaque affirmation factuelle en la confrontant aux articles Google Actualités fournis.
+Avant de renvoyer le JSON final, effectue une vérification factuelle rigoureuse de l'ensemble de l'article, phrase par phrase, en la confrontant aux articles Google Actualités fournis.
 
-Si une affirmation ne peut pas être directement étayée par les sources fournies, supprime-la.
+Chaque affirmation factuelle doit être directement étayée par au moins un article Google Actualités fourni.
 
-N'utilise aucune information provenant de tes connaissances générales, de ta mémoire ou de suppositions, même si tu penses qu'elle est vraie.
+Si une affirmation ne peut pas être retrouvée directement ou clairement étayée dans les articles fournis, SUPPRIME-LA.
 
-N'introduis aucun nouveau fait lors de la rédaction des transitions, du contexte ou des conclusions.
+Ne conserve pas une affirmation simplement parce qu'elle est plausible, probable, généralement connue ou logiquement déductible.
+
+N'ajoute jamais d'opinions, de réactions, de prévisions, d'analyses, de conséquences, de motivations ou d'informations de contexte sauf si elles sont explicitement mentionnées dans les sources fournies.
+
+N'utilise pas de formulations telles que :
+- « de nombreux observateurs »
+- « les supporters et les analystes »
+- « cela a montré que »
+- « cela pourrait être une leçon »
+- « le club devrait probablement »
+- « il est probable que »
+- « on s'attend à ce que »
+ou des formulations similaires, sauf si elles sont explicitement étayées par les sources.
+
+N'introduis aucune nouvelle information factuelle lors de la rédaction de l'introduction, des transitions, des sections ou de la conclusion.
+
+Au moindre doute sur le fait qu'une phrase soit étayée par les sources, SUPPRIME LA PHRASE.
+
+L'article final doit contenir uniquement des informations pouvant être directement rattachées aux articles Google Actualités fournis.
+
+VÉRIFICATION DES DATES ET DES ÉVÉNEMENTS :
+
+N'invente, ne déplace et ne réinterprète jamais la date d'un événement.
+
+N'utilise la date d'un événement que si elle est explicitement indiquée dans les sources fournies.
+
+Si différentes sources donnent des dates différentes, ne choisis pas une date par déduction.
+
+Utilise la date de la source fiable la plus récente ou omets la date si le conflit ne peut pas être résolu.
+
+N'indique un jour de la semaine que lorsque la même source fournie associe explicitement ce jour à la date de l'événement.
+
+Ne calcule pas le jour de la semaine et ne combine pas le jour de la semaine d'une source avec la date d'une autre source.
+
+Ne déplace jamais un événement à une autre date simplement parce que le jour de la semaine calculé semble correct.
 
 Uniquement le JSON.
 """
