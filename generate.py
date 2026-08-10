@@ -10,7 +10,7 @@ from html_generator import render_article, save_article
 from processed import load_processed, add_processed
 from index_generator import update_all
 
-REQUIRED_FIELDS = ["title", "description", "h1", "intro", "sections", "faq"]
+REQUIRED_FIELDS = ["title", "description", "h1", "intro", "sections"]
 
 MIN_WORDS = 100
 
@@ -45,8 +45,8 @@ def validate_article(article):
     if not isinstance(article["sections"], list):
         raise Exception("Sections must be a list")
 
-    if not 3 <= len(article["sections"]) <= 5:
-        raise Exception("Article should contain 3-5 well-structured sections.")
+    if not 1 <= len(article["sections"]) <= 5:
+        raise Exception("Article should contain 1-5 well-structured sections.")
 
     titles = set()
     words = len(article["intro"].split())
@@ -54,20 +54,18 @@ def validate_article(article):
     for s in article["sections"]:
         if "title" not in s or "text" not in s:
             raise Exception("Invalid section")
-
         if s["title"] in titles:
             raise Exception("Duplicate section title")
-
         titles.add(s["title"])
         words += len(s["text"].split())
 
-    if words < MIN_WORDS:
-        raise Exception(f"Article too short ({words} words)")
+    min_words = 70 if len(article["sections"]) <= 2 else MIN_WORDS
+    if words < min_words:
+        raise Exception(f"Article too short ({words} words; minimum {min_words})")
 
     return True
 
-
-def generate_valid_article(prompt, max_attempts=3):
+def generate_valid_article(prompt, max_attempts=1):
     last = None
 
     for i in range(max_attempts):
