@@ -1,11 +1,12 @@
 import json
 import os
 import re
+import time
 from datetime import date
 from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 from ollama import chat
-from config import MODEL
+from config import MODEL, LANGUAGE
 
 # ============================================================
 # TrendCurrent UNIVERSAL FACTUAL PIPELINE v5
@@ -40,13 +41,13 @@ from config import MODEL
 # This is intentionally language-independent and topic-independent.
 # ============================================================
 
-PIPELINE_VERSION = "universal-build-temporal-recovery-v12"
+PIPELINE_VERSION = "universal-build-temporal-recovery-v12-compression-v1"
 
 NUM_THREADS = int(os.getenv("OLLAMA_NUM_THREADS", "16"))
 NUM_GPU = int(os.getenv("OLLAMA_NUM_GPU", "0"))
 NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 
-EVIDENCE_TOKENS = 2200
+EVIDENCE_TOKENS = 1400
 ARTICLE_TOKENS = 2400
 AUDIT_TOKENS = 1800
 REPAIR_TOKENS = 2400
@@ -123,7 +124,24 @@ def _clean_json(text):
     return text[start:]
 
 
+def _compact_json(value):
+    """Compact JSON for downstream prompts without changing its data.
+
+    V1 INPUT COMPRESSION: whitespace/indentation is removed only.
+    No fields, values, ordering, or factual content are changed.
+    """
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
 def _call(prompt, temperature=0.0, num_predict=2600):
+    call_start = time.perf_counter()
+    prompt_chars = len(prompt or "")
+    prompt_lines = (prompt or "").count("\n") + 1
+    print(
+        f"[TIMER] Ollama START | predict={num_predict} | temp={temperature} "
+        f"| prompt_chars={prompt_chars} | prompt_lines={prompt_lines}"
+    )
+
     response = chat(
         model=MODEL,
         messages=[{"role": "user", "content": prompt}],
@@ -142,9 +160,36 @@ def _call(prompt, temperature=0.0, num_predict=2600):
     raw = response.message.content
     cleaned = _clean_json(raw)
 
+    call_elapsed = time.perf_counter() - call_start
+
+    # Ollama may expose detailed server-side timings on the response object.
+    # Log them when available, without changing pipeline behavior.
+    timing_fields = (
+        "load_duration",
+        "prompt_eval_duration",
+        "eval_duration",
+        "total_duration",
+        "prompt_eval_count",
+        "eval_count",
+    )
+    timing = {}
+    for field in timing_fields:
+        value = getattr(response, field, None)
+        if value is not None:
+            timing[field] = value
+
+    print(
+        f"[TIMER] Ollama END   | elapsed={call_elapsed:.2f}s "
+        f"| response_chars={len(raw or '')} | timing={timing}"
+    )
+
+    parse_start = time.perf_counter()
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
+        print(f"[TIMER] JSON parse     | elapsed={time.perf_counter() - parse_start:.4f}s")
+        return parsed
     except json.JSONDecodeError as exc:
+        print(f"[TIMER] JSON parse FAIL | elapsed={time.perf_counter() - parse_start:.4f}s")
         raise ValueError(
             f"Ollama returned invalid JSON: {exc}. "
             f"Response prefix: {raw[:600]!r}"
@@ -156,50 +201,51 @@ def _call(prompt, temperature=0.0, num_predict=2600):
 # ------------------------------------------------------------
 
 def _extract_evidence(source_prompt):
-    return _call(
+    stage_start = time.perf_counter()
+    print(
+        f"[TIMER] Evidence extraction START | source_chars={len(source_prompt or '')}"
+    )
+    try:
+        return _call(
         f"""
 You are TrendCurrent's UNIVERSAL SOURCE EVIDENCE ENGINE.
 
-Your ONLY job is to convert the supplied SOURCE MATERIAL into a precise
-evidence map for another model. Do not write an article.
+Convert the supplied SOURCE MATERIAL into a compact, precise evidence map for
+another model. DO NOT write an article. SOURCE MATERIAL is authoritative.
+Use no outside knowledge.
 
-SOURCE MATERIAL is authoritative. Do not use outside knowledge.
+PRIORITY:
+Extract only material facts needed to write and verify the story. Prefer
+central, article-relevant facts. Do not repeat the same fact in multiple forms,
+do not summarize whole articles, and do not add commentary or filler.
 
-CORE RULE:
-A date has meaning only because of the EVENT it is attached to.
+TEMPORAL RULES:
+- Publication/update dates are NOT event dates unless the source explicitly
+  connects that date to the event/action.
+- "published on August 11" -> publication_date.
+- "updated on August 11" -> update_date.
+- "announced/happened/occurred/scheduled on August 11" -> event_date.
+- "last year", "Tuesday", etc. -> relative event time; preserve it as relative.
+- Age (for example "at 22") is an age fact, not a missing calendar date.
+- Preserve event status exactly: scheduled, ongoing, completed, announced,
+  postponed, cancelled, rescheduled, historical, or unknown.
+- Never infer a date from publication metadata.
 
-Examples:
-- "published on August 11" -> publication_date
-- "updated on August 11" -> update_date
-- "the ruling was announced on August 11" -> event_date for the announcement
-- "the court announced the ruling Tuesday" -> event_date for the announcement
-- "bought the house at 22" -> age fact; NOT a missing-calendar-date error
-- "the match is scheduled for August 11" -> scheduled event_date
-- "the match ended August 11" -> completed event_date
-- "last year" -> relative event time
-- a date appearing only in a page header/byline is NOT an event date
-
-Do NOT infer an event date from a publication date.
-
-Capture the exact event/action described by the source and the date attached
-to that event when the source explicitly connects them.
-
-Also capture:
-- exact people/entities
-- roles and titles
-- relationships
-- event status
-- sports competition/round/result when present
-- numbers, prices, percentages and rankings
-- quotes and their speakers
+CAPTURE WHEN SUPPORTED:
+- people/entities, exact roles/titles, relationships
+- event/action and status
+- exact dates and whether exact/relative/none
+- numbers, prices, percentages, rankings, scores
+- quotes and speakers
 - locations
-- claims that are uncertain or disputed
-- source-level attribution
+- uncertainty/dispute
+- source attribution
 
-A historical fact is valid evidence even if it is not a new event.
-Do not turn historical facts into current news.
+Keep each "fact", "evidence", "event", and "date_evidence" SHORT and atomic.
+Do not copy long source passages. Use the minimum wording needed to preserve
+the factual meaning. Do not omit a material fact merely to shorten the map.
 
-Return ONLY this JSON:
+Return ONLY this JSON object, with exactly this schema:
 
 {{
   "source_facts": [
@@ -235,15 +281,14 @@ Return ONLY this JSON:
   "attributions": []
 }}
 
-Never put a publication date into event_date unless the source text explicitly
-says the event happened/was announced/occurred on that date.
-
 SOURCE MATERIAL:
 {source_prompt}
 """,
         temperature=0.0,
         num_predict=EVIDENCE_TOKENS,
-    )
+        )
+    finally:
+        print(f"[TIMER] Evidence extraction TOTAL | elapsed={time.perf_counter() - stage_start:.2f}s")
 
 
 # ------------------------------------------------------------
@@ -268,17 +313,14 @@ Do not add facts merely to keep the article long.
         f"""
 You are TrendCurrent's UNIVERSAL ARTICLE GENERATOR.
 
-Write the article in the target language specified by the SOURCE MATERIAL.
+Write the article exclusively in {LANGUAGE}.
 
 The EVIDENCE MAP is the factual contract.
-Use ONLY facts contained in the EVIDENCE MAP or directly supported by the
-SOURCE MATERIAL.
-
-SOURCE MATERIAL:
-{source_prompt}
+Use ONLY facts contained in the EVIDENCE MAP.
+Do not use outside knowledge.
 
 EVIDENCE MAP:
-{json.dumps(evidence, ensure_ascii=False, indent=2)}
+{_compact_json(evidence)}
 
 NON-NEGOTIABLE FACTUAL RULES:
 
@@ -380,7 +422,7 @@ The previous article-generation response did not match the required JSON
 schema. Generate the article again.
 
 FACTUAL RULE:
-Use ONLY the SOURCE MATERIAL and EVIDENCE MAP. Do not add facts.
+Use ONLY the EVIDENCE MAP. Do not add facts or outside knowledge.
 
 REQUIRED JSON OBJECT:
 {{
@@ -404,14 +446,11 @@ REQUIREMENTS:
 - Every value must be valid JSON.
 - Do not use markdown code fences.
 - Return ONLY the JSON object.
-- Keep the article in the target language.
+- Keep the article in {LANGUAGE}.
 - If evidence is limited, write less rather than inventing facts.
 
-SOURCE MATERIAL:
-{source_prompt}
-
 EVIDENCE MAP:
-{json.dumps(evidence, ensure_ascii=False, indent=2)}
+{_compact_json(evidence)}
 """,
         temperature=0.03,
         num_predict=ARTICLE_TOKENS,
@@ -431,8 +470,7 @@ def _audit(source_prompt, article, evidence):
         f"""
 You are TrendCurrent's UNIVERSAL EVIDENCE-BOUND FACT AUDITOR.
 
-Your task is to audit the ARTICLE against ONLY the SOURCE MATERIAL and
-EVIDENCE MAP.
+Your task is to audit the ARTICLE against ONLY the EVIDENCE MAP.
 
 Do not use outside knowledge.
 Do not speculate.
@@ -541,14 +579,11 @@ STRICT RULE:
 If there is no real factual contradiction or unsupported material claim,
 return passed=true.
 
-SOURCE MATERIAL:
-{source_prompt}
-
 EVIDENCE MAP:
-{json.dumps(evidence, ensure_ascii=False, indent=2)}
+{_compact_json(evidence)}
 
 ARTICLE:
-{json.dumps(article, ensure_ascii=False, indent=2)}
+{_compact_json(article)}
 """,
         temperature=0.0,
         num_predict=AUDIT_TOKENS,
@@ -564,10 +599,10 @@ def _repair(source_prompt, article, evidence, audit):
         f"""
 You are TrendCurrent's UNIVERSAL FACTUAL REPAIR ENGINE.
 
-Repair the ARTICLE using ONLY the SOURCE MATERIAL and EVIDENCE MAP.
+Repair the ARTICLE using ONLY the EVIDENCE MAP and AUDIT.
 
 AUDIT ERRORS:
-{json.dumps(audit, ensure_ascii=False, indent=2)}
+{_compact_json(audit)}
 
 Rules:
 1. Correct only the listed factual errors.
@@ -588,17 +623,14 @@ Rules:
 12. Keep the original article language.
 12. Return the same JSON schema as the original article.
 
-SOURCE MATERIAL:
-{source_prompt}
-
 EVIDENCE MAP:
-{json.dumps(evidence, ensure_ascii=False, indent=2)}
+{_compact_json(evidence)}
 
 ARTICLE:
-{json.dumps(article, ensure_ascii=False, indent=2)}
+{_compact_json(article)}
 
 AUDIT:
-{json.dumps(audit, ensure_ascii=False, indent=2)}
+{_compact_json(audit)}
 
 Return ONLY the repaired article JSON.
 """,
@@ -1164,20 +1196,29 @@ def generate(prompt, retries=0):
     Ollama calls.
     """
 
+    pipeline_start = time.perf_counter()
+    print(f"[TIMER] PIPELINE START | prompt_chars={len(prompt or '')}")
+
     print("[PIPELINE] Evidence extraction...")
     evidence = _extract_evidence(prompt)
+    print(f"[TIMER] Evidence stage complete | elapsed={time.perf_counter() - pipeline_start:.2f}s")
 
     print("[PIPELINE] Article generation...")
+    article_stage_start = time.perf_counter()
     article = _generate_article_with_schema_retry(prompt, evidence)
+    print(f"[TIMER] Article stage complete | elapsed={time.perf_counter() - article_stage_start:.2f}s")
 
     if not _schema_ok(article):
         raise ValueError("Article generation returned invalid article schema after schema retry.")
 
     print("[PIPELINE] Evidence-bound audit...")
+    audit_stage_start = time.perf_counter()
     audit = _normalize_audit(_audit(prompt, article, evidence), evidence)
+    print(f"[TIMER] Initial audit complete | elapsed={time.perf_counter() - audit_stage_start:.2f}s")
 
     if audit["passed"]:
         print("[PIPELINE] FACT CHECK PASSED")
+        print(f"[TIMER] PIPELINE TOTAL | elapsed={time.perf_counter() - pipeline_start:.2f}s")
         return article
 
     print("[UNIVERSAL FACT/TEMPORAL CHECK FAILED]")
@@ -1202,7 +1243,9 @@ def generate(prompt, retries=0):
             print("[TEMPORAL RECOVERY] Existing evidence is sufficient; repairing from evidence.")
 
     print("[PIPELINE] One factual repair...")
+    repair_stage_start = time.perf_counter()
     repaired = _repair(prompt, article, evidence, audit)
+    print(f"[TIMER] Repair stage complete | elapsed={time.perf_counter() - repair_stage_start:.2f}s")
 
     if not _schema_ok(repaired):
         print("[PIPELINE] Repair schema invalid; one strict repair-schema retry...")
@@ -1221,24 +1264,21 @@ Return ONLY a valid JSON article object using exactly this schema:
 }}
 
 Repair ONLY the factual errors listed in the AUDIT.
-Use ONLY SOURCE MATERIAL and EVIDENCE MAP.
+Use ONLY the EVIDENCE MAP and AUDIT.
 Do not invent facts or dates.
 If dates or amounts conflict, remove the unsupported comparison instead of
 creating an intermediate value or date.
 Keep the original article language.
 Do not use markdown fences.
 
-SOURCE MATERIAL:
-{prompt}
-
 EVIDENCE MAP:
-{json.dumps(evidence, ensure_ascii=False, indent=2)}
+{_compact_json(evidence)}
 
 ORIGINAL ARTICLE:
-{json.dumps(article, ensure_ascii=False, indent=2)}
+{_compact_json(article)}
 
 AUDIT:
-{json.dumps(audit, ensure_ascii=False, indent=2)}
+{_compact_json(audit)}
 """,
             temperature=0.02,
             num_predict=REPAIR_TOKENS,
@@ -1252,10 +1292,14 @@ AUDIT:
         raise ValueError("Repair produced an unusably short article.")
 
     print("[PIPELINE] Final evidence-bound audit...")
+    final_audit_stage_start = time.perf_counter()
     final_audit = _normalize_audit(_audit(prompt, repaired, evidence), evidence)
+    print(f"[TIMER] Final audit complete | elapsed={time.perf_counter() - final_audit_stage_start:.2f}s")
+    print(f"[TIMER] PIPELINE TOTAL SO FAR | elapsed={time.perf_counter() - pipeline_start:.2f}s")
 
     if final_audit["passed"]:
         print("[PIPELINE] FACT CHECK PASSED AFTER REPAIR")
+        print(f"[TIMER] PIPELINE TOTAL | elapsed={time.perf_counter() - pipeline_start:.2f}s")
         return repaired
 
     print("[UNIVERSAL FINAL FACT/TEMPORAL CHECK FAILED]")
