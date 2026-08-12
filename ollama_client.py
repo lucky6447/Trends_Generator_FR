@@ -41,13 +41,13 @@ from config import MODEL, LANGUAGE
 # This is intentionally language-independent and topic-independent.
 # ============================================================
 
-PIPELINE_VERSION = "universal-build-temporal-recovery-v12-compression-v1"
+PIPELINE_VERSION = "universal-build-temporal-recovery-v15.3-inference-final-cleanup-v1"
 
 NUM_THREADS = int(os.getenv("OLLAMA_NUM_THREADS", "16"))
 NUM_GPU = int(os.getenv("OLLAMA_NUM_GPU", "0"))
 NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
 
-EVIDENCE_TOKENS = 1400
+EVIDENCE_TOKENS = 1800
 ARTICLE_TOKENS = 2400
 AUDIT_TOKENS = 1800
 REPAIR_TOKENS = 2400
@@ -230,6 +230,24 @@ TEMPORAL RULES:
 - Preserve event status exactly: scheduled, ongoing, completed, announced,
   postponed, cancelled, rescheduled, historical, or unknown.
 - Never infer a date from publication metadata.
+- When multiple source items describe the SAME underlying event/action at
+  different points in time, determine whether a later source explicitly
+  updates, clarifies, confirms, reschedules, postpones, cancels, or otherwise
+  supersedes the earlier information.
+- A later source does NOT automatically supersede an earlier source merely
+  because its publication date is later. The source must refer to the same
+  event/action and provide an explicit update/clarification/status change.
+- Preserve both the earlier and later claims when both are relevant, but record
+  the supersession relationship in "temporal_updates".
+- Prefer the latest supported state when an article describes the CURRENT
+  schedule/status of the same event.
+- Example: "funeral is this week" followed by a later report saying "funeral is
+  today" => record that the later "today" statement supersedes the earlier
+  "this week" statement for the same funeral.
+- Example: "match scheduled for Tuesday" followed by "match postponed to
+  Thursday" => record Thursday as the current schedule and mark Tuesday as
+  superseded.
+- Do not treat a publication date alone as an update to the underlying event.
 
 CAPTURE WHEN SUPPORTED:
 - people/entities, exact roles/titles, relationships
@@ -240,6 +258,26 @@ CAPTURE WHEN SUPPORTED:
 - locations
 - uncertainty/dispute
 - source attribution
+- temporal update/supersession relationships between source items
+
+For "temporal_updates", each item should be an object with:
+- "event": the same underlying event/action
+- "earlier_evidence_ids": IDs of the earlier evidence items
+- "later_evidence_ids": IDs of the later evidence items
+- "earlier_claim": the earlier temporal/status claim
+- "later_claim": the later temporal/status claim
+- "supersedes": true only when the later source explicitly updates/clarifies/
+  confirms/reschedules/postpones/cancels or otherwise supersedes the earlier claim
+- "reason": a short source-grounded explanation
+
+RELATIONSHIP / ENTITY RULE:
+- Record only relationships explicitly supported by the source.
+- Keep the two entities and the exact relationship together.
+- Do NOT infer a person's club/team, job, title, relationship, nationality,
+  location, employer, or affiliation from context, familiarity, or outside
+  knowledge.
+- If a relationship is not explicitly established, leave it out.
+- Do not turn a person's mention into a role or affiliation.
 
 Keep each "fact", "evidence", "event", and "date_evidence" SHORT and atomic.
 Do not copy long source passages. Use the minimum wording needed to preserve
@@ -278,7 +316,8 @@ Return ONLY this JSON object, with exactly this schema:
   "numbers": [],
   "locations": [],
   "uncertainties": [],
-  "attributions": []
+  "attributions": [],
+  "temporal_updates": []
 }}
 
 SOURCE MATERIAL:
@@ -356,7 +395,9 @@ NON-NEGOTIABLE FACTUAL RULES:
    postponed/cancelled != completed
    announced != implemented unless the source says so.
 
-10. Preserve exact roles and relationships.
+10. Preserve exact roles and relationships. Never infer an entity relationship.
+    A person being mentioned near a team, organization, place, or role does NOT
+    establish membership, employment, affiliation, or position.
 
 11. Preserve quote speaker and attribution.
 
@@ -372,9 +413,46 @@ NON-NEGOTIABLE FACTUAL RULES:
 16. Do not add unsupported psychological claims, motives, causation,
     significance or dramatic adjectives.
 
-17. If evidence is limited, write a shorter article. Never add filler.
+17. Do not add "plausible" explanatory language that is not in the evidence.
+    This includes claims such as "indicating", "suggesting", "showing that",
+    "highlighting", "reflecting", "reinforcing", "demonstrating", "aims to",
+    "perfect for", "looking forward to", "remains focused on", or similar
+    interpretations unless the evidence explicitly supports that meaning.
 
-18. The conclusion must not introduce a new fact.
+17A. NO DERIVED CONSEQUENCES OR SIGNIFICANCE:
+    Do not derive a new consequence, impact, implication, importance, readiness,
+    likelihood, policy effect, market effect, strategic meaning, or other
+    evaluation from a supported fact.
+    Example: evidence that "Rwanda suspended imports of more than 50 alcohol
+    brands" does NOT support adding "this could have significant impacts on the
+    domestic market" unless the evidence explicitly states that impact.
+    Example: evidence that "Italy maintains the Libya model" does NOT by itself
+    support "this indicates Italy is not ready to follow the Albania model".
+    A sentence may state a forecast, consequence, motive, evaluation, or
+    interpretation ONLY when that exact meaning is directly present in the
+    EVIDENCE MAP.
+    Plausibility, common sense, or logical consequence is NOT evidence.
+
+18. Relative-time words such as "today", "tomorrow", "yesterday", "tonight",
+    "currently", "soon", "recently", "upcoming", "earlier this week" and
+    "this week" are factual temporal claims. Use them only when the evidence
+    explicitly supports the same temporal relationship. When in doubt, use
+    the concrete event/status supported by the evidence or omit the phrase.
+
+19. TEMPORAL EVIDENCE PRECEDENCE:
+    When "temporal_updates" says a later evidence item supersedes an earlier
+    item for the SAME event/action, use the later supported state for the
+    current story. Do not regress to the superseded wording merely because the
+    earlier wording is also factually true historically.
+    Do NOT infer supersession from publication order alone.
+
+20. Title, description, H1, intro and section headings are factual output too.
+    They must contain only claims supported by the evidence map and must not
+    introduce a stronger, newer, or more specific version of the story.
+
+21. If evidence is limited, write a shorter article. Never add filler.
+
+22. The conclusion must not introduce a new fact.
 
 Return ONLY:
 
@@ -448,6 +526,9 @@ REQUIREMENTS:
 - Return ONLY the JSON object.
 - Keep the article in {LANGUAGE}.
 - If evidence is limited, write less rather than inventing facts.
+- Do not derive consequences, impacts, significance, readiness, likelihood,
+  policy effects, market effects, or other interpretations from a base fact
+  unless that exact meaning is explicitly present in the EVIDENCE MAP.
 
 EVIDENCE MAP:
 {_compact_json(evidence)}
@@ -517,11 +598,21 @@ date establishes the date of the source's reporting/publication action.
 Do not incorrectly treat it as a claim that the underlying subject event
 occurred on August 6.
 
-A relative temporal phrase is NOT an exact-date claim. Examples include:
-"before the 2026 WNBA All-Star Game", "during the tournament", "earlier this week",
-"recently", "after the announcement", or "before the match". Do not demand a
-calendar date merely because the phrase identifies a time window or relative
-position. Instead, check whether the source/evidence supports that relationship.
+A relative temporal phrase is NOT an exact-date claim, but it IS still a
+factual temporal claim. Examples include "before the 2026 WNBA All-Star Game",
+"during the tournament", "earlier this week", "recently", "after the
+announcement", or "before the match". Do not demand a calendar date merely
+because the phrase is relative. Instead, verify that the source/evidence
+supports the SAME temporal relationship.
+
+SPECIAL RELATIVE-TIME GUARD:
+Treat "today", "tomorrow", "yesterday", "tonight", "currently", "soon",
+"recently", "upcoming", "earlier this week", "this week", "this month" and
+similar relative expressions as claims. They are errors when the evidence
+does not establish that temporal relationship. Do not use the current system
+date as a substitute for evidence. If the article can be correct without the
+relative expression, flag the unsupported expression and recommend removing
+only that expression.
 
 F. ANNOUNCEMENT
 "The ruling was announced on August 11" is supported if the source says the
@@ -538,11 +629,80 @@ Never turn a supported relative time relationship into an exact-date requirement
 H. TEMPORAL STATUS
 Do not transfer status/date from one event to another related event.
 
+H2. TEMPORAL EVIDENCE PRECEDENCE / SUPERSESSION
+When the evidence map contains a "temporal_updates" item with
+"supersedes": true, and the article describes the CURRENT state/schedule/status
+of that same event, the later evidence item is authoritative for that current
+claim. Do not flag the article merely because an earlier evidence item contains
+an older temporal state.
+If the article explicitly reports the earlier state as historical (for example,
+"it was initially reported as this week"), that earlier state may remain valid.
+Do not assume that a later publication date alone supersedes an earlier claim;
+the evidence map must establish the same-event update relationship.
+
 I. HISTORICAL FACT
 A source-supported historical fact remains factual even when it is not a new
 development.
 
+J. ENTITY / RELATIONSHIP INTEGRITY
+Audit every person/entity relationship independently. A claim such as
+"Person X plays for Team Y", "Person X is the coach of Team Y", "Person X is
+engaged to Person Y", or "Person X works for Organization Y" requires direct
+support for that exact relationship. Co-occurrence in the source is not enough.
+Do not import a relationship from general knowledge.
+
+K. UNSUPPORTED INFERENCE / EMBELLISHMENT
+Flag claims that add motive, psychology, causation, significance, evaluation,
+recommendation, certainty, severity, or narrative meaning beyond the evidence.
+Examples include "indicating", "suggesting", "showing that", "highlighting",
+"reflecting", "reinforcing", "perfect for", "aims to", "looking forward to",
+"remains focused on", "caused a major crisis", "serious environmental
+disaster", or similar stronger interpretations unless explicitly supported.
+
+K2. SENTENCE-LEVEL DERIVATION TEST
+For EVERY article sentence that goes beyond a direct event/person/number/date/
+quote/location statement, ask:
+1. What exact evidence item supports the added meaning?
+2. Does that evidence explicitly state the consequence, impact, significance,
+   interpretation, readiness, likelihood, or evaluation?
+3. Or is the article merely deriving it from another fact?
+
+If the sentence is a derived consequence/interpretation and the EVIDENCE MAP
+does not explicitly state that consequence/interpretation, flag it as
+INFERENCE. Do NOT accept logical plausibility as support.
+
+Examples of claims that MUST be flagged when the evidence contains only the
+preceding base fact:
+- "This is an important phase that could lead to significant policy changes"
+  when evidence only says that negotiations are taking place.
+- "This indicates that Italy is not ready to follow the Albania model" when
+  evidence only says Italy maintains the Libya model.
+- "This decision could have significant impacts on the domestic market or
+  international trade" when evidence only says imports were suspended.
+
+These examples illustrate the reasoning error, not a language-specific
+keyword rule. Apply the same test to equivalent wording in ANY article
+language. If the evidence explicitly states the consequence/interpretation,
+PASS it.
+
+L. OUTPUT-FIELD CONSISTENCY
+Audit title, description, H1, intro, section headings and section text as
+separate factual surfaces. No field may introduce a material claim absent
+from the evidence. Title/description must not be stronger or more specific
+than the evidence merely because they are metadata.
+
+M. INTERNAL CONSISTENCY
+Title, H1, description, intro and body must not contradict one another on
+person, team, event, date, status, number, outcome, or attribution. If two
+fields describe the same event differently, flag the contradiction even when
+the evidence itself is correct.
+
 AUDIT EVERY MATERIAL CLAIM.
+
+Before returning any TEMPORAL error, inspect "temporal_updates". If it explicitly
+marks a later evidence item as superseding an earlier item for the same event,
+judge a CURRENT article claim against the later state. Do not resurrect the
+superseded earlier state as the required correction.
 
 A claim is an ERROR only if:
 1. the source/evidence contradicts it, or
@@ -567,7 +727,7 @@ OR:
   "errors": [
     {{
       "severity": "CRITICAL|MAJOR|MINOR",
-      "category": "FACTUAL|TEMPORAL|ROLE|RELATIONSHIP|EVENT|SPORTS|NUMBER|QUOTE|ATTRIBUTION|LOCATION|CAUSATION|OTHER",
+      "category": "FACTUAL|TEMPORAL|ROLE|RELATIONSHIP|ENTITY|EVENT|SPORTS|NUMBER|QUOTE|ATTRIBUTION|LOCATION|CAUSATION|INFERENCE|CONSISTENCY|OTHER",
       "claim": "",
       "reason": "",
       "evidence_ids": ["F1", "E1"]
@@ -616,12 +776,46 @@ Rules:
 8. An announcement date is an event date when the source explicitly connects
    the announcement to that date.
 9. Preserve roles, relationships, status, numbers, quotes and attribution.
-10. Do not add filler after deleting unsupported material.
-11. When temporal evidence contains conflicting dates or amounts, remove the
-    unsupported comparison/sequence rather than inventing an intermediate value,
-    date, or "next day" change.
-12. Keep the original article language.
-12. Return the same JSON schema as the original article.
+10. Remove unsupported entity relationships instead of replacing them with
+    a plausible relationship.
+
+11. INFERENCE ERRORS ARE DELETE-FIRST:
+    For every AUDIT error with category INFERENCE:
+    - delete the unsupported claim;
+    - if the whole sentence is the inference, delete the whole sentence;
+    - if only one clause is unsupported, delete only that clause;
+    - never paraphrase, soften, generalize, summarize, or reinterpret it;
+    - never replace it with equivalent wording such as "underscores",
+      "highlights", "shows", "reflects", "demonstrates", "suggests",
+      "indicates", "points to", "signals", or "reveals";
+    - only use a replacement if the EVIDENCE MAP contains a directly supported
+      factual claim that is materially different from the rejected inference;
+      otherwise DELETE it.
+    If a sentence derives a consequence from a supported fact but the evidence
+    does not explicitly state that consequence, remove the derived clause or
+    sentence. Do not replace it with another speculative consequence.
+
+12. Remove unsupported relative-time words such as "today", "tomorrow",
+    "yesterday", "currently", "soon", or "recently" when the evidence does not
+    establish the same temporal relationship.
+13. Keep title, description and H1 evidence-bound; repair them if they
+    introduce unsupported facts or contradict the body.
+14. Do not add filler after deleting unsupported material.
+    If removing an unsupported inference makes the article unusually short,
+    the repair may expand it ONLY by adding additional directly supported,
+    material facts already present in the EVIDENCE MAP. It must not invent,
+    generalize, speculate, or add generic explanatory prose merely to reach a
+    word-count target.
+15. When temporal evidence contains conflicting dates or amounts, first check
+    "temporal_updates". If a later evidence item explicitly supersedes an earlier
+    item for the SAME event/action, repair the article to the later supported
+    state rather than reverting to the earlier state. Preserve the earlier state
+    only when the article explicitly reports it as historical/initial information.
+    If no supersession relationship is established, remove the unsupported
+    comparison/sequence rather than inventing an intermediate value, date, or
+    "next day" change.
+16. Keep the original article language.
+17. Return the same JSON schema as the original article.
 
 EVIDENCE MAP:
 {_compact_json(evidence)}
@@ -897,6 +1091,7 @@ or:
         "confidence": "medium",
     })
     recovered["events"] = events
+    recovered = _normalize_temporal_updates(recovered)
 
     print(
         "[TEMPORAL RECOVERY] Resolved:",
@@ -957,6 +1152,42 @@ def _article_word_count(article):
         parts.append(section.get("text", ""))
 
     return len(" ".join(parts).split())
+
+
+def _normalize_temporal_updates(evidence):
+    """Normalize explicit same-event temporal supersession records only."""
+    if not isinstance(evidence, dict):
+        return evidence
+    updates = evidence.get("temporal_updates", [])
+    if not isinstance(updates, list):
+        evidence["temporal_updates"] = []
+        return evidence
+    normalized = []
+    for item in updates:
+        if not isinstance(item, dict):
+            continue
+        earlier_ids = item.get("earlier_evidence_ids", [])
+        later_ids = item.get("later_evidence_ids", [])
+        if isinstance(earlier_ids, str):
+            earlier_ids = [earlier_ids]
+        if isinstance(later_ids, str):
+            later_ids = [later_ids]
+        earlier_ids = [str(x).strip() for x in earlier_ids if str(x).strip()]
+        later_ids = [str(x).strip() for x in later_ids if str(x).strip()]
+        event = str(item.get("event", "")).strip()
+        if not event or not earlier_ids or not later_ids:
+            continue
+        normalized.append({
+            "event": event,
+            "earlier_evidence_ids": earlier_ids,
+            "later_evidence_ids": later_ids,
+            "earlier_claim": str(item.get("earlier_claim", "")).strip(),
+            "later_claim": str(item.get("later_claim", "")).strip(),
+            "supersedes": bool(item.get("supersedes", False)),
+            "reason": str(item.get("reason", "")).strip(),
+        })
+    evidence["temporal_updates"] = normalized
+    return evidence
 
 
 def _normalize_audit(audit, evidence=None):
@@ -1178,6 +1409,66 @@ def _normalize_audit(audit, evidence=None):
 
 
 # ------------------------------------------------------------
+# Final inference cleanup guard
+# ------------------------------------------------------------
+
+def _final_inference_cleanup(article, evidence, audit):
+    """Remove inference claims discovered only by the final audit.
+
+    This is intentionally a narrow post-repair guard. It is NOT a general
+    regeneration loop and it is invoked only when the final audit contains
+    INFERENCE errors and no other error category. The cleanup receives the
+    exact final-audit claims and is forbidden to paraphrase or replace them.
+    """
+    inference_errors = [
+        e for e in (audit or {}).get("errors", [])
+        if str(e.get("category", "")).upper() == "INFERENCE"
+    ]
+    if not inference_errors:
+        return article
+
+    return _call(
+        f"""
+You are TrendCurrent's FINAL INFERENCE CLEANUP ENGINE.
+
+The article has already passed the normal repair stage, but the FINAL AUDIT
+found unsupported INFERENCE claims that were missed earlier.
+
+Your ONLY task is to REMOVE those unsupported inference claims.
+
+NON-NEGOTIABLE:
+- Use ONLY the EVIDENCE MAP.
+- Remove every claim listed in the INFERENCE ERRORS.
+- If an error claim is a complete sentence, DELETE that sentence.
+- If it is a clause inside a supported sentence, DELETE ONLY that unsupported
+  clause and preserve the supported factual material.
+- NEVER paraphrase, soften, generalize, summarize, reinterpret, or replace an
+  unsupported inference.
+- NEVER replace it with equivalent wording such as suggests, indicates,
+  highlights, underscores, reflects, demonstrates, shows, signals, or reveals.
+- Do not add any new fact, explanation, consequence, significance, opinion,
+  motive, or filler.
+- Preserve all supported facts, dates, roles, relationships, numbers,
+  attribution, and the original article language.
+- Keep title/description/H1 valid and factual. If an unsupported inference is
+  present there, remove it rather than replacing it with another claim.
+- Return the SAME JSON schema. Return ONLY JSON.
+
+INFERENCE ERRORS:
+{_compact_json(inference_errors)}
+
+EVIDENCE MAP:
+{_compact_json(evidence)}
+
+ARTICLE:
+{_compact_json(article)}
+""",
+        temperature=0.0,
+        num_predict=REPAIR_TOKENS,
+    )
+
+
+# ------------------------------------------------------------
 # Public API
 # ------------------------------------------------------------
 
@@ -1192,8 +1483,14 @@ def generate(prompt, retries=0):
         evidence -> article -> audit -> one repair -> final audit
 
     There is NO regeneration loop and NO recursive retry loop.
-    A single trend therefore has a deterministic upper bound of five
-    Ollama calls.
+    A single trend therefore has a deterministic upper bound of eight
+    Ollama calls:
+        - 3 normal calls: evidence -> article -> audit
+        - +1 temporal recovery when needed
+        - +1 repair
+        - +1 final audit
+        - +1 inference cleanup when needed
+        - +1 post-cleanup audit when inference cleanup runs
     """
 
     pipeline_start = time.perf_counter()
@@ -1201,6 +1498,7 @@ def generate(prompt, retries=0):
 
     print("[PIPELINE] Evidence extraction...")
     evidence = _extract_evidence(prompt)
+    evidence = _normalize_temporal_updates(evidence)
     print(f"[TIMER] Evidence stage complete | elapsed={time.perf_counter() - pipeline_start:.2f}s")
 
     print("[PIPELINE] Article generation...")
@@ -1268,6 +1566,13 @@ Use ONLY the EVIDENCE MAP and AUDIT.
 Do not invent facts or dates.
 If dates or amounts conflict, remove the unsupported comparison instead of
 creating an intermediate value or date.
+For every INFERENCE error, DELETE the unsupported inference rather than
+paraphrasing, softening, or replacing it with another interpretation. Delete the
+whole sentence when the whole sentence is unsupported; otherwise delete only the
+unsupported clause. Never substitute equivalent wording such as "underscores",
+"highlights", "shows", "reflects", "demonstrates", "suggests", or "indicates".
+If removing such language makes the article short, add only additional material
+facts already present in the EVIDENCE MAP; never add filler or speculation.
 Keep the original article language.
 Do not use markdown fences.
 
@@ -1305,6 +1610,51 @@ AUDIT:
     print("[UNIVERSAL FINAL FACT/TEMPORAL CHECK FAILED]")
     print(json.dumps(final_audit, ensure_ascii=False, indent=2))
 
+    # --------------------------------------------------------
+    # V15.3 FINAL INFERENCE CLEANUP GUARD
+    # --------------------------------------------------------
+    # The initial auditor can occasionally miss an inference that becomes
+    # visible only after a temporal/factual repair. Do one narrow cleanup when
+    # the FINAL audit contains INFERENCE errors and nothing else. This prevents
+    # the model from merely rephrasing the inference while keeping the main
+    # one-repair architecture intact for ordinary factual/temporal failures.
+    # --------------------------------------------------------
+    final_errors = final_audit.get("errors", [])
+    if final_errors and all(
+        str(e.get("category", "")).upper() == "INFERENCE"
+        for e in final_errors
+    ):
+        print("[PIPELINE] Final inference cleanup guard...")
+        cleanup_stage_start = time.perf_counter()
+        cleaned = _final_inference_cleanup(repaired, evidence, final_audit)
+        print(
+            f"[TIMER] Final inference cleanup complete | elapsed="
+            f"{time.perf_counter() - cleanup_stage_start:.2f}s"
+        )
+
+        if not _schema_ok(cleaned):
+            raise ValueError("Final inference cleanup returned invalid article schema.")
+        if _article_word_count(cleaned) < 40:
+            raise ValueError("Final inference cleanup produced an unusably short article.")
+
+        print("[PIPELINE] Final evidence-bound audit after inference cleanup...")
+        cleanup_audit_stage_start = time.perf_counter()
+        cleanup_audit = _normalize_audit(
+            _audit(prompt, cleaned, evidence), evidence
+        )
+        print(
+            f"[TIMER] Cleanup final audit complete | elapsed="
+            f"{time.perf_counter() - cleanup_audit_stage_start:.2f}s"
+        )
+
+        if cleanup_audit["passed"]:
+            print("[PIPELINE] FACT CHECK PASSED AFTER FINAL INFERENCE CLEANUP")
+            print(f"[TIMER] PIPELINE TOTAL | elapsed={time.perf_counter() - pipeline_start:.2f}s")
+            return cleaned
+
+        print("[UNIVERSAL POST-CLEANUP FACT/TEMPORAL CHECK FAILED]")
+        print(json.dumps(cleanup_audit, ensure_ascii=False, indent=2))
+
     raise ValueError(
-        "Article failed source-grounded validation after one factual repair."
+        "Article failed source-grounded validation after factual repair and final inference cleanup."
     )
