@@ -41,7 +41,7 @@ from config import MODEL, LANGUAGE
 # This is intentionally language-independent and topic-independent.
 # ============================================================
 
-PIPELINE_VERSION = "universal-build-temporal-recovery-v15.3-inference-final-cleanup-v1"
+PIPELINE_VERSION = "universal-build-temporal-recovery-v15.4-stable-article-guard-v1"
 
 NUM_THREADS = int(os.getenv("OLLAMA_NUM_THREADS", "16"))
 NUM_GPU = int(os.getenv("OLLAMA_NUM_GPU", "0"))
@@ -53,6 +53,12 @@ AUDIT_TOKENS = 1800
 REPAIR_TOKENS = 2400
 
 MAX_REPAIR_ATTEMPTS = 1
+
+# Article completeness guard. The downstream generator rejects articles below
+# 70 words, so keep a small safety margin. This guard runs BEFORE factual audit
+# when possible, and again after repair/cleanup. It never adds unsupported facts.
+MIN_ARTICLE_WORDS = 82
+MAX_ARTICLE_WORDS_TARGET = 150
 
 # ============================================================
 # BUILD: TEMPORAL RECOVERY v11
@@ -450,7 +456,11 @@ NON-NEGOTIABLE FACTUAL RULES:
     They must contain only claims supported by the evidence map and must not
     introduce a stronger, newer, or more specific version of the story.
 
-21. If evidence is limited, write a shorter article. Never add filler.
+21. If evidence is limited, use the supported facts available rather than filler.
+    The finished article should normally be at least 82 words total across title,
+    description, H1, intro and sections. Do not stop after only the first one or
+    two supported facts when additional material facts are available in the map.
+    Never add unsupported filler merely to reach a length.
 
 22. The conclusion must not introduce a new fact.
 
@@ -525,7 +535,8 @@ REQUIREMENTS:
 - Do not use markdown code fences.
 - Return ONLY the JSON object.
 - Keep the article in {LANGUAGE}.
-- If evidence is limited, write less rather than inventing facts.
+- If evidence is limited, use the supported facts available rather than stopping prematurely.
+- Aim for at least 82 words total when the evidence map contains enough material.
 - Do not derive consequences, impacts, significance, readiness, likelihood,
   policy effects, market effects, or other interpretations from a base fact
   unless that exact meaning is explicitly present in the EVIDENCE MAP.
@@ -538,6 +549,79 @@ EVIDENCE MAP:
     )
 
     return retry
+
+
+# ------------------------------------------------------------
+# Article completeness guard
+# ------------------------------------------------------------
+
+def _expand_short_article(article, evidence, reason="initial"):
+    """Expand only undersized articles using already-supported evidence.
+
+    This is deliberately a targeted completeness pass, not a regeneration loop.
+    It runs before an article can be rejected by the downstream 70-word validator.
+    The model may only add material facts already present in the evidence map and
+    must not invent filler, implications, motives, or interpretations.
+    """
+    if not _schema_ok(article):
+        return article
+
+    words = _article_word_count(article)
+    if words >= MIN_ARTICLE_WORDS:
+        return article
+
+    print(
+        f"[PIPELINE] Article too short ({words} words); "
+        f"targeted evidence-only expansion ({reason})..."
+    )
+
+    expanded = _call(
+        f"""
+You are TrendCurrent's ARTICLE COMPLETENESS REPAIR ENGINE.
+
+The supplied article is factually constrained and is too short for publication.
+Expand it ONLY by adding directly supported material facts already present in the
+EVIDENCE MAP. Do not rewrite supported facts unnecessarily.
+
+NON-NEGOTIABLE RULES:
+- Use ONLY the EVIDENCE MAP.
+- Do NOT add outside knowledge.
+- Do NOT add filler or generic commentary.
+- Do NOT add consequences, significance, motives, predictions, emotions,
+  implications, or interpretations unless explicitly present in the evidence.
+- Preserve dates, status, roles, relationships, numbers, quotes and attribution.
+- Do not invent an exact date.
+- Keep the original article language.
+- Keep the same JSON schema.
+- Aim for {MIN_ARTICLE_WORDS}-{MAX_ARTICLE_WORDS_TARGET} total words.
+- Add only as many supported details as needed.
+- Do not remove supported material merely to rewrite it.
+
+EVIDENCE MAP:
+{_compact_json(evidence)}
+
+CURRENT ARTICLE:
+{_compact_json(article)}
+
+Return ONLY the repaired article JSON.
+""",
+        temperature=0.02,
+        num_predict=ARTICLE_TOKENS,
+    )
+
+    if not _schema_ok(expanded):
+        print("[PIPELINE] Short-article expansion returned invalid schema; keeping original.")
+        return article
+
+    expanded_words = _article_word_count(expanded)
+    print(f"[PIPELINE] Article completeness result: {expanded_words} words")
+
+    # Never replace a usable article with a shorter expansion.
+    if expanded_words < words:
+        print("[PIPELINE] Expansion was shorter; keeping original article.")
+        return article
+
+    return expanded
 
 
 # ------------------------------------------------------------
@@ -1483,14 +1567,16 @@ def generate(prompt, retries=0):
         evidence -> article -> audit -> one repair -> final audit
 
     There is NO regeneration loop and NO recursive retry loop.
-    A single trend therefore has a deterministic upper bound of eight
-    Ollama calls:
+    A single trend normally uses three calls, with targeted recovery only when
+    necessary. A short-article completeness pass is used only when the article is
+    below the publication safety margin:
         - 3 normal calls: evidence -> article -> audit
-        - +1 temporal recovery when needed
-        - +1 repair
-        - +1 final audit
-        - +1 inference cleanup when needed
-        - +1 post-cleanup audit when inference cleanup runs
+        - +1 short-article expansion only when needed
+        - +1 temporal recovery only when needed
+        - +1 repair when needed
+        - +1 final audit after repair
+        - +1 inference cleanup only when the final audit contains inference-only errors
+        - +1 final audit after that cleanup
     """
 
     pipeline_start = time.perf_counter()
@@ -1508,6 +1594,10 @@ def generate(prompt, retries=0):
 
     if not _schema_ok(article):
         raise ValueError("Article generation returned invalid article schema after schema retry.")
+
+    # Prevent the common failure where factual audit passes but the downstream
+    # publisher rejects the article for being under 70 words. Expand first, then audit.
+    article = _expand_short_article(article, evidence, reason="pre-audit")
 
     print("[PIPELINE] Evidence-bound audit...")
     audit_stage_start = time.perf_counter()
@@ -1592,9 +1682,12 @@ AUDIT:
     if not _schema_ok(repaired):
         raise ValueError("Repair returned invalid article schema after schema retry.")
 
-    # Do not allow repair to turn a valid article into an empty shell.
-    if _article_word_count(repaired) < 40:
-        raise ValueError("Repair produced an unusably short article.")
+    # Repair may delete an unsupported inference and accidentally leave the article
+    # below the publisher minimum. Expand only from the existing evidence map.
+    repaired = _expand_short_article(repaired, evidence, reason="post-repair")
+
+    if _article_word_count(repaired) < 70:
+        raise ValueError("Repair produced an article below the publication minimum after evidence-only expansion.")
 
     print("[PIPELINE] Final evidence-bound audit...")
     final_audit_stage_start = time.perf_counter()
@@ -1634,8 +1727,10 @@ AUDIT:
 
         if not _schema_ok(cleaned):
             raise ValueError("Final inference cleanup returned invalid article schema.")
-        if _article_word_count(cleaned) < 40:
-            raise ValueError("Final inference cleanup produced an unusably short article.")
+
+        cleaned = _expand_short_article(cleaned, evidence, reason="post-cleanup")
+        if _article_word_count(cleaned) < 70:
+            raise ValueError("Final inference cleanup produced an article below the publication minimum after evidence-only expansion.")
 
         print("[PIPELINE] Final evidence-bound audit after inference cleanup...")
         cleanup_audit_stage_start = time.perf_counter()
