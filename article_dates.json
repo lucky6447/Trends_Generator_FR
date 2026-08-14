@@ -510,5 +510,9 @@
   "grammy-awards": {
     "published_at": "2026-08-14 13:13",
     "order": -128
+  },
+  "scrabble": {
+    "published_at": "2026-08-14 18:46",
+    "order": -129
   }
 }
