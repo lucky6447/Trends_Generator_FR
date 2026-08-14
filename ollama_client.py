@@ -39,10 +39,10 @@ EVIDENCE_CHUNK_CHARS = max(
     7000, int(os.getenv("OLLAMA_EVIDENCE_CHUNK_CHARS", "14000"))
 )
 EVIDENCE_TOKENS = max(
-    240, int(os.getenv("OLLAMA_EVIDENCE_TOKENS", "360"))
+    360, int(os.getenv("OLLAMA_EVIDENCE_TOKENS", "480"))
 )
 EVIDENCE_MAX_FACTS = max(
-    4, int(os.getenv("OLLAMA_EVIDENCE_MAX_FACTS", "8"))
+    4, int(os.getenv("OLLAMA_EVIDENCE_MAX_FACTS", "6"))
 )
 
 ARTICLE_TOKENS = max(
@@ -74,7 +74,7 @@ EVIDENCE_PARALLEL = os.getenv(
 # One retry is allowed only for malformed/truncated evidence JSON.
 # The retry uses a smaller output contract, not another huge prompt.
 EVIDENCE_RETRY_TOKENS = max(
-    180, int(os.getenv("OLLAMA_EVIDENCE_RETRY_TOKENS", "220"))
+    EVIDENCE_TOKENS, int(os.getenv("OLLAMA_EVIDENCE_RETRY_TOKENS", "520"))
 )
 
 print(f"[TrendCurrent PIPELINE] {PIPELINE_VERSION}")
@@ -317,11 +317,13 @@ You are TrendCurrent's source-evidence extractor.
 Read ONLY the SOURCE MATERIAL. Build evidence for ONE publishable news story.
 
 PRIMARY-EVENT RULE:
-- Identify the main story/event in the supplied material.
-- Keep unrelated games, injuries, statements, people, dates or incidents out.
-- Facts that belong to the SAME main event must share the same group value.
+- Identify the MAIN story/event in the supplied material.
+- Return facts ONLY from that main story. Exclude unrelated games, injuries, statements,
+  people, dates or incidents even when they share a person or topic.
+- ALL returned facts from the main story MUST use group "G1". Do not create G2/G3
+  for supporting details of the same story.
 - Do NOT stop after one fact if the source contains more directly useful facts.
-- Extract up to {limit} useful facts from the main event. Prefer 4-8 when available.
+- Extract up to {limit} useful facts from the main event. Prefer 4-6 when available.
 - A useful fact can be the event itself, date, location, result/status, named people,
   numbers, direct developments or other material details explicitly supported by the source.
 - Do not manufacture supporting facts just to reach a count.
@@ -332,11 +334,12 @@ FACT RULES:
 - Never turn reported/expected/talks into confirmed facts.
 - Do not infer motives, causes, consequences or significance.
 - Do not use outside knowledge.
-- Keep excerpts short.
+- Keep excerpts short (prefer <=160 characters).
+- For "s", return only the publisher/source name, never a URL.
 - Return ONLY JSON. No article and no commentary.
 
 Use this compact JSON shape:
-{{"facts":[{{"g":"G1","f":"fact","e":"short source excerpt","s":"source","d":"date or empty","t":"status or empty"}}]}}
+{{"facts":[{{"g":"G1","f":"fact","e":"short excerpt","s":"publisher","d":"date or empty","t":"status or empty"}}]}}
 
 SOURCE MATERIAL:
 {source}
@@ -348,10 +351,11 @@ def _evidence_retry_prompt(source):
 Extract the MAIN EVENT from this source. Return ONLY compact JSON.
 
 Use 2-6 facts if the source supports them; do not invent facts.
-All returned facts must belong to the same main event. Exclude unrelated events.
-Every fact needs a short supporting excerpt copied from the source.
+All returned facts must belong to the same main event and MUST use group "G1".
+Exclude unrelated events. Every fact needs a short supporting excerpt copied from the source.
+For "s", use only the publisher/source name, never a URL.
 
-{{"facts":[{{"g":"G1","f":"fact","e":"excerpt","s":"source","d":"date or empty","t":"status or empty"}}]}}
+{{"facts":[{{"g":"G1","f":"fact","e":"excerpt","s":"publisher","d":"date or empty","t":"status or empty"}}]}}
 
 SOURCE:
 {source}
@@ -392,8 +396,8 @@ def _normalize_evidence(data):
             "id": f"F{len(clean) + 1}",
             "group": group,
             "fact": fact,
-            "excerpt": excerpt[:220],
-            "source": source,
+            "excerpt": excerpt[:160],
+            "source": source[:80],
             "date": date,
             "status": status,
         })
