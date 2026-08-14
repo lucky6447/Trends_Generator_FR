@@ -26,7 +26,7 @@ from config import MODEL, LANGUAGE
 #   * language-independent
 # ============================================================
 
-PIPELINE_VERSION = "universal-fact-lock-v2.1-balanced"
+PIPELINE_VERSION = "universal-fact-lock-v2.1-balanced-entity-lock-v1"
 
 NUM_THREADS = max(1, int(os.getenv("OLLAMA_NUM_THREADS", "16")))
 NUM_CTX = max(4096, int(os.getenv("OLLAMA_NUM_CTX", "8192")))
@@ -326,6 +326,12 @@ PRIMARY-EVENT RULE:
 - Extract up to {limit} useful facts from the main event. Prefer 4-6 when available.
 - A useful fact can be the event itself, date, location, result/status, named people,
   numbers, direct developments or other material details explicitly supported by the source.
+- CRITICAL ENTITY RULE: When the main story explicitly states a named person's role,
+  position, job title or other identity-defining attribute, ALWAYS extract that attribute
+  as a separate fact if it is relevant to the main event. Never omit an explicit role or
+  position merely because the event itself is already covered.
+- For person-related facts, name the person explicitly in the "f" field. Do not use pronouns
+  such as "he", "she" or "they" when the fact can be stated with the person's name.
 - Do not manufacture supporting facts just to reach a count.
 
 FACT RULES:
@@ -353,6 +359,9 @@ Extract the MAIN EVENT from this source. Return ONLY compact JSON.
 Use 2-6 facts if the source supports them; do not invent facts.
 All returned facts must belong to the same main event and MUST use group "G1".
 Exclude unrelated events. Every fact needs a short supporting excerpt copied from the source.
+If the main story explicitly states a named person's role, position, job title or identity
+attribute, ALWAYS include that as a separate fact.
+For person-related facts, use the person's full name rather than pronouns.
 For "s", use only the publisher/source name, never a URL.
 
 {{"facts":[{{"g":"G1","f":"fact","e":"excerpt","s":"publisher","d":"date or empty","t":"status or empty"}}]}}
@@ -362,7 +371,23 @@ SOURCE:
 """
 
 
-def _normalize_evidence(data):
+def _source_excerpt_supported(source, excerpt):
+    """
+    Deterministic provenance guard.
+
+    The extractor may paraphrase the fact field, but the evidence excerpt must
+    actually occur in the supplied source. Whitespace is normalized only.
+    """
+    source_norm = re.sub(r"\s+", " ", (source or "")).strip().casefold()
+    excerpt_norm = re.sub(r"\s+", " ", (excerpt or "")).strip().casefold()
+
+    if not source_norm or not excerpt_norm:
+        return False
+
+    return excerpt_norm in source_norm
+
+
+def _normalize_evidence(data, source_material=None):
     if not isinstance(data, dict):
         raise ValueError("Evidence response is not an object.")
 
@@ -380,11 +405,17 @@ def _normalize_evidence(data):
         group = str(item.get("g", "")).strip()
         fact = str(item.get("f", "")).strip()
         excerpt = str(item.get("e", "")).strip()
-        source = str(item.get("s", "")).strip()
+        source_name = str(item.get("s", "")).strip()
         date = str(item.get("d", "")).strip()
         status = str(item.get("t", "")).strip()
 
         if not group or not fact or not excerpt:
+            continue
+
+        # Provenance guard: the excerpt must be traceable to the supplied source.
+        # This prevents fabricated evidence from entering the factual lock.
+        if source_material is not None and not _source_excerpt_supported(source_material, excerpt):
+            print("[PIPELINE] Evidence excerpt rejected: not found in source")
             continue
 
         key = (group.lower(), fact.lower(), excerpt.lower())
@@ -397,7 +428,7 @@ def _normalize_evidence(data):
             "group": group,
             "fact": fact,
             "excerpt": excerpt[:160],
-            "source": source[:80],
+            "source": source_name[:80],
             "date": date,
             "status": status,
         })
@@ -451,7 +482,7 @@ def _extract_evidence(source):
                 num_thread=NUM_THREADS,
                 response_format=_EVIDENCE_FORMAT,
             )
-            maps.append(_normalize_evidence(data))
+            maps.append(_normalize_evidence(data, source_material=chunk))
         except ValueError as exc:
             # Only malformed/truncated evidence is retried.  The retry is
             # compact, deterministic and deliberately smaller.
@@ -468,7 +499,7 @@ def _extract_evidence(source):
                 num_thread=NUM_THREADS,
                 response_format=_EVIDENCE_FORMAT,
             )
-            maps.append(_normalize_evidence(data))
+            maps.append(_normalize_evidence(data, source_material=chunk))
 
     # Merge only within the already selected primary group of each chunk.
     # Different chunks remain different groups, so they cannot accidentally
@@ -585,6 +616,8 @@ _ARTICLE_FORMAT = {
         "intro": {"type": "string"},
         "sections": {
             "type": "array",
+            "minItems": 1,
+            "maxItems": MAX_SECTIONS,
             "items": {
                 "type": "object",
                 "properties": {
@@ -617,6 +650,10 @@ BALANCED FACT RULES:
 - You may combine facts when they clearly describe the same event.
 - Do not add outside facts.
 - Do not invent dates, numbers, roles, locations, causes or motives.
+- ENTITY ATTRIBUTE LOCK: A person's role, position, job title or other identity-defining
+  attribute may be stated only when that attribute is explicitly present in LOCKED EVIDENCE.
+  If it is absent from LOCKED EVIDENCE, do not guess it. If LOCKED EVIDENCE explicitly
+  gives a different attribute, never substitute another one.
 - Preserve uncertainty and status.
 - Do not turn a report into a confirmed fact.
 - Do not use unsupported quotes.
@@ -626,6 +663,7 @@ BALANCED FACT RULES:
 - Use the available supporting facts naturally; do not collapse a multi-fact story into a single sentence.
 - If the evidence genuinely contains only one or two facts, a shorter article is acceptable.
 - Never add filler just to reach a word target.
+    - Return 1-4 sections only.
 
 Return ONLY the required JSON.
 
@@ -694,6 +732,7 @@ Flag only material factual problems:
 - unsupported fact
 - wrong date or number
 - wrong person/role/location
+- wrong or contradictory entity attribute (including a person's role, position or job title)
 - changed status or certainty
 - unsupported quote/attribution
 - unsupported causal claim
@@ -783,9 +822,12 @@ Repair this article using ONLY the LOCKED EVIDENCE and AUDIT.
 Rules:
 - Fix only the listed factual problems.
 - Delete unsupported material instead of inventing a replacement.
+- If an entity attribute conflicts with LOCKED EVIDENCE, delete the incorrect attribute or
+  replace it only with the exact supported attribute from LOCKED EVIDENCE.
 - Preserve supported material.
 - Do not add new facts.
-- Do not change dates, numbers, roles, status or certainty.
+- Do not change dates, numbers, roles, status or certainty except to correct a listed
+  contradiction using the exact LOCKED EVIDENCE.
 - Do not create quotes or attribution.
 - Keep the article in {LANGUAGE}.
 - Return only the article JSON.
