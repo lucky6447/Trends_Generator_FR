@@ -110,8 +110,20 @@ SPORT:
   from the supplied sources.
 - Never predict a winner, score or outcome.
 
-TRANSFERS:
+TRANSFERS — HARD STATUS LOCK:
 - Never assume a transfer is completed.
+- Preserve the exact stage reported by the sources:
+  interest -> talks/negotiations -> bid/offer -> agreement -> medical -> signing -> official completion.
+- These stages are mutually distinct factual states.
+- "talks", "negotiations", "interest", "possible", "expected", "could", "may",
+  or "reportedly" NEVER justify "agreement", "deal", "signed", "completed",
+  "joined", or "officially confirmed".
+- An agreement does not automatically mean the player has signed.
+- A signing does not automatically mean official completion unless the source
+  explicitly says so.
+- If sources describe different stages at different times, preserve the
+  chronology and do not collapse them into the strongest stage.
+
 - Preserve the exact status reported by the sources: interest, talks, bid,
   agreement, medical, signing, official announcement, loan, etc.
 - An agreement or negotiation is not automatically a completed transfer.
