@@ -27,7 +27,7 @@ from config import MODEL
 #   3) no automatic article rewriting
 # ============================================================
 
-FACT_GUARD_VERSION = "fact-guard-v1.0"
+FACT_GUARD_VERSION = "fact-guard-v1.1.1-temporal"
 
 NUM_THREADS = max(1, int(os.getenv("FACT_GUARD_NUM_THREADS", "16")))
 NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
@@ -111,6 +111,48 @@ def _source_contains(source: str, text: str) -> bool:
 
 
 # ============================================================
+
+def _temporal_consistency_signals(article: Dict[str, Any]) -> Dict[str, bool]:
+    """
+    Detect whether a focused cross-fact temporal audit is warranted.
+
+    This is only a trigger. It does not decide factual correctness.
+    """
+    text_norm = _normalize(_article_text(article))
+
+    temporal_patterns = [
+        r"\bround\s+\d+\b", r"\bround\b",
+        r"\bweek\s+\d+\b", r"\bmatchday\s+\d+\b", r"\bday\s+\d+\b",
+        r"\bopening round\b", r"\bsecond round\b", r"\bthird round\b",
+        r"\bfinal round\b", r"\bquarter[- ]final\b", r"\bsemi[- ]final\b",
+        r"\bfinal\b", r"\btoday\b", r"\byesterday\b",
+        r"\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+        r"\b\d{1,2}\s+[a-z]+\s+\d{4}\b",
+        r"\b[a-z]+\s+\d{1,2},\s+\d{4}\b",
+        r"\b\d{4}-\d{2}-\d{2}\b",
+    ]
+
+    score_patterns = [
+        r"\b(?:score|scored|shot|fired|carded|finished|recorded)\b.{0,45}\b\d{1,3}\b",
+        r"\b\d{1,3}\s*(?:under|over)\b",
+        r"\b\d{1,3}[-–]\d{1,3}\b",
+        r"\b\d{1,3}\b.{0,12}\b(?:goals?|points?|runs?|yards?|strokes?|shots?)\b",
+    ]
+
+    relation_patterns = [
+        r"\bin contrast\b", r"\bwhile\b", r"\bcompared with\b",
+        r"\bcompared to\b", r"\bversus\b", r"\bvs\.?\b",
+        r"\bwhereas\b", r"\bmeanwhile\b", r"\bbut\b",
+        r"\bafter\b", r"\bbefore\b", r"\bsame (?:day|round|week|match)\b",
+    ]
+
+    return {
+        "temporal": any(re.search(p, text_norm) for p in temporal_patterns),
+        "score": any(re.search(p, text_norm) for p in score_patterns),
+        "relation": any(re.search(p, text_norm) for p in relation_patterns),
+    }
+
+
 # Deterministic checks
 # ============================================================
 
@@ -239,10 +281,71 @@ def _deterministic_checks(source: str, article: Dict[str, Any]) -> List[Dict[str
     # --------------------------------------------------------
     # Obvious role/title substitutions
     #
-    # We do not maintain a hard-coded list of people. Instead, when
-    # the source contains an explicit title immediately around a name,
-    # the independent semantic audit will compare the article against it.
+    # Keep this deliberately narrow: role/title consistency is handled
+    # by the independent audit, but we explicitly mark it as a required
+    # high-priority comparison. We do not maintain a hard-coded person list.
     # --------------------------------------------------------
+
+    role_patterns = [
+        r"\\bmanager\\b", r"\\bcoach\\b", r"\\bhead coach\\b",
+        r"\\bplayer\\b", r"\\bmidfielder\\b", r"\\bdefender\\b",
+        r"\\bforward\\b", r"\\bpresident\\b", r"\\bceo\\b",
+        r"\\bowner\\b", r"\\bminister\\b", r"\\bmayor\\b",
+    ]
+    article_has_role_claim = any(re.search(p, text_norm) for p in role_patterns)
+
+    if article_has_role_claim:
+        add(
+            "REVIEW",
+            "role_attribution_check",
+            "Explicit person/entity role or title detected.",
+            "The independent audit must verify that each named person's role/title "
+            "matches the source and is not merely inferred from team/entity association."
+        )
+
+    # --------------------------------------------------------
+    # Current-state / temporal consistency
+    #
+    # A historical event must not be silently presented as a new/current
+    # event. The semantic audit is responsible for deciding the actual
+    # chronology from the supplied source.
+    # --------------------------------------------------------
+
+    temporal_patterns = [
+        r"\\b(joined|joins|signed|signs|moved|moves|transferred|transfer|departed|leaves|left)\\b",
+        r"\\b(on|since|from|as of)\\s+\\d{1,2}\\s+[a-z]+\\s+\\d{4}\\b",
+        r"\\b(on|since|from|as of)\\s+[a-z]+\\s+\\d{1,2},\\s+\\d{4}\\b",
+        r"\\b(\\d{4}-\\d{2}-\\d{2})\\b",
+        r"\\b(first|debut|latest|current|currently|today|yesterday)\\b",
+    ]
+
+    if any(re.search(p, text_norm) for p in temporal_patterns):
+        add(
+            "REVIEW",
+            "temporal_state_check",
+            "Explicit transfer/event/current-state claim detected.",
+            "The independent audit must reconstruct the event chronology from the "
+            "source and must not treat an old event as a new/current event."
+        )
+
+
+    # Cross-fact temporal relationship trigger. Individual facts can each be
+    # true while their combined temporal relationship is false.
+    temporal_signals = _temporal_consistency_signals(article)
+    if (
+        temporal_signals["temporal"]
+        and temporal_signals["score"]
+        and temporal_signals["relation"]
+    ):
+        add(
+            "REVIEW",
+            "cross_fact_temporal_consistency",
+            "Multiple time-bound facts are connected by a comparative or "
+            "relational statement.",
+            "The focused temporal audit must verify that the connected facts "
+            "belong to the same relevant event state rather than merely being "
+            "individually true."
+        )
 
     return issues
 
@@ -298,18 +401,46 @@ STRICT RULES:
 - Flag a claim when the source does not support it.
 - Flag wrong names, roles, dates, numbers, locations, event status,
   attribution, quotations, causal claims and exaggerated scope.
+- Reconstruct the chronology of important events before judging them.
+- When two or more factual claims are linked by "while", "in contrast",
+  "compared with", "versus", "whereas", "meanwhile", or similar wording,
+  verify the RELATION between the facts, not only each fact in isolation.
+- For time-bound results/statistics, bind each fact to its relevant event,
+  round, matchday, week, date, or status whenever the source provides it.
+  Do not combine a true fact from one temporal state with a true fact from
+  another temporal state as if they occurred in the same state.
+- A fact such as "Player A scored 61" and "Player B scored 74" can both be
+  source-supported while the sentence connecting them is still materially
+  wrong if 61 belongs to Round 2 and 74 belongs to Round 1.
+- Treat cross-round/cross-day/cross-match/cross-week conflation as HIGH when
+  the source explicitly establishes the conflicting temporal assignments.
+  Use REVIEW when the source does not contain enough temporal information.
+- For every person mentioned with a job/team role, verify the ROLE itself,
+  not merely that the person is associated with the club/company/entity.
+- Treat PLAYER vs MANAGER/COACH and similar role substitutions as material
+  factual errors when the source establishes the person's actual role.
+- For transfers, appointments, departures, signings and debuts, determine
+  the event date and the person's state at the article's claimed time.
+  An old/historical transfer must NOT be accepted as a new/current transfer
+  merely because the same person and destination still appear in the source.
 - Be especially careful with:
   * "record", "lowest/highest ever", "unprecedented", "first-ever"
   * "nationwide", "all cinemas", "everywhere"
   * causes, motives or connections inferred from chronology
   * people whose job title/role may have been changed
   * old information presented as current
+  * historical transfers/events presented as newly announced
+   * results/statistics from different rounds, dates, matchdays or weeks
+     accidentally combined into one comparison or same-day narrative
   * reported/expected/planned information presented as confirmed
 - A contextual sentence is NOT automatically wrong merely because it is
   not word-for-word in the source. Flag it only when it makes a factual
   claim that the source cannot reasonably support.
 - If a claim is uncertain, prefer severity REVIEW rather than HIGH.
 - HIGH means a clear material factual error or unsupported concrete claim.
+- A clearly wrong person-role attribution is HIGH.
+- A clearly wrong event chronology, such as an old transfer presented as a
+  new/current transfer, is HIGH.
 - REVIEW means the wording requires human/secondary verification.
 - Ignore style, grammar and harmless editorial wording.
 
@@ -346,6 +477,154 @@ SOURCE MATERIAL:
 ARTICLE:
 {json.dumps(article, ensure_ascii=False)}
 """
+
+
+
+_TEMPORAL_AUDIT_FORMAT = {
+    "type": "object",
+    "properties": {
+        "passed": {"type": "boolean"},
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {"type": "string"},
+                    "type": {"type": "string"},
+                    "claim": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "source_excerpt": {"type": "string"},
+                },
+                "required": [
+                    "severity", "type", "claim", "reason", "source_excerpt"
+                ],
+            },
+        },
+    },
+    "required": ["passed", "issues"],
+}
+
+
+def _temporal_audit_prompt(source: str, article: Dict[str, Any]) -> str:
+    return f"""
+You are a focused temporal-consistency validator for TrendCurrent.
+
+Your ONLY task is to detect factual errors caused by combining individually
+true facts that belong to different temporal/event states.
+
+SOURCE MATERIAL is the ONLY factual authority.
+
+STRICT RULES:
+- Do not use outside knowledge.
+- Do not rewrite the article.
+- Do not reject normal paraphrasing.
+- Bind each relevant result/statistic/event to the source-supported event,
+  round, matchday, week, date, or status whenever available.
+- Inspect whether the ARTICLE connects facts as if they belong to the same
+  temporal state.
+- Pay special attention to "while", "in contrast", "compared with",
+  "versus", "whereas", "meanwhile", "but", and similar relational wording.
+- A fact being individually true is NOT enough. The relationship between
+  connected facts must also be source-supported.
+- Example:
+  Source: A = 61 in Round 2; B = 74 in Round 1; B = 70 in Round 2.
+  Article: "A shot 61, while B struggled with 74."
+  This is HIGH if the wording presents 61 and 74 as results from the same
+  relevant round/day.
+- Do NOT infer a same-round relationship merely because facts appear in the
+  same source or article.
+- If the article explicitly identifies different rounds/dates, that is fine.
+- If the source lacks enough temporal information to decide, use REVIEW.
+- HIGH requires a clear temporal contradiction established by the source.
+- Ignore style and grammar.
+
+For every issue, provide a short exact source excerpt supporting the
+temporal conclusion. If none can be identified, leave it empty.
+
+Return ONLY JSON:
+{{
+  "passed": true,
+  "issues": []
+}}
+
+or:
+{{
+  "passed": false,
+  "issues": [
+    {{
+      "severity": "HIGH",
+      "type": "cross_round_conflation",
+      "claim": "short description of the connected claim",
+      "reason": "why the article combines different temporal states",
+      "source_excerpt": "short exact excerpt"
+    }}
+  ]
+}}
+
+SOURCE MATERIAL:
+{source}
+
+ARTICLE:
+{json.dumps(article, ensure_ascii=False)}
+"""
+
+
+def _ollama_temporal_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
+    response = chat(
+        model=MODEL,
+        messages=[{"role": "user", "content": _temporal_audit_prompt(source, article)}],
+        options={
+            "temperature": 0.0,
+            "top_p": 0.85,
+            "top_k": 40,
+            "num_ctx": NUM_CTX,
+            "num_predict": AUDIT_TOKENS,
+            "num_batch": NUM_BATCH,
+            "num_thread": NUM_THREADS,
+        },
+        format=_TEMPORAL_AUDIT_FORMAT,
+    )
+
+    raw = response.message.content or ""
+    result = _extract_json_object(raw)
+
+    if not isinstance(result, dict):
+        raise ValueError("Temporal Fact Guard audit returned invalid JSON.")
+
+    issues = result.get("issues", [])
+    if not isinstance(issues, list):
+        issues = []
+
+    clean = []
+    for item in issues:
+        if not isinstance(item, dict):
+            continue
+
+        claim = str(item.get("claim", "")).strip()
+        reason = str(item.get("reason", "")).strip()
+        if not claim or not reason:
+            continue
+
+        severity = str(item.get("severity", "REVIEW")).upper()
+        if severity not in {"HIGH", "MEDIUM", "LOW", "REVIEW"}:
+            severity = "REVIEW"
+
+        clean.append({
+            "severity": severity,
+            "type": str(
+                item.get("type", "cross_fact_temporal_consistency")
+            ).strip() or "cross_fact_temporal_consistency",
+            "claim": claim,
+            "reason": reason,
+            "source_excerpt": str(item.get("source_excerpt", "")).strip(),
+            "deterministic": False,
+            "audit_layer": "focused_temporal",
+        })
+
+    return {
+        "passed": bool(result.get("passed", False)) and not clean,
+        "issues": clean,
+    }
 
 
 def _ollama_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
@@ -419,7 +698,23 @@ def validate(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
     # deterministic findings, so the two layers can cross-check each other.
     semantic = _ollama_audit(source, article)
 
-    all_issues = deterministic + semantic.get("issues", [])
+    # Focused temporal audit is intentionally narrow: it runs only when the
+    # article contains temporal context + result/statistic + relational wording.
+    temporal_signals = _temporal_consistency_signals(article)
+    temporal = {"issues": []}
+    if (
+        temporal_signals["temporal"]
+        and temporal_signals["score"]
+        and temporal_signals["relation"]
+    ):
+        temporal = _ollama_temporal_audit(source, article)
+
+
+    all_issues = (
+        deterministic
+        + semantic.get("issues", [])
+        + temporal.get("issues", [])
+    )
 
     # REVIEW alone does not automatically reject an article.
     # HIGH / MEDIUM are publication blockers.
