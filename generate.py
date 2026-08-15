@@ -6,6 +6,8 @@ from rss import fetch_trends
 from news import fetch_news
 from prompt import build_prompt
 from ollama_client import generate
+from fact_guard import validate as fact_guard_validate
+import json
 from html_generator import render_article, save_article
 from processed import load_processed, add_processed
 from index_generator import update_all
@@ -20,9 +22,9 @@ SKIP_PATTERNS = [
     " live",
     " score",
     " result",
-    " spielplan",
-    " aufstellung",
-    " prognose",
+    " calendario",
+    " alineación",
+    " pronóstico",
     " stream",
     " streaming",
 ]
@@ -65,13 +67,33 @@ def validate_article(article):
 
     return True
 
-def generate_valid_article(prompt, max_attempts=1):
+def generate_valid_article(prompt, fact_guard_source, max_attempts=1):
     last = None
 
     for i in range(max_attempts):
         try:
             article = generate(prompt)
             validate_article(article)
+
+            print("[FACT GUARD] Checking generated article...")
+            guard = fact_guard_validate(fact_guard_source, article)
+
+            if guard["status"] != "PASS":
+                print("[FACT GUARD] FLAG - article blocked.")
+                print(json.dumps(guard, ensure_ascii=False, indent=2))
+                raise Exception(
+                    f"Fact Guard blocked article "
+                    f"({guard['blocking_issues']} blocking issue(s))"
+                )
+
+            if guard.get("review_items", 0):
+                print(
+                    f"[FACT GUARD] PASS with "
+                    f"{guard['review_items']} review item(s)."
+                )
+            else:
+                print("[FACT GUARD] PASS")
+
             return article
 
         except Exception as e:
@@ -141,13 +163,23 @@ def main():
         try:
             news = fetch_news(keyword)
 
-            if len(news) < 5:
+            if len(news) < 2:
                 print(f"SKIPPED: only {len(news)} news found")
                 continue
 
             trend["news"] = news
 
-            article = generate_valid_article(build_prompt(trend))
+            generation_prompt = build_prompt(trend)
+            fact_guard_source = json.dumps(
+                news,
+                ensure_ascii=False,
+                indent=2,
+            )
+
+            article = generate_valid_article(
+                generation_prompt,
+                fact_guard_source,
+            )
 
             slug = slugify(keyword)
             article["slug"] = slug

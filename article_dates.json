@@ -522,5 +522,9 @@
   "el-ni-o-2026": {
     "published_at": "2026-08-15 09:04",
     "order": -131
+  },
+  "rassemblement-national": {
+    "published_at": "2026-08-15 11:13",
+    "order": -132
   }
 }
