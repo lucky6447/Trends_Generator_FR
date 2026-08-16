@@ -27,7 +27,7 @@ from config import MODEL
 #   3) no automatic article rewriting
 # ============================================================
 
-FACT_GUARD_VERSION = "fact-guard-v1.1.1-temporal"
+FACT_GUARD_VERSION = "fact-guard-v1.1.2-event-date"
 
 NUM_THREADS = max(1, int(os.getenv("FACT_GUARD_NUM_THREADS", "16")))
 NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
@@ -150,6 +150,41 @@ def _temporal_consistency_signals(article: Dict[str, Any]) -> Dict[str, bool]:
         "temporal": any(re.search(p, text_norm) for p in temporal_patterns),
         "score": any(re.search(p, text_norm) for p in score_patterns),
         "relation": any(re.search(p, text_norm) for p in relation_patterns),
+    }
+
+
+# ============================================================
+# Event-date consistency trigger
+# ============================================================
+
+def _event_date_consistency_signals(article: Dict[str, Any]) -> Dict[str, bool]:
+    """
+    Trigger for the dedicated event-date audit.
+    This function does not infer or compare dates.
+    """
+    text_norm = _normalize(_article_text(article))
+
+    date_patterns = [
+        r"\b\d{1,2}\s+[a-z]+\s+\d{4}\b",
+        r"\b[a-z]+\s+\d{1,2},\s+\d{4}\b",
+        r"\b\d{4}-\d{2}-\d{2}\b",
+        r"\b\d{1,2}[./-]\d{1,2}[./-]\d{4}\b",
+    ]
+
+    event_patterns = [
+        r"\b(win|wins|won|defeated|beat|beats|lost|lose|final|match|game|race|event)\b",
+        r"\b(gewann|gewinnt|besiegte|schlug|verlor|finale|spiel|rennen|veranstaltung)\b",
+        r"\b(gagné|gagne|battu|finale|match|course|événement)\b",
+        r"\b(ganó|gana|venció|final|partido|carrera|evento)\b",
+        r"\b(vinto|vince|battuto|finale|partita|gara|evento)\b",
+        r"\b(venceu|vence|derrotou|final|partida|corrida|evento)\b",
+        r"\b(signed|signs|joined|appointed|elected|announced|released|launched)\b",
+        r"\b(unterschrieb|unterzeichnete|wechselte|ernannt|gewählt|angekündigt|veröffentlicht|gestartet)\b",
+    ]
+
+    return {
+        "explicit_date": any(re.search(p, text_norm) for p in date_patterns),
+        "event_language": any(re.search(p, text_norm) for p in event_patterns),
     }
 
 
@@ -351,6 +386,162 @@ def _deterministic_checks(source: str, article: Dict[str, Any]) -> List[Dict[str
 
 
 # ============================================================
+# Focused event-date audit
+# ============================================================
+
+_EVENT_DATE_AUDIT_FORMAT = {
+    "type": "object",
+    "properties": {
+        "passed": {"type": "boolean"},
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {"type": "string"},
+                    "type": {"type": "string"},
+                    "claim": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "source_excerpt": {"type": "string"},
+                },
+                "required": [
+                    "severity", "type", "claim", "reason", "source_excerpt"
+                ],
+            },
+        },
+    },
+    "required": ["passed", "issues"],
+}
+
+
+def _event_date_audit_prompt(source: str, article: Dict[str, Any]) -> str:
+    return f"""
+You are a focused event-date consistency validator for TrendCurrent.
+
+Your ONLY task is to detect whether the ARTICLE assigns the WRONG DATE to an
+EVENT, compared with the event date established by the SOURCE MATERIAL.
+
+SOURCE MATERIAL is the ONLY factual authority.
+
+STRICT RULES:
+- Do not use outside knowledge.
+- Do not rewrite the article.
+- Do not reject normal paraphrasing.
+- Distinguish EVENT DATE from SOURCE PUBLICATION DATE, UPDATE DATE, and
+  ARTICLE GENERATION DATE.
+- A source being published on date B does NOT mean that the event happened on
+  date B.
+- If the source explicitly states or clearly establishes that an event happened
+  on date A, while the article states that the event happened on date B, flag
+  the mismatch.
+- Pay special attention to results, finals, matches, races, elections,
+  appointments, transfers, signings, releases, launches, and other completed
+  events.
+- Prefer the date explicitly tied to the EVENT itself over a nearby publication
+  or update date.
+- If the source contains multiple dates, identify what each date refers to
+  before judging the article.
+- Do NOT flag a date merely because it differs from the source publication date.
+- If the article gives a date but the source does not provide enough information
+  to establish the event date, use REVIEW rather than HIGH.
+- If the article gives no explicit event date, return no event-date issue.
+- HIGH requires that the source clearly establishes a different event date.
+- REVIEW is appropriate when the source has ambiguous or conflicting temporal
+  information that prevents a confident determination.
+- Ignore style, grammar, and harmless wording.
+
+IMPORTANT:
+Catch the failure mode where an article copies the SOURCE PUBLICATION DATE
+and presents it as the EVENT DATE.
+
+For every issue, provide a short exact source excerpt supporting the conclusion.
+If no source excerpt can be identified, leave it empty.
+
+Return ONLY JSON:
+{{
+  "passed": true,
+  "issues": []
+}}
+
+or:
+{{
+  "passed": false,
+  "issues": [
+    {{
+      "severity": "HIGH",
+      "type": "event_date_mismatch",
+      "claim": "short description of the article's event-date claim",
+      "reason": "The article assigns the event to a different date than the source-supported event date.",
+      "source_excerpt": "short exact excerpt"
+    }}
+  ]
+}}
+
+SOURCE MATERIAL:
+{source}
+
+ARTICLE:
+{json.dumps(article, ensure_ascii=False)}
+"""
+
+
+def _ollama_event_date_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
+    response = chat(
+        model=MODEL,
+        messages=[{"role": "user", "content": _event_date_audit_prompt(source, article)}],
+        options={
+            "temperature": 0.0,
+            "top_p": 0.85,
+            "top_k": 40,
+            "num_ctx": NUM_CTX,
+            "num_predict": AUDIT_TOKENS,
+            "num_batch": NUM_BATCH,
+            "num_thread": NUM_THREADS,
+        },
+        format=_EVENT_DATE_AUDIT_FORMAT,
+    )
+
+    raw = response.message.content or ""
+    result = _extract_json_object(raw)
+
+    if not isinstance(result, dict):
+        raise ValueError("Event-date Fact Guard audit returned invalid JSON.")
+
+    issues = result.get("issues", [])
+    if not isinstance(issues, list):
+        issues = []
+
+    clean = []
+    for item in issues:
+        if not isinstance(item, dict):
+            continue
+
+        claim = str(item.get("claim", "")).strip()
+        reason = str(item.get("reason", "")).strip()
+        if not claim or not reason:
+            continue
+
+        severity = str(item.get("severity", "REVIEW")).upper()
+        if severity not in {"HIGH", "MEDIUM", "LOW", "REVIEW"}:
+            severity = "REVIEW"
+
+        clean.append({
+            "severity": severity,
+            "type": str(item.get("type", "event_date_mismatch")).strip()
+                    or "event_date_mismatch",
+            "claim": claim,
+            "reason": reason,
+            "source_excerpt": str(item.get("source_excerpt", "")).strip(),
+            "deterministic": False,
+            "audit_layer": "focused_event_date",
+        })
+
+    return {
+        "passed": bool(result.get("passed", False)) and not clean,
+        "issues": clean,
+    }
+
+
 # Independent semantic audit
 # ============================================================
 
@@ -710,10 +901,21 @@ def validate(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
         temporal = _ollama_temporal_audit(source, article)
 
 
+    # Dedicated event-date audit. Publication-date/event-date confusion is a
+    # distinct failure mode, so it is checked separately from cross-fact time.
+    event_date_signals = _event_date_consistency_signals(article)
+    event_date = {"issues": []}
+    if (
+        event_date_signals["explicit_date"]
+        and event_date_signals["event_language"]
+    ):
+        event_date = _ollama_event_date_audit(source, article)
+
     all_issues = (
         deterministic
         + semantic.get("issues", [])
         + temporal.get("issues", [])
+        + event_date.get("issues", [])
     )
 
     # REVIEW alone does not automatically reject an article.
