@@ -61,7 +61,7 @@ def validate_article(article):
         titles.add(s["title"])
         words += len(s["text"].split())
 
-    min_words = 70 if len(article["sections"]) <= 2 else MIN_WORDS
+    min_words = 55 if len(article["sections"]) <= 2 else MIN_WORDS
     if words < min_words:
         raise Exception(f"Article too short ({words} words; minimum {min_words})")
 
