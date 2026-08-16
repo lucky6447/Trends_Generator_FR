@@ -27,7 +27,7 @@ from config import MODEL
 #   3) no automatic article rewriting
 # ============================================================
 
-FACT_GUARD_VERSION = "fact-guard-v1.1.2-event-date"
+FACT_GUARD_VERSION = "fact-guard-v1.1.3-event-freshness"
 
 NUM_THREADS = max(1, int(os.getenv("FACT_GUARD_NUM_THREADS", "16")))
 NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
@@ -159,7 +159,7 @@ def _temporal_consistency_signals(article: Dict[str, Any]) -> Dict[str, bool]:
 
 def _event_date_consistency_signals(article: Dict[str, Any]) -> Dict[str, bool]:
     """
-    Trigger for the dedicated event-date audit.
+    Trigger for the dedicated event-date/freshness audit.
     This function does not infer or compare dates.
     """
     text_norm = _normalize(_article_text(article))
@@ -180,11 +180,30 @@ def _event_date_consistency_signals(article: Dict[str, Any]) -> Dict[str, bool]:
         r"\b(venceu|vence|derrotou|final|partida|corrida|evento)\b",
         r"\b(signed|signs|joined|appointed|elected|announced|released|launched)\b",
         r"\b(unterschrieb|unterzeichnete|wechselte|ernannt|gewählt|angekündigt|veröffentlicht|gestartet)\b",
+        # Entertainment/media release events.
+        r"\b(trailer|teaser|film|movie|series|album|single|premiere|release|released|debut)\b",
+        r"\b(bande[- ]annonce|teaser|film|série|album|single|première|sortie|sorti|début)\b",
+        r"\b(trailer|teaser|película|serie|álbum|sencillo|estreno|lanzamiento|lanzó|debut)\b",
+        r"\b(trailer|teaser|film|serie|album|singolo|anteprima|uscita|uscito|debutto)\b",
+        r"\b(trailer|teaser|filme|série|álbum|single|estreia|lançamento|lançou)\b",
+    ]
+
+    # Relative/current temporal language must also trigger the audit.
+    # v1.1.2 required an explicit calendar date, so "récemment ..." could
+    # bypass the dedicated event-date audit completely.
+    freshness_patterns = [
+        r"\b(recent|recently|latest|new|newly|current|currently|today|yesterday|just)\b",
+        r"\b(récemment|récent|récente|dernier|dernière|nouveau|nouvelle|actuel|actuelle|aujourd'hui|hier|vient de)\b",
+        r"\b(recientemente|reciente|último|última|nuevo|nueva|actual|actualmente|hoy|ayer|acaba de)\b",
+        r"\b(recentemente|recente|ultimo|ultima|nuovo|nuova|attuale|attualmente|oggi|ieri|ha appena)\b",
+        r"\b(recentemente|recente|último|última|novo|nova|atual|atualmente|hoje|ontem|acabou de)\b",
+        r"\b(kürzlich|neu|neue|neuest|aktuell|derzeit|heute|gestern|gerade)\b",
     ]
 
     return {
         "explicit_date": any(re.search(p, text_norm) for p in date_patterns),
         "event_language": any(re.search(p, text_norm) for p in event_patterns),
+        "freshness_language": any(re.search(p, text_norm) for p in freshness_patterns),
     }
 
 
@@ -418,8 +437,14 @@ def _event_date_audit_prompt(source: str, article: Dict[str, Any]) -> str:
     return f"""
 You are a focused event-date consistency validator for TrendCurrent.
 
-Your ONLY task is to detect whether the ARTICLE assigns the WRONG DATE to an
-EVENT, compared with the event date established by the SOURCE MATERIAL.
+Your ONLY task is to detect whether the ARTICLE gives an EVENT an
+incorrect temporal status or date compared with the SOURCE MATERIAL.
+
+This includes TWO distinct failure modes:
+1) explicit date mismatch: the article assigns the event to the wrong date;
+2) temporal freshness mismatch: the source establishes that the event is
+   historical/old, but the article presents the same event as recent, new,
+   current, just announced, newly released, or otherwise happening now.
 
 SOURCE MATERIAL is the ONLY factual authority.
 
@@ -444,15 +469,27 @@ STRICT RULES:
 - Do NOT flag a date merely because it differs from the source publication date.
 - If the article gives a date but the source does not provide enough information
   to establish the event date, use REVIEW rather than HIGH.
-- If the article gives no explicit event date, return no event-date issue.
-- HIGH requires that the source clearly establishes a different event date.
+- Do NOT require the article to contain an explicit calendar date. Relative
+  temporal wording such as "recently", "today", "newly", "current",
+  "just announced", "récemment", "nouvelle", "actuel", etc. is a temporal
+  claim and must be checked against the source-supported event date.
+- If the source clearly establishes that the event is old/historical and the
+  article presents that event as recent/new/current, flag HIGH even when the
+  article contains no explicit calendar date.
+- If the article gives no explicit date and makes no relative/current temporal
+  claim, return no event-date issue.
+- HIGH requires either a clear date mismatch OR a clear source-supported
+  historical event being presented with materially false current/recent framing.
 - REVIEW is appropriate when the source has ambiguous or conflicting temporal
   information that prevents a confident determination.
 - Ignore style, grammar, and harmless wording.
 
 IMPORTANT:
-Catch the failure mode where an article copies the SOURCE PUBLICATION DATE
-and presents it as the EVENT DATE.
+Catch BOTH:
+A) the failure mode where an article copies the SOURCE PUBLICATION DATE and
+   presents it as the EVENT DATE;
+B) the failure mode where an old event is presented as recent/current without
+   an explicit date.
 
 For every issue, provide a short exact source excerpt supporting the conclusion.
 If no source excerpt can be identified, leave it empty.
@@ -901,13 +938,21 @@ def validate(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
         temporal = _ollama_temporal_audit(source, article)
 
 
-    # Dedicated event-date audit. Publication-date/event-date confusion is a
-    # distinct failure mode, so it is checked separately from cross-fact time.
+    # Dedicated event-date/freshness audit. This is intentionally independent
+    # from the cross-fact temporal audit.
+    #
+    # v1.1.3 fix:
+    # Relative freshness language is now a valid trigger even without an
+    # explicit calendar date. This closes the exact "a récemment ..." failure
+    # mode where v1.1.2 could bypass its own audit.
     event_date_signals = _event_date_consistency_signals(article)
     event_date = {"issues": []}
     if (
-        event_date_signals["explicit_date"]
-        and event_date_signals["event_language"]
+        event_date_signals["event_language"]
+        and (
+            event_date_signals["explicit_date"]
+            or event_date_signals["freshness_language"]
+        )
     ):
         event_date = _ollama_event_date_audit(source, article)
 
