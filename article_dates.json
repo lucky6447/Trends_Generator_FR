@@ -566,5 +566,9 @@
   "milo-ventimiglia": {
     "published_at": "2026-08-17 10:26",
     "order": -142
+  },
+  "hacker": {
+    "published_at": "2026-08-17 12:55",
+    "order": -143
   }
 }
