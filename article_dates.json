@@ -558,5 +558,9 @@
   "strasbourg": {
     "published_at": "2026-08-17 05:11",
     "order": -140
+  },
+  "maroc": {
+    "published_at": "2026-08-17 06:55",
+    "order": -141
   }
 }
