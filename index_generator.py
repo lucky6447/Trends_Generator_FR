@@ -28,20 +28,64 @@ _DATE_I18N = {
 def _language_key():
     value = (LANGUAGE or "").strip().lower()
     aliases = {
+        "en": "en",
         "english": "en",
         "english (us)": "en",
+        "en-us": "en",
+        "en_us": "en",
+        "id": "id",
         "bahasa indonesia": "id",
         "indonesian": "id",
+        "id-id": "id",
+        "de": "de",
         "deutsch": "de",
         "german": "de",
+        "de-de": "de",
+        "fr": "fr",
         "français": "fr",
         "french": "fr",
+        "fr-fr": "fr",
+        "it": "it",
         "italiano": "it",
         "italian": "it",
+        "it-it": "it",
+        "es": "es",
         "español": "es",
         "spanish": "es",
+        "es-es": "es",
     }
-    return aliases.get(value, "en")
+    if value in aliases:
+        return aliases[value]
+
+    # Also accept common config values such as "French (France)" or
+    # locale strings such as "fr-FR". This keeps the generator universal
+    # without requiring any changes to language-specific config.py files.
+    normalized = re.sub(r"[_-]+", "-", value)
+    if normalized.startswith(("fr-", "fr ")):
+        return "fr"
+    if normalized.startswith(("de-", "de ")):
+        return "de"
+    if normalized.startswith(("it-", "it ")):
+        return "it"
+    if normalized.startswith(("es-", "es ")):
+        return "es"
+    if normalized.startswith(("id-", "id ")):
+        return "id"
+    if normalized.startswith(("en-", "en ")):
+        return "en"
+    if "français" in value or "french" in value:
+        return "fr"
+    if "deutsch" in value or "german" in value:
+        return "de"
+    if "italiano" in value or "italian" in value:
+        return "it"
+    if "español" in value or "spanish" in value:
+        return "es"
+    if "indonesian" in value or "bahasa indonesia" in value:
+        return "id"
+    if "english" in value:
+        return "en"
+    return "en"
 
 
 def _date_copy(date_obj, today):
