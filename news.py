@@ -47,7 +47,7 @@ def fetch_news(query, limit=20):
     url = (
         "https://news.google.com/rss/search?"
         f"q={quote_plus(query + ' when:7d')}"
-        "&hl=en-GB&gl=GB&ceid=GB:en"
+        "&hl=fr-FR&gl=FR&ceid=FR:fr"
     )
     feed = feedparser.parse(url)
     items = feed.entries[:limit]

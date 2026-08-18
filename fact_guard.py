@@ -27,7 +27,7 @@ from config import MODEL
 #   3) no automatic article rewriting
 # ============================================================
 
-FACT_GUARD_VERSION = "fact-guard-v1.1.3-event-freshness"
+FACT_GUARD_VERSION = "fact-guard-v1.1.5-event-status"
 
 NUM_THREADS = max(1, int(os.getenv("FACT_GUARD_NUM_THREADS", "16")))
 NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
@@ -191,6 +191,20 @@ def _event_date_consistency_signals(article: Dict[str, Any]) -> Dict[str, bool]:
     # Relative/current temporal language must also trigger the audit.
     # v1.1.2 required an explicit calendar date, so "récemment ..." could
     # bypass the dedicated event-date audit completely.
+    # Explicit event-status language also triggers the focused audit.
+    event_status_patterns = [
+        r"\b(?:made|makes|making)\s+landfall\b",
+        r"\blandfall\b",
+        r"\b(?:without|did not|didn't|never)\s+(?:make|making)\s+landfall\b",
+        r"\b(?:passed|passes|moved|moving)\s+(?:offshore|off shore)\b",
+        r"\b(?:weakened|strengthened|downgraded|upgraded|intensified|dissipated)\b",
+        r"\b(?:cancelled|canceled|postponed|called off|went ahead)\b",
+        r"\b(?:landete|landet)\b", r"\bohne\s+landfall\b",
+        r"\b(?:touché|a touché)\s+terre\b", r"\bsans\s+atteindre\s+les\s+côtes\b",
+        r"\btocó\s+tierra\b", r"\bsin\s+tocar\s+tierra\b",
+        r"\b(?:atterrato|approdato)\b", r"\bsem\s+(?:tocar|atingir)\s+terra\b",
+    ]
+
     freshness_patterns = [
         r"\b(recent|recently|latest|new|newly|current|currently|today|yesterday|just)\b",
         r"\b(récemment|récent|récente|dernier|dernière|nouveau|nouvelle|actuel|actuelle|aujourd'hui|hier|vient de)\b",
@@ -203,6 +217,7 @@ def _event_date_consistency_signals(article: Dict[str, Any]) -> Dict[str, bool]:
     return {
         "explicit_date": any(re.search(p, text_norm) for p in date_patterns),
         "event_language": any(re.search(p, text_norm) for p in event_patterns),
+        "event_status_language": any(re.search(p, text_norm) for p in event_status_patterns),
         "freshness_language": any(re.search(p, text_norm) for p in freshness_patterns),
     }
 
@@ -440,11 +455,16 @@ You are a focused event-date consistency validator for TrendCurrent.
 Your ONLY task is to detect whether the ARTICLE gives an EVENT an
 incorrect temporal status or date compared with the SOURCE MATERIAL.
 
-This includes TWO distinct failure modes:
+This includes THREE distinct failure modes:
 1) explicit date mismatch: the article assigns the event to the wrong date;
 2) temporal freshness mismatch: the source establishes that the event is
    historical/old, but the article presents the same event as recent, new,
-   current, just announced, newly released, or otherwise happening now.
+   current, just announced, newly released, or otherwise happening now;
+3) event-status mismatch: the source explicitly establishes one event state
+   or transition, but the article states a materially different state.
+   Examples include "made landfall" vs "passed offshore without landfall",
+   "weakened to a tropical storm" vs "strengthened to a hurricane", or
+   "was cancelled" vs "went ahead".
 
 SOURCE MATERIAL is the ONLY factual authority.
 
@@ -460,8 +480,15 @@ STRICT RULES:
   on date A, while the article states that the event happened on date B, flag
   the mismatch.
 - Pay special attention to results, finals, matches, races, elections,
-  appointments, transfers, signings, releases, launches, and other completed
+  appointments, transfers, signings, releases, launches, landfalls, storm
+  strength changes, cancellations, departures, arrivals, and other completed
   events.
+- For event-status claims, compare the actual event relationship/state, not just
+  whether the same event and entities are mentioned.
+- If the source explicitly says an event did NOT happen or happened in a
+  materially different way, a contrary article statement is HIGH.
+- Do not infer a negative event status from silence. A HIGH event-status
+  mismatch requires explicit source support for the contrary state.
 - Prefer the date explicitly tied to the EVENT itself over a nearby publication
   or update date.
 - If the source contains multiple dates, identify what each date refers to
@@ -507,8 +534,8 @@ or:
     {{
       "severity": "HIGH",
       "type": "event_date_mismatch",
-      "claim": "short description of the article's event-date claim",
-      "reason": "The article assigns the event to a different date than the source-supported event date.",
+      "claim": "short description of the article's event/date/status claim",
+      "reason": "The article assigns the event a materially different date or event status than the source-supported event state.",
       "source_excerpt": "short exact excerpt"
     }}
   ]
@@ -577,6 +604,157 @@ def _ollama_event_date_audit(source: str, article: Dict[str, Any]) -> Dict[str, 
         "passed": bool(result.get("passed", False)) and not clean,
         "issues": clean,
     }
+
+
+# ============================================================
+# Focused entity-attribution audit
+# ============================================================
+
+_ENTITY_ATTRIBUTION_FORMAT = {
+    "type": "object",
+    "properties": {
+        "passed": {"type": "boolean"},
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {"type": "string"},
+                    "type": {"type": "string"},
+                    "claim": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "source_excerpt": {"type": "string"},
+                },
+                "required": ["severity", "type", "claim", "reason", "source_excerpt"],
+            },
+        },
+    },
+    "required": ["passed", "issues"],
+}
+
+
+def _entity_attribution_signals(article: Dict[str, Any]) -> bool:
+    """Conservative trigger; ordinary entity mentions do not trigger this audit."""
+    text_norm = _normalize(_article_text(article))
+    patterns = [
+        r"\b(said|says|told|admitted|denied|announced|confirmed|revealed|warned|appointed|elected)\b",
+        r"\b(signed|agreed|rejected|accepted|joined|left|returns?|returned|injured|operated|will join|will sign|set to join|set to sign)\b",
+        r"\b(has|have|had)\s+\w+\s+(?:days?|weeks?|months?)\b",
+        r"\b(?:is|was|became|remains|will be|has been)\s+(?:the|a|an)?\s*(?:manager|coach|player|midfielder|defender|forward|president|ceo|minister|mayor)\b",
+        r"\b(sagte|sagt|erklärte|bestätigte|kündigte|warnte|ernannt|gewählt|unterschrieb|vereinbarte|wechselte|verließ|verletzt|operiert)\b",
+        r"\b(?:ist|war|wurde|bleibt|wird)\s+(?:der|die|das|ein|eine)?\s*(?:trainer|cheftrainer|spieler|mittelfeldspieler|verteidiger|stürmer|präsident|minister|bürgermeister)\b",
+        r"\b(a déclaré|a confirmé|a annoncé|a révélé|a averti|nommé|élu|a signé|a accepté|a refusé|a rejoint|a quitté|blessé|opéré)\b",
+        r"\b(?:est|était|devient|reste|sera)\s+(?:le|la|un|une)?\s*(?:entraîneur|joueur|milieu|défenseur|attaquant|président|ministre|maire)\b",
+        r"\b(dijo|dice|declaró|confirmó|anunció|reveló|advirtió|nombrado|elegido|firmó|aceptó|rechazó|dejó|regresa|lesionado|operado)\b",
+        r"\b(?:es|era|se convirtió en|sigue siendo|será)\s+(?:el|la|un|una)?\s*(?:entrenador|jugador|centrocampista|defensa|delantero|presidente|ministro|alcalde)\b",
+        r"\b(ha detto|ha dichiarato|ha confermato|ha annunciato|ha rivelato|ha avvertito|nominato|eletto|ha firmato|ha accettato|ha rifiutato|ha lasciato|torna|infortunato|operato)\b",
+        r"\b(?:è|era|diventa|rimane|sarà)\s+(?:il|la|un|una)?\s*(?:allenatore|giocatore|centrocampista|difensore|attaccante|presidente|ministro|sindaco)\b",
+        r"\b(disse|declarou|confirmou|anunciou|revelou|alertou|nomeado|eleito|assinou|aceitou|rejeitou|deixou|retorna|lesionado|operado)\b",
+        r"\b(?:é|era|tornou-se|continua sendo|será)\s+(?:o|a|um|uma)?\s*(?:treinador|jogador|meio-campista|defensor|atacante|presidente|ministro|prefeito)\b",
+    ]
+    return any(re.search(pattern, text_norm) for pattern in patterns)
+
+
+def _entity_attribution_audit_prompt(source: str, article: Dict[str, Any]) -> str:
+    return f"""
+You are a focused entity-attribution consistency validator for TrendCurrent.
+
+Your ONLY task is to detect material errors where the ARTICLE assigns a factual
+ACTION, STATEMENT, ROLE, STATUS, DEADLINE, DECISION, TRANSFER STATE, or other
+meaning-bearing relationship to the WRONG PERSON, ORGANIZATION, TEAM, or OTHER
+ENTITY compared with the SOURCE MATERIAL.
+
+SOURCE MATERIAL is the ONLY factual authority.
+
+STRICT RULES:
+- Do not use outside knowledge.
+- Do not rewrite the article.
+- Do not reject normal paraphrasing.
+- Identify the actual subject of each important claim. Verify SUBJECT +
+  PREDICATE/ACTION + OBJECT/RELATIONSHIP together.
+- A fact is materially wrong when the source supports it for entity A but the
+  article assigns the same fact to entity B.
+- Proximity does NOT transfer an action or status from one entity to another.
+- Pay special attention to transfers, appointments, injuries, departures,
+  signings, deadlines, quotations, decisions, and roles.
+- Do NOT flag an omitted source entity or harmless pronoun use.
+- If the source is ambiguous about the subject, use REVIEW.
+- HIGH requires a clear source-supported attribution mismatch that materially
+  changes the factual meaning.
+- REVIEW is appropriate when entity linkage cannot be established confidently.
+- Ignore style, grammar and harmless wording.
+
+For every issue, provide a short exact source excerpt directly supporting the
+attribution conclusion.
+
+Return ONLY JSON:
+{{
+  "passed": true,
+  "issues": []
+}}
+or:
+{{
+  "passed": false,
+  "issues": [{{
+    "severity": "HIGH",
+    "type": "wrong_entity_attribution",
+    "claim": "short description",
+    "reason": "The source assigns this action/status/relationship to a different entity.",
+    "source_excerpt": "short exact excerpt"
+  }}]
+}}
+
+SOURCE MATERIAL:
+{source}
+
+ARTICLE:
+{json.dumps(article, ensure_ascii=False)}
+"""
+
+
+def _ollama_entity_attribution_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
+    response = chat(
+        model=MODEL,
+        messages=[{"role": "user", "content": _entity_attribution_audit_prompt(source, article)}],
+        options={
+            "temperature": 0.0,
+            "top_p": 0.85,
+            "top_k": 40,
+            "num_ctx": NUM_CTX,
+            "num_predict": AUDIT_TOKENS,
+            "num_batch": NUM_BATCH,
+            "num_thread": NUM_THREADS,
+        },
+        format=_ENTITY_ATTRIBUTION_FORMAT,
+    )
+    raw = response.message.content or ""
+    result = _extract_json_object(raw)
+    if not isinstance(result, dict):
+        raise ValueError("Entity-attribution Fact Guard audit returned invalid JSON.")
+    issues = result.get("issues", [])
+    if not isinstance(issues, list):
+        issues = []
+    clean = []
+    for item in issues:
+        if not isinstance(item, dict):
+            continue
+        claim = str(item.get("claim", "")).strip()
+        reason = str(item.get("reason", "")).strip()
+        if not claim or not reason:
+            continue
+        severity = str(item.get("severity", "REVIEW")).upper()
+        if severity not in {"HIGH", "MEDIUM", "LOW", "REVIEW"}:
+            severity = "REVIEW"
+        clean.append({
+            "severity": severity,
+            "type": str(item.get("type", "wrong_entity_attribution")).strip() or "wrong_entity_attribution",
+            "claim": claim,
+            "reason": reason,
+            "source_excerpt": str(item.get("source_excerpt", "")).strip(),
+            "deterministic": False,
+            "audit_layer": "focused_entity_attribution",
+        })
+    return {"passed": bool(result.get("passed", False)) and not clean, "issues": clean}
 
 
 # Independent semantic audit
@@ -948,19 +1126,29 @@ def validate(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
     event_date_signals = _event_date_consistency_signals(article)
     event_date = {"issues": []}
     if (
-        event_date_signals["event_language"]
-        and (
-            event_date_signals["explicit_date"]
-            or event_date_signals["freshness_language"]
+        (
+            event_date_signals["event_language"]
+            and (
+                event_date_signals["explicit_date"]
+                or event_date_signals["freshness_language"]
+            )
         )
+        or event_date_signals.get("event_status_language", False)
     ):
         event_date = _ollama_event_date_audit(source, article)
+
+    # Focused entity-attribution audit. Separate from the broad semantic audit
+    # so subject/action swaps receive a dedicated, conservative check.
+    entity_attribution = {"issues": []}
+    if _entity_attribution_signals(article):
+        entity_attribution = _ollama_entity_attribution_audit(source, article)
 
     all_issues = (
         deterministic
         + semantic.get("issues", [])
         + temporal.get("issues", [])
         + event_date.get("issues", [])
+        + entity_attribution.get("issues", [])
     )
 
     # REVIEW alone does not automatically reject an article.

@@ -7,6 +7,7 @@ from news import fetch_news
 from prompt import build_prompt
 from ollama_client import generate
 from fact_guard import validate as fact_guard_validate
+from fact_guard_repair import repair as fact_guard_repair
 import json
 from html_generator import render_article, save_article
 from processed import load_processed, add_processed
@@ -67,6 +68,7 @@ def validate_article(article):
 
     return True
 
+
 def generate_valid_article(prompt, fact_guard_source, max_attempts=1):
     last = None
 
@@ -79,12 +81,54 @@ def generate_valid_article(prompt, fact_guard_source, max_attempts=1):
             guard = fact_guard_validate(fact_guard_source, article)
 
             if guard["status"] != "PASS":
-                print("[FACT GUARD] FLAG - article blocked.")
+                print("[FACT GUARD] FLAG - article requires repair.")
                 print(json.dumps(guard, ensure_ascii=False, indent=2))
-                raise Exception(
-                    f"Fact Guard blocked article "
-                    f"({guard['blocking_issues']} blocking issue(s))"
-                )
+
+                try:
+                    print("[FACT GUARD REPAIR] Attempting targeted repair v1.0...")
+                    repaired = fact_guard_repair(
+                        article,
+                        fact_guard_source,
+                        guard,
+                    )
+                    validate_article(repaired)
+
+                    print("[FACT GUARD REPAIR] Re-checking repaired article...")
+                    repaired_guard = fact_guard_validate(
+                        fact_guard_source,
+                        repaired,
+                    )
+
+                    if repaired_guard["status"] != "PASS":
+                        print("[FACT GUARD REPAIR] FAIL - repaired article blocked.")
+                        print(
+                            json.dumps(
+                                repaired_guard,
+                                ensure_ascii=False,
+                                indent=2,
+                            )
+                        )
+                        raise Exception(
+                            "Fact Guard repair failed re-validation "
+                            f"({repaired_guard['blocking_issues']} blocking issue(s))"
+                        )
+
+                    print("[FACT GUARD REPAIR] PASS - repaired article accepted.")
+
+                    if repaired_guard.get("review_items", 0):
+                        print(
+                            f"[FACT GUARD] PASS with "
+                            f"{repaired_guard['review_items']} review item(s)."
+                        )
+                    else:
+                        print("[FACT GUARD] PASS")
+
+                    return repaired
+
+                except Exception as repair_error:
+                    raise Exception(
+                        f"Fact Guard blocked article; repair failed: {repair_error}"
+                    ) from repair_error
 
             if guard.get("review_items", 0):
                 print(
