@@ -602,5 +602,9 @@
   "land-rover-freelander": {
     "published_at": "2026-08-18 13:51",
     "order": -151
+  },
+  "pro-d2": {
+    "published_at": "2026-08-18 15:17",
+    "order": -152
   }
 }
