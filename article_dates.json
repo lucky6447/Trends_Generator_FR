@@ -650,5 +650,9 @@
   "autobus": {
     "published_at": "2026-08-19 20:25",
     "order": -163
+  },
+  "bodo-glimt": {
+    "published_at": "2026-08-19 23:34",
+    "order": -164
   }
 }
