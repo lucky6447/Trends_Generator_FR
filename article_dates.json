@@ -630,5 +630,9 @@
   "meilleur-joueur": {
     "published_at": "2026-08-19 06:22",
     "order": -158
+  },
+  "meteo-nantes": {
+    "published_at": "2026-08-19 08:25",
+    "order": -159
   }
 }
