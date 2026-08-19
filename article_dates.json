@@ -646,5 +646,9 @@
   "renewi-tour-2026": {
     "published_at": "2026-08-19 18:10",
     "order": -162
+  },
+  "autobus": {
+    "published_at": "2026-08-19 20:25",
+    "order": -163
   }
 }
