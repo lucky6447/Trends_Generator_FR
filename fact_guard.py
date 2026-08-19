@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sys
+from datetime import date, datetime
 from typing import Any, Dict, List
 
 from ollama import chat
@@ -27,7 +28,7 @@ from config import MODEL
 #   3) no automatic article rewriting
 # ============================================================
 
-FACT_GUARD_VERSION = "fact-guard-v1.1.5-event-status"
+FACT_GUARD_VERSION = "fact-guard-v1.1.6-current-state"
 
 NUM_THREADS = max(1, int(os.getenv("FACT_GUARD_NUM_THREADS", "16")))
 NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
@@ -220,6 +221,173 @@ def _event_date_consistency_signals(article: Dict[str, Any]) -> Dict[str, bool]:
         "event_status_language": any(re.search(p, text_norm) for p in event_status_patterns),
         "freshness_language": any(re.search(p, text_norm) for p in freshness_patterns),
     }
+
+
+
+# ============================================================
+# Current-state / upcoming-event deterministic checks
+# ============================================================
+
+# These checks are intentionally narrow. They only operate when the
+# article itself contains an explicit calendar date and/or an unambiguous
+# future/upcoming event-status phrase. They never infer completion merely
+# because a date is old: postponement/cancellation/rescheduling language
+# must be considered by the focused semantic audit.
+#
+# The validator's reference date is supplied by FACT_GUARD_REFERENCE_DATE
+# when available. If it is absent, no deterministic past-vs-upcoming check
+# is performed; the existing source-grounded Ollama audit remains active.
+
+_FUTURE_EVENT_STATUS_PATTERNS = [
+    r"\bwill\s+(?:play|face|meet|take\s+on|host|visit|travel|compete|return|appear)\b",
+    r"\b(?:is|are)\s+(?:set|scheduled|due)\s+to\s+(?:play|face|meet|take\s+on|host|visit|compete|return|appear)\b",
+    r"\b(?:is|are)\s+set\s+for\b",
+    r"\b(?:will|is|are)\s+(?:battle|clash|go)\b",
+    r"\b(?:set|scheduled)\s+to\s+battle\b",
+    r"\b(?:upcoming|forthcoming)\b",
+    r"\b(?:tomorrow|tonight)\b",
+    r"\b(?:se\s+enfrentar[aá]n|jugar[aá]n|disputar[aá]n)\b",
+    r"\b(?:s'affronteront|joueront)\b",
+    r"\b(?:si affronteranno|giocheranno)\b",
+    r"\b(?:werden\s+spielen|werden\s+antreten|treten\s+gegeneinander\s+an)\b",
+    r"\b(?:vão\s+jogar|irão\s+jogar|se\s+enfrentarão)\b",
+]
+
+def _parse_reference_date() -> date | None:
+    """
+    Optional validator reference date.
+
+    Priority:
+      1) FACT_GUARD_REFERENCE_DATE=YYYY-MM-DD
+      2) no deterministic reference date
+
+    We deliberately do not use the machine's wall-clock date implicitly.
+    This keeps validation reproducible and avoids timezone-related drift.
+    """
+    raw = os.getenv("FACT_GUARD_REFERENCE_DATE", "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError:
+        print(
+            f"[FACT GUARD] Invalid FACT_GUARD_REFERENCE_DATE={raw!r}; "
+            "deterministic current-state date check disabled.",
+            file=sys.stderr,
+        )
+        return None
+
+
+def _extract_article_dates(article: Dict[str, Any]) -> List[date]:
+    """
+    Extract explicit YYYY-MM-DD, D Month YYYY, or Month D, YYYY dates
+    from the article text. Natural-language month parsing is intentionally
+    limited to English month names here; the semantic audit handles
+    multilingual dates.
+    """
+    text = _article_text(article)
+    dates: List[date] = []
+
+    for m in re.finditer(r"\b(\d{4})-(\d{2})-(\d{2})\b", text):
+        try:
+            dates.append(date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+        except ValueError:
+            pass
+
+    months = {
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "may": 5, "june": 6, "july": 7, "august": 8,
+        "september": 9, "october": 10, "november": 11, "december": 12,
+    }
+
+    for m in re.finditer(
+        r"\b(\d{1,2})\s+([a-z]+)\s+(\d{4})\b",
+        _normalize(text),
+    ):
+        month = months.get(m.group(2))
+        if month:
+            try:
+                dates.append(date(int(m.group(3)), month, int(m.group(1))))
+            except ValueError:
+                pass
+
+    for m in re.finditer(
+        r"\b([a-z]+)\s+(\d{1,2}),\s+(\d{4})\b",
+        _normalize(text),
+    ):
+        month = months.get(m.group(1))
+        if month:
+            try:
+                dates.append(date(int(m.group(3)), month, int(m.group(2))))
+            except ValueError:
+                pass
+
+    # Preserve order while removing duplicates.
+    unique: List[date] = []
+    seen = set()
+    for d in dates:
+        if d not in seen:
+            seen.add(d)
+            unique.append(d)
+    return unique
+
+
+def _deterministic_current_state_checks(
+    article: Dict[str, Any],
+    reference_date: date | None,
+) -> List[Dict[str, Any]]:
+    """
+    Detect the narrow, high-confidence case:
+      explicit article event date < validation reference date
+      AND article uses explicit future/upcoming event language.
+
+    This does NOT infer that every past-dated event is completed.
+    It only blocks the particularly clear contradiction where the article
+    itself dates the event in the past but still presents it as upcoming.
+    The focused Event Status audit remains responsible for source-grounded
+    cases involving postponed/rescheduled/cancelled events and cases where
+    the article has no explicit event date.
+    """
+    if reference_date is None:
+        return []
+
+    text_norm = _normalize(_article_text(article))
+    if not any(re.search(p, text_norm) for p in _FUTURE_EVENT_STATUS_PATTERNS):
+        return []
+
+    article_dates = _extract_article_dates(article)
+    past_dates = [d for d in article_dates if d < reference_date]
+    if not past_dates:
+        return []
+
+    # Avoid assuming that an arbitrary historical date in the article is
+    # necessarily the event date. The semantic audit still performs the
+    # source-grounded event/date binding.
+    dates_display = ", ".join(d.isoformat() for d in past_dates[:3])
+    matched_status = next(
+        (
+            re.search(p, text_norm).group(0)
+            for p in _FUTURE_EVENT_STATUS_PATTERNS
+            if re.search(p, text_norm)
+        ),
+        "future/upcoming event language",
+    )
+
+    return [{
+        "severity": "REVIEW",
+        "type": "past_dated_event_presented_as_upcoming",
+        "claim": f"{matched_status} with article date(s) before reference date",
+        "reason": (
+            f"The article contains an explicit date before the validation "
+            f"reference date ({reference_date.isoformat()}) while also using "
+            f"future/upcoming event wording. This is a targeted temporal "
+            f"signal; the source-grounded Event Status audit must determine "
+            f"whether the dated item is the relevant event and whether it "
+            f"was postponed, cancelled, or rescheduled."
+        ),
+        "evidence": [dates_display],
+        "deterministic": True,
+    }]
 
 
 # Deterministic checks
@@ -420,7 +588,7 @@ def _deterministic_checks(source: str, article: Dict[str, Any]) -> List[Dict[str
 
 
 # ============================================================
-# Focused event-date audit
+# Focused event-date / current-state audit
 # ============================================================
 
 _EVENT_DATE_AUDIT_FORMAT = {
@@ -448,7 +616,8 @@ _EVENT_DATE_AUDIT_FORMAT = {
 }
 
 
-def _event_date_audit_prompt(source: str, article: Dict[str, Any]) -> str:
+def _event_date_audit_prompt(source: str, article: Dict[str, Any], reference_date: date | None = None) -> str:
+    reference_text = reference_date.isoformat() if reference_date else "NOT PROVIDED"
     return f"""
 You are a focused event-date consistency validator for TrendCurrent.
 
@@ -505,6 +674,21 @@ STRICT RULES:
   article contains no explicit calendar date.
 - If the article gives no explicit date and makes no relative/current temporal
   claim, return no event-date issue.
+- VALIDATION REFERENCE DATE: {reference_text}
+- When a validation reference date is provided, use it only as the temporal
+  point at which the article is being judged. If the source establishes that
+  the relevant event occurred before that reference date, the article must
+  not present that same event as upcoming, scheduled to occur, or otherwise
+  still pending unless the source explicitly establishes a postponement,
+  cancellation, rescheduling, delay, or another later event date.
+- Distinguish an EVENT DATE from the publication date and the validation
+  reference date. Never treat the reference date itself as the event date.
+- A past event may legitimately be discussed in the present tense as a
+  historical/current fact (for example, "won" or "defeated"). Only future/
+  upcoming status applied to an already completed past event is a mismatch.
+- If the source gives an earlier scheduled date but explicitly says the event
+  was postponed/rescheduled/cancelled and provides a later state, judge the
+  later supported state rather than assuming completion.
 - HIGH requires either a clear date mismatch OR a clear source-supported
   historical event being presented with materially false current/recent framing.
 - REVIEW is appropriate when the source has ambiguous or conflicting temporal
@@ -544,15 +728,18 @@ or:
 SOURCE MATERIAL:
 {source}
 
+VALIDATION REFERENCE DATE:
+{reference_text}
+
 ARTICLE:
 {json.dumps(article, ensure_ascii=False)}
 """
 
 
-def _ollama_event_date_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
+def _ollama_event_date_audit(source: str, article: Dict[str, Any], reference_date: date | None = None) -> Dict[str, Any]:
     response = chat(
         model=MODEL,
-        messages=[{"role": "user", "content": _event_date_audit_prompt(source, article)}],
+        messages=[{"role": "user", "content": _event_date_audit_prompt(source, article, reference_date)}],
         options={
             "temperature": 0.0,
             "top_p": 0.85,
@@ -1094,11 +1281,21 @@ def _ollama_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
 # Result normalization
 # ============================================================
 
-def validate(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
+def validate(
+    source: str,
+    article: Dict[str, Any],
+    reference_date: date | None = None,
+) -> Dict[str, Any]:
     if not isinstance(article, dict):
         raise ValueError("Article must be a JSON object.")
 
+    # Production callers pass the run's explicit validation date.
+    # CLI/manual callers may still use FACT_GUARD_REFERENCE_DATE.
+    if reference_date is None:
+        reference_date = _parse_reference_date()
+
     deterministic = _deterministic_checks(source, article)
+    deterministic += _deterministic_current_state_checks(article, reference_date)
 
     # The semantic audit remains independent. It is not told about
     # deterministic findings, so the two layers can cross-check each other.
@@ -1135,7 +1332,7 @@ def validate(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
         )
         or event_date_signals.get("event_status_language", False)
     ):
-        event_date = _ollama_event_date_audit(source, article)
+        event_date = _ollama_event_date_audit(source, article, reference_date)
 
     # Focused entity-attribution audit. Separate from the broad semantic audit
     # so subject/action swaps receive a dedicated, conservative check.

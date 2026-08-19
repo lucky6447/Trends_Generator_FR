@@ -1,5 +1,6 @@
 import re
 import subprocess
+from datetime import date
 
 from config import MAX_ARTICLES_PER_RUN
 from rss import fetch_trends
@@ -69,7 +70,7 @@ def validate_article(article):
     return True
 
 
-def generate_valid_article(prompt, fact_guard_source, max_attempts=1):
+def generate_valid_article(prompt, fact_guard_source, reference_date, max_attempts=1):
     last = None
 
     for i in range(max_attempts):
@@ -78,7 +79,11 @@ def generate_valid_article(prompt, fact_guard_source, max_attempts=1):
             validate_article(article)
 
             print("[FACT GUARD] Checking generated article...")
-            guard = fact_guard_validate(fact_guard_source, article)
+            guard = fact_guard_validate(
+                fact_guard_source,
+                article,
+                reference_date=reference_date,
+            )
 
             if guard["status"] != "PASS":
                 print("[FACT GUARD] FLAG - article requires repair.")
@@ -97,6 +102,7 @@ def generate_valid_article(prompt, fact_guard_source, max_attempts=1):
                     repaired_guard = fact_guard_validate(
                         fact_guard_source,
                         repaired,
+                        reference_date=reference_date,
                     )
 
                     if repaired_guard["status"] != "PASS":
@@ -187,6 +193,11 @@ def main():
     processed = load_processed()
     trends = fetch_trends()
 
+    # One explicit reference date for the entire production run.
+    # This is the date against which event state is evaluated.
+    reference_date = date.today()
+    print(f"[FACT GUARD] Validation reference date: {reference_date.isoformat()}")
+
     generated = 0
     new_keywords = []
 
@@ -223,6 +234,7 @@ def main():
             article = generate_valid_article(
                 generation_prompt,
                 fact_guard_source,
+                reference_date,
             )
 
             slug = slugify(keyword)

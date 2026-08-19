@@ -634,5 +634,9 @@
   "meteo-nantes": {
     "published_at": "2026-08-19 08:25",
     "order": -159
+  },
+  "hadjar": {
+    "published_at": "2026-08-19 12:10",
+    "order": -160
   }
 }
