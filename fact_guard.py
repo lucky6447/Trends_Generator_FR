@@ -2,6 +2,8 @@ import json
 import os
 import re
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Any, Dict, List
 
@@ -28,14 +30,56 @@ from config import MODEL
 #   3) no automatic article rewriting
 # ============================================================
 
-FACT_GUARD_VERSION = "fact-guard-v1.1.6-current-state"
+FACT_GUARD_VERSION = "fact-guard-v1.1.6-current-state-perf-auto-parallel-benchmark"
 
-NUM_THREADS = max(1, int(os.getenv("FACT_GUARD_NUM_THREADS", "16")))
+# Performance configuration:
+# Threads and batch are intentionally left to Ollama by default.
+# This mirrors the AUTO runner strategy already used elsewhere in TrendCurrent.
+# Explicit environment overrides remain supported for controlled testing.
+FACT_GUARD_NUM_THREADS = os.getenv("FACT_GUARD_NUM_THREADS", "").strip()
+FACT_GUARD_NUM_BATCH = os.getenv("FACT_GUARD_NUM_BATCH", "").strip()
+
+# Benchmark only: when enabled, independent focused audits run concurrently.
+# Default is OFF so the normal production behavior remains unchanged.
+FACT_GUARD_PARALLEL_AUDITS = (
+    os.getenv("FACT_GUARD_PARALLEL_AUDITS", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
 NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
-NUM_BATCH = max(64, int(os.getenv("FACT_GUARD_NUM_BATCH", "512")))
 AUDIT_TOKENS = max(300, int(os.getenv("FACT_GUARD_AUDIT_TOKENS", "520")))
 
 print(f"[FACT GUARD] {FACT_GUARD_VERSION}")
+
+
+def _fact_guard_ollama_options(
+    *,
+    temperature: float,
+    num_predict: int,
+) -> Dict[str, Any]:
+    """Build Ollama options while preserving AUTO defaults."""
+    options: Dict[str, Any] = {
+        "temperature": temperature,
+        "top_p": 0.85,
+        "top_k": 40,
+        "num_ctx": NUM_CTX,
+        "num_predict": num_predict,
+    }
+
+    # Only send thread/batch when explicitly overridden.
+    # Omitting them lets Ollama choose automatically.
+    if FACT_GUARD_NUM_THREADS:
+        options["num_thread"] = max(1, int(FACT_GUARD_NUM_THREADS))
+
+    if FACT_GUARD_NUM_BATCH:
+        options["num_batch"] = max(64, int(FACT_GUARD_NUM_BATCH))
+
+    return options
+
+
+def _fact_guard_timer_label(label: str, started: float) -> None:
+    elapsed = time.perf_counter() - started
+    print(f"[FACT GUARD TIMER] {label} END | elapsed={elapsed:.2f}s")
 
 
 # ============================================================
@@ -737,18 +781,14 @@ ARTICLE:
 
 
 def _ollama_event_date_audit(source: str, article: Dict[str, Any], reference_date: date | None = None) -> Dict[str, Any]:
+    _fact_guard_started = time.perf_counter()
     response = chat(
         model=MODEL,
         messages=[{"role": "user", "content": _event_date_audit_prompt(source, article, reference_date)}],
-        options={
-            "temperature": 0.0,
-            "top_p": 0.85,
-            "top_k": 40,
-            "num_ctx": NUM_CTX,
-            "num_predict": AUDIT_TOKENS,
-            "num_batch": NUM_BATCH,
-            "num_thread": NUM_THREADS,
-        },
+        options=_fact_guard_ollama_options(
+            temperature=0.0,
+            num_predict=AUDIT_TOKENS,
+        ),
         format=_EVENT_DATE_AUDIT_FORMAT,
     )
 
@@ -787,6 +827,7 @@ def _ollama_event_date_audit(source: str, article: Dict[str, Any], reference_dat
             "audit_layer": "focused_event_date",
         })
 
+    _fact_guard_timer_label("event_date", _fact_guard_started)
     return {
         "passed": bool(result.get("passed", False)) and not clean,
         "issues": clean,
@@ -900,18 +941,14 @@ ARTICLE:
 
 
 def _ollama_entity_attribution_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
+    _fact_guard_started = time.perf_counter()
     response = chat(
         model=MODEL,
         messages=[{"role": "user", "content": _entity_attribution_audit_prompt(source, article)}],
-        options={
-            "temperature": 0.0,
-            "top_p": 0.85,
-            "top_k": 40,
-            "num_ctx": NUM_CTX,
-            "num_predict": AUDIT_TOKENS,
-            "num_batch": NUM_BATCH,
-            "num_thread": NUM_THREADS,
-        },
+        options=_fact_guard_ollama_options(
+            temperature=0.0,
+            num_predict=AUDIT_TOKENS,
+        ),
         format=_ENTITY_ATTRIBUTION_FORMAT,
     )
     raw = response.message.content or ""
@@ -941,6 +978,7 @@ def _ollama_entity_attribution_audit(source: str, article: Dict[str, Any]) -> Di
             "deterministic": False,
             "audit_layer": "focused_entity_attribution",
         })
+    _fact_guard_timer_label("entity_attribution", _fact_guard_started)
     return {"passed": bool(result.get("passed", False)) and not clean, "issues": clean}
 
 
@@ -1163,18 +1201,14 @@ ARTICLE:
 
 
 def _ollama_temporal_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
+    _fact_guard_started = time.perf_counter()
     response = chat(
         model=MODEL,
         messages=[{"role": "user", "content": _temporal_audit_prompt(source, article)}],
-        options={
-            "temperature": 0.0,
-            "top_p": 0.85,
-            "top_k": 40,
-            "num_ctx": NUM_CTX,
-            "num_predict": AUDIT_TOKENS,
-            "num_batch": NUM_BATCH,
-            "num_thread": NUM_THREADS,
-        },
+        options=_fact_guard_ollama_options(
+            temperature=0.0,
+            num_predict=AUDIT_TOKENS,
+        ),
         format=_TEMPORAL_AUDIT_FORMAT,
     )
 
@@ -1214,6 +1248,7 @@ def _ollama_temporal_audit(source: str, article: Dict[str, Any]) -> Dict[str, An
             "audit_layer": "focused_temporal",
         })
 
+    _fact_guard_timer_label("temporal", _fact_guard_started)
     return {
         "passed": bool(result.get("passed", False)) and not clean,
         "issues": clean,
@@ -1221,18 +1256,14 @@ def _ollama_temporal_audit(source: str, article: Dict[str, Any]) -> Dict[str, An
 
 
 def _ollama_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
+    _fact_guard_started = time.perf_counter()
     response = chat(
         model=MODEL,
         messages=[{"role": "user", "content": _audit_prompt(source, article)}],
-        options={
-            "temperature": 0.0,
-            "top_p": 0.85,
-            "top_k": 40,
-            "num_ctx": NUM_CTX,
-            "num_predict": AUDIT_TOKENS,
-            "num_batch": NUM_BATCH,
-            "num_thread": NUM_THREADS,
-        },
+        options=_fact_guard_ollama_options(
+            temperature=0.0,
+            num_predict=AUDIT_TOKENS,
+        ),
         format=_AUDIT_FORMAT,
     )
 
@@ -1271,6 +1302,7 @@ def _ollama_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
             "deterministic": False,
         })
 
+    _fact_guard_timer_label("semantic", _fact_guard_started)
     return {
         "passed": bool(result.get("passed", False)) and not clean,
         "issues": clean,
@@ -1281,11 +1313,137 @@ def _ollama_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
 # Result normalization
 # ============================================================
 
+# ============================================================
+# Correlated blocking-issue normalization
+# ============================================================
+
+# The broad semantic audit and focused entity-attribution audit are
+# intentionally independent. The same factual incident can therefore be
+# reported twice by two audit layers. That is useful for detection, but the
+# downstream targeted repair contract expects ONE blocking issue per
+# underlying repairable incident.
+#
+# This normalization is deliberately narrow:
+#   - only wrong_role + wrong_entity_attribution pairs are correlated;
+#   - only when their claims clearly describe the same action/relationship;
+#   - unrelated role/attribution failures remain separate blockers.
+#
+# We do NOT use an LLM here. The purpose is normalization, not adjudication.
+
+_ISSUE_STOPWORDS = {
+    "the", "and", "are", "was", "were", "is", "be", "been", "being",
+    "to", "of", "a", "an", "for", "in", "on", "with", "from", "as", "at",
+    "by", "that", "this", "it", "they", "their", "his", "her", "its",
+    "set", "season",
+}
+
+_RELATION_TOKENS = {
+    # Roles / appointments
+    "host", "hosts", "hosting", "hosted",
+    "coach", "manager", "player", "president", "ceo", "minister", "mayor",
+    "director", "captain", "chairman", "chairwoman",
+    # Actions / status commonly audited by entity attribution
+    "appointed", "appoint", "appointed",
+    "elected", "elect", "elected",
+    "signed", "sign", "signing",
+    "joined", "join", "joining",
+    "left", "leave", "leaving",
+    "returned", "return", "returns",
+    "announced", "announce", "announcing",
+    "confirmed", "confirm", "confirming",
+    "revealed", "reveal", "revealing",
+    "said", "says", "told",
+    "injured", "injury",
+    "rejected", "reject",
+    "accepted", "accept",
+    "transferred", "transfer",
+}
+
+def _issue_tokens(text: str) -> set[str]:
+    tokens = re.findall(r"[a-z0-9]+", _normalize(text))
+    return {
+        token for token in tokens
+        if len(token) >= 3 and token not in _ISSUE_STOPWORDS
+    }
+
+
+def _correlated_role_attribution(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    types = {str(a.get("type", "")).strip(), str(b.get("type", "")).strip()}
+    if types != {"wrong_role", "wrong_entity_attribution"}:
+        return False
+
+    claim_a = _issue_tokens(str(a.get("claim", "")))
+    claim_b = _issue_tokens(str(b.get("claim", "")))
+    if not claim_a or not claim_b:
+        return False
+
+    shared = claim_a & claim_b
+    relation_shared = shared & _RELATION_TOKENS
+
+    # Same action/role + at least two additional shared claim tokens is a
+    # conservative indication that both audit layers describe one incident.
+    if relation_shared and len(shared) >= 3:
+        return True
+
+    # Source excerpts can be more precise than the generated claim. If both
+    # layers independently point to substantially overlapping evidence, that
+    # is also enough to treat them as correlated.
+    excerpt_a = _issue_tokens(str(a.get("source_excerpt", "")))
+    excerpt_b = _issue_tokens(str(b.get("source_excerpt", "")))
+    if excerpt_a and excerpt_b:
+        excerpt_shared = excerpt_a & excerpt_b
+        if len(excerpt_shared) >= 4:
+            return True
+
+    return False
+
+
+def _deduplicate_correlated_blockers(
+    issues: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Collapse only duplicate reports of the same role/entity-attribution
+    incident. Every other issue remains untouched.
+
+    The first issue is retained so the broad semantic audit remains the
+    primary blocking record. The duplicate is removed from the top-level
+    issue list so downstream repair sees exactly one blocker.
+    """
+    result: List[Dict[str, Any]] = []
+    removed = 0
+
+    for issue in issues:
+        if issue.get("severity") not in {"HIGH", "MEDIUM"}:
+            result.append(issue)
+            continue
+
+        duplicate_index = None
+        for idx, existing in enumerate(result):
+            if existing.get("severity") not in {"HIGH", "MEDIUM"}:
+                continue
+            if _correlated_role_attribution(existing, issue):
+                duplicate_index = idx
+                break
+
+        if duplicate_index is None:
+            result.append(issue)
+        else:
+            removed += 1
+
+    if removed:
+        print(
+            f"[FACT GUARD] Correlated duplicate blockers collapsed: {removed}"
+        )
+
+    return result
+
+
 def validate(
     source: str,
     article: Dict[str, Any],
     reference_date: date | None = None,
 ) -> Dict[str, Any]:
+    _fact_guard_total_started = time.perf_counter()
     if not isinstance(article, dict):
         raise ValueError("Article must be a JSON object.")
 
@@ -1297,32 +1455,15 @@ def validate(
     deterministic = _deterministic_checks(source, article)
     deterministic += _deterministic_current_state_checks(article, reference_date)
 
-    # The semantic audit remains independent. It is not told about
-    # deterministic findings, so the two layers can cross-check each other.
-    semantic = _ollama_audit(source, article)
-
-    # Focused temporal audit is intentionally narrow: it runs only when the
-    # article contains temporal context + result/statistic + relational wording.
     temporal_signals = _temporal_consistency_signals(article)
-    temporal = {"issues": []}
-    if (
+    run_temporal = (
         temporal_signals["temporal"]
         and temporal_signals["score"]
         and temporal_signals["relation"]
-    ):
-        temporal = _ollama_temporal_audit(source, article)
+    )
 
-
-    # Dedicated event-date/freshness audit. This is intentionally independent
-    # from the cross-fact temporal audit.
-    #
-    # v1.1.3 fix:
-    # Relative freshness language is now a valid trigger even without an
-    # explicit calendar date. This closes the exact "a récemment ..." failure
-    # mode where v1.1.2 could bypass its own audit.
     event_date_signals = _event_date_consistency_signals(article)
-    event_date = {"issues": []}
-    if (
+    run_event_date = (
         (
             event_date_signals["event_language"]
             and (
@@ -1331,14 +1472,71 @@ def validate(
             )
         )
         or event_date_signals.get("event_status_language", False)
-    ):
-        event_date = _ollama_event_date_audit(source, article, reference_date)
+    )
 
-    # Focused entity-attribution audit. Separate from the broad semantic audit
-    # so subject/action swaps receive a dedicated, conservative check.
-    entity_attribution = {"issues": []}
-    if _entity_attribution_signals(article):
-        entity_attribution = _ollama_entity_attribution_audit(source, article)
+    run_entity = _entity_attribution_signals(article)
+
+    # The broad semantic audit is always independent and remains mandatory.
+    # The focused audits are also independent of one another. In benchmark
+    # mode they may execute concurrently; their prompts, models, options,
+    # triggers, result parsing and issue normalization are unchanged.
+    if FACT_GUARD_PARALLEL_AUDITS:
+        jobs = {
+            "semantic": lambda: _ollama_audit(source, article),
+        }
+        if run_temporal:
+            jobs["temporal"] = lambda: _ollama_temporal_audit(source, article)
+        if run_event_date:
+            jobs["event_date"] = lambda: _ollama_event_date_audit(
+                source, article, reference_date
+            )
+        if run_entity:
+            jobs["entity_attribution"] = lambda: _ollama_entity_attribution_audit(
+                source, article
+            )
+
+        parallel_started = time.perf_counter()
+        results: Dict[str, Dict[str, Any]] = {}
+
+        with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+            futures = {
+                executor.submit(job): name
+                for name, job in jobs.items()
+            }
+            for future in as_completed(futures):
+                name = futures[future]
+                results[name] = future.result()
+
+        print(
+            f"[FACT GUARD TIMER] parallel audit group END | "
+            f"elapsed={time.perf_counter() - parallel_started:.2f}s | "
+            f"audits={len(jobs)}"
+        )
+
+        semantic = results["semantic"]
+        temporal = results.get("temporal", {"issues": []})
+        event_date = results.get("event_date", {"issues": []})
+        entity_attribution = results.get(
+            "entity_attribution", {"issues": []}
+        )
+    else:
+        semantic = _ollama_audit(source, article)
+
+        temporal = {"issues": []}
+        if run_temporal:
+            temporal = _ollama_temporal_audit(source, article)
+
+        event_date = {"issues": []}
+        if run_event_date:
+            event_date = _ollama_event_date_audit(
+                source, article, reference_date
+            )
+
+        entity_attribution = {"issues": []}
+        if run_entity:
+            entity_attribution = _ollama_entity_attribution_audit(
+                source, article
+            )
 
     all_issues = (
         deterministic
@@ -1347,6 +1545,11 @@ def validate(
         + event_date.get("issues", [])
         + entity_attribution.get("issues", [])
     )
+
+    # Normalize only correlated duplicate reports before counting blockers.
+    # Detection remains independent; this step only makes one underlying
+    # repairable incident count as one blocking issue.
+    all_issues = _deduplicate_correlated_blockers(all_issues)
 
     # REVIEW alone does not automatically reject an article.
     # HIGH / MEDIUM are publication blockers.
@@ -1357,6 +1560,7 @@ def validate(
 
     status = "FLAG" if blocking else "PASS"
 
+    _fact_guard_timer_label("TOTAL", _fact_guard_total_started)
     return {
         "fact_guard_version": FACT_GUARD_VERSION,
         "status": status,

@@ -157,6 +157,28 @@ LOCALITY AND TIME:
 - Do not transfer a date, time, result, status or programme from one occurrence,
   location or entity to another.
 
+
+HEADLINE RULES — STRICT, NON-NEGOTIABLE:
+- The public title MUST be short: maximum 10 words AND maximum 65 characters.
+- The H1 MUST use the SAME short editorial headline as the public title.
+- Target 7-10 words whenever possible. Never write a long SEO-style headline.
+- Write ONE clean editorial headline for the single verified story.
+- Do not concatenate the Trend topic, source headline and article summary.
+- Do not repeat the same entity, phrase or keyword.
+- Do not include generic SEO scaffolding such as "latest", "profile",
+  "explained" or similar filler unless that wording is essential to the
+  verified event.
+- Write an original headline based on the verified event; do not copy the
+  Google News/source headline verbatim.
+- Never include the publisher, website, source or outlet name in the title.
+- Never append a source name, author name or duplicate source name.
+- Do not use keyword stuffing, list-style phrasing or unnecessary questions.
+- State the main development clearly and directly.
+- Keep the title focused on the single verified story.
+- If the supplied topic is long, extract only the core entity + core event.
+- Before returning JSON, count the words and characters of BOTH title and H1.
+- Rewrite until BOTH title and H1 satisfy the hard limits and are identical.
+
 STYLE:
 - Natural, fluent {LANGUAGE}.
 - Professional, clear, objective and precise.

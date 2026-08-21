@@ -6,12 +6,13 @@ from ollama import chat
 from config import MODEL
 
 
-FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.0"
+FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.3-multi-issue"
 
 NUM_THREADS = max(1, int(os.getenv("FACT_GUARD_NUM_THREADS", "16")))
 NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
 NUM_BATCH = max(64, int(os.getenv("FACT_GUARD_NUM_BATCH", "512")))
-REPAIR_TOKENS = max(300, int(os.getenv("FACT_GUARD_REPAIR_TOKENS", "520")))
+REPAIR_CTX = max(4096, int(os.getenv("FACT_GUARD_REPAIR_CTX", "4096")))
+REPAIR_TOKENS = max(280, int(os.getenv("FACT_GUARD_REPAIR_TOKENS", "420")))
 
 
 _ARTICLE_FORMAT = {
@@ -112,28 +113,71 @@ def _schema_ok(article: Dict[str, Any]) -> bool:
 
 def _supported_repair(issue: Dict[str, Any]) -> bool:
     """
-    v1.0 intentionally supports only the production-proven
-    wrong_entity_attribution failure mode.
+    v1.2 supports three narrowly-scoped production failure modes:
+
+    - wrong_entity_attribution:
+      correct only when the source excerpt directly supports the
+      correct attribution.
+
+    - unsupported_claim:
+      delete-only repair. The unsupported claim is removed rather than
+      replaced with an inferred or guessed fact.
+
+    - event_date_mismatch:
+      delete-only repair. Remove the unsupported date or temporal assertion
+      without inventing, substituting, or inferring another date/status.
+
+    No other repair types are accepted.
     """
-    return (
-        str(issue.get("type", "")).strip().casefold()
-        == "wrong_entity_attribution"
-        and str(issue.get("severity", "")).strip().upper() in {"HIGH", "MEDIUM"}
-        and bool(str(issue.get("claim", "")).strip())
-        and bool(str(issue.get("reason", "")).strip())
-        and bool(str(issue.get("source_excerpt", "")).strip())
+    issue_type = str(issue.get("type", "")).strip().casefold()
+
+    severity_ok = (
+        str(issue.get("severity", "")).strip().upper()
+        in {"HIGH", "MEDIUM"}
     )
 
+    common_ok = (
+        severity_ok
+        and bool(str(issue.get("claim", "")).strip())
+        and bool(str(issue.get("reason", "")).strip())
+    )
 
-def repair(article: Dict[str, Any], source: str, guard_result: Dict[str, Any]) -> Dict[str, Any]:
+    if not common_ok:
+        return False
+
+    if issue_type in {"wrong_entity_attribution", "wrong_role"}:
+        return bool(str(issue.get("source_excerpt", "")).strip())
+
+    if issue_type in {"unsupported_claim", "event_date_mismatch"}:
+        return True
+
+    return False
+
+
+def repair(
+    article: Dict[str, Any],
+    source: str,
+    guard_result: Dict[str, Any],
+) -> Dict[str, Any]:
     """
-    Perform exactly one targeted repair.
+    Perform one consolidated targeted repair for all currently reported HIGH/MEDIUM blocking issues.
 
     Safety rules:
-    - Only wrong_entity_attribution is repairable in v1.0.
-    - Exactly one blocking issue must exist.
-    - The source material is the only factual authority.
-    - The repair may not introduce new facts.
+    - One or more HIGH/MEDIUM blocking issues may exist.
+    - The source material is the ONLY factual authority.
+    - Repair ONLY the reported blocking issues.
+    - Never introduce new facts.
+    - Never infer a missing date, status, entity, role, event, number or quote.
+    - wrong_entity_attribution may be corrected only from direct
+      source-supported evidence.
+    - unsupported_claim is delete-only.
+    - event_date_mismatch is delete-only and includes unsupported temporal
+      framing such as "next week", "tomorrow", "is set to air", or similar
+      future/past assertions when the source establishes a different state.
+    - For event_date_mismatch, do NOT replace the bad temporal assertion with
+      the current date, reference date, publication date, trend date, feed
+      date, or any inferred date.
+    - Preserve every other supported claim and preserve uncertainty/status.
     - The caller MUST run Fact Guard again after this function returns.
     """
     if not isinstance(article, dict):
@@ -145,44 +189,72 @@ def repair(article: Dict[str, Any], source: str, guard_result: Dict[str, Any]) -
     blocking = [
         x for x in guard_result.get("issues", [])
         if isinstance(x, dict)
-        and str(x.get("severity", "")).upper() in {"HIGH", "MEDIUM"}
+        and str(x.get("severity", "")).strip().upper() in {"HIGH", "MEDIUM"}
     ]
 
-    if len(blocking) != 1:
-        raise ValueError(
-            "fact-guard-repair-v1.0 requires exactly one blocking issue."
-        )
+    if not blocking:
+        raise ValueError("Fact Guard repair requires at least one blocking issue.")
 
-    issue = blocking[0]
+    unsupported = [x for x in blocking if not _supported_repair(x)]
+    if unsupported:
+        types = ", ".join(sorted({
+            str(x.get("type", "")).strip() or "unknown"
+            for x in unsupported
+        }))
+        raise ValueError(f"Unsupported Fact Guard repair type(s): {types}")
 
-    if not _supported_repair(issue):
-        raise ValueError(
-            f"Unsupported Fact Guard repair type: {issue.get('type', '')}"
-        )
+    issue_rules_parts = []
+    for index, issue in enumerate(blocking, 1):
+        issue_type = str(issue.get("type", "")).strip().casefold()
+
+        if issue_type in {"wrong_entity_attribution", "wrong_role"}:
+            rules = (
+                "- Correct the entity/role only when the source excerpt directly "
+                "establishes the correct entity or role.\n"
+                "- If the source does not establish the correction, DELETE the "
+                "incorrect attribution/role instead of guessing."
+            )
+        elif issue_type == "unsupported_claim":
+            rules = (
+                "- DELETE-ONLY: remove the unsupported claim or smallest sentence "
+                "containing it.\n"
+                "- Do not soften, paraphrase, reinterpret or replace it."
+            )
+        elif issue_type == "event_date_mismatch":
+            rules = (
+                "- DELETE-ONLY: remove the unsupported date/temporal assertion.\n"
+                "- Do not replace it with an inferred date or status.\n"
+                "- Preserve surrounding supported event wording."
+            )
+        else:
+            raise ValueError(f"Unsupported Fact Guard repair type: {issue_type}")
+
+        issue_rules_parts.append(f"ISSUE {index} ({issue_type}):\n{rules}")
+
+    issue_rules = "\n\n".join(issue_rules_parts)
 
     prompt = f"""
 You are TrendCurrent's targeted Fact Guard repair engine.
 
 Repair ONE already-generated article after an independent Fact Guard found
-one wrong_entity_attribution error.
+one or more blocking factual errors.
 
 SOURCE MATERIAL is the ONLY factual authority.
 
-CRITICAL RULES:
-- Fix ONLY the listed wrong_entity_attribution issue.
+GLOBAL SAFETY RULES:
+- Fix ONLY the listed issue.
 - Preserve all other supported article content.
 - Do NOT regenerate the article from scratch.
-- Do NOT add any new fact, context, motive, date, number, quote or event.
+- Do NOT add any new fact, context, motive, date, number, quote, event,
+  entity, role, or status.
 - Do NOT use outside knowledge.
-- If the source excerpt identifies the correct entity, replace the wrong
-  entity attribution with the exact entity supported by the source.
-- If the correct attribution cannot be established directly from the source
-  material, DELETE the incorrect attribution/claim instead of guessing.
-- Do not transfer an action, statement, role or status between entities based
-  on proximity alone.
-- Preserve uncertainty and status.
+- Do NOT infer missing information.
+- Preserve uncertainty when the source is uncertain.
 - Keep the article in its existing language.
-- Return ONLY valid article JSON.
+- Return ONLY valid article JSON matching the required schema.
+
+ISSUE-SPECIFIC RULES:
+{issue_rules}
 
 FACT GUARD ISSUE:
 {json.dumps(issue, ensure_ascii=False, indent=2)}
@@ -201,7 +273,7 @@ ARTICLE:
             "temperature": 0.0,
             "top_p": 0.85,
             "top_k": 40,
-            "num_ctx": NUM_CTX,
+            "num_ctx": REPAIR_CTX,
             "num_predict": REPAIR_TOKENS,
             "num_batch": NUM_BATCH,
             "num_thread": NUM_THREADS,

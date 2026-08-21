@@ -1,6 +1,7 @@
 import html
 import json
 import re
+from html.parser import HTMLParser
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -97,6 +98,37 @@ def _date_copy(date_obj, today):
     return f"{date_obj.day} {copy['months'][date_obj.month - 1]} {date_obj.year}"
 
 
+
+
+class _TitleParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.in_title = False
+        self.parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() == "title":
+            self.in_title = True
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "title":
+            self.in_title = False
+
+    def handle_data(self, data):
+        if self.in_title:
+            self.parts.append(data)
+
+
+def _extract_public_title(html_text, fallback):
+    """Read the generated editorial <title>; never derive card text from slug."""
+    parser = _TitleParser()
+    try:
+        parser.feed(html_text)
+        title = " ".join("".join(parser.parts).split()).strip()
+        return title or fallback
+    except Exception:
+        return fallback
+
 def get_articles():
     """Build the article list using the permanent publication timestamps."""
     ordered = ordered_slugs()
@@ -115,8 +147,16 @@ def get_articles():
             file_time = datetime.fromtimestamp(f.stat().st_mtime).astimezone()
             updated = file_time.strftime("%Y-%m-%d %H:%M")
 
+        try:
+            html_text = f.read_text(encoding="utf-8")
+        except Exception:
+            html_text = ""
+
+        fallback_title = f.stem.replace("-", " ").title()
+        public_title = _extract_public_title(html_text, fallback_title)
+
         articles.append({
-            "title": f.stem.replace("-", " ").title(),
+            "title": public_title,
             "url": f"/trends/{f.name}",
             "updated": updated,
             "lastmod": updated[:10],

@@ -26,11 +26,32 @@ from config import MODEL, LANGUAGE
 #   * language-independent
 # ============================================================
 
-PIPELINE_VERSION = "universal-fact-lock-v2.1-balanced-entity-lock-v1"
+PIPELINE_VERSION = "universal-fact-lock-v2.1-balanced-entity-lock-v1-perf"
 
-NUM_THREADS = max(1, int(os.getenv("OLLAMA_NUM_THREADS", "16")))
-NUM_CTX = max(4096, int(os.getenv("OLLAMA_NUM_CTX", "8192")))
-NUM_BATCH = max(64, int(os.getenv("OLLAMA_NUM_BATCH", "512")))
+# IMPORTANT: Do not force a CPU thread count by default.
+# Ollama can auto-detect the runner's optimal thread count. A hard-coded
+# "16" can be slower on machines whose optimal physical-core count differs.
+# Set OLLAMA_NUM_THREADS explicitly only if benchmarking proves a fixed value
+# is faster on the production machine.
+_OLLAMA_THREADS_RAW = os.getenv("OLLAMA_NUM_THREADS", "").strip()
+NUM_THREADS = (
+    max(1, int(_OLLAMA_THREADS_RAW))
+    if _OLLAMA_THREADS_RAW
+    else None
+)
+
+NUM_CTX = max(4096, int(os.getenv("OLLAMA_NUM_CTX", "6144")))
+
+# IMPORTANT: Do not force num_batch=512 by default.
+# Current Ollama versions can choose an automatic generation batch based on
+# available memory/context. Keep an explicit override available for controlled
+# benchmarking via OLLAMA_NUM_BATCH.
+_OLLAMA_BATCH_RAW = os.getenv("OLLAMA_NUM_BATCH", "").strip()
+NUM_BATCH = (
+    max(32, int(_OLLAMA_BATCH_RAW))
+    if _OLLAMA_BATCH_RAW
+    else None
+)
 
 # The old extractor asked the model for facts + quotes + groups at once.
 # That made a 500-token ceiling very easy to hit.  The balanced extractor
@@ -39,20 +60,20 @@ EVIDENCE_CHUNK_CHARS = max(
     7000, int(os.getenv("OLLAMA_EVIDENCE_CHUNK_CHARS", "14000"))
 )
 EVIDENCE_TOKENS = max(
-    360, int(os.getenv("OLLAMA_EVIDENCE_TOKENS", "480"))
+    280, int(os.getenv("OLLAMA_EVIDENCE_TOKENS", "320"))
 )
 EVIDENCE_MAX_FACTS = max(
-    4, int(os.getenv("OLLAMA_EVIDENCE_MAX_FACTS", "6"))
+    4, int(os.getenv("OLLAMA_EVIDENCE_MAX_FACTS", "5"))
 )
 
 ARTICLE_TOKENS = max(
-    500, int(os.getenv("OLLAMA_ARTICLE_TOKENS", "760"))
+    420, int(os.getenv("OLLAMA_ARTICLE_TOKENS", "520"))
 )
 AUDIT_TOKENS = max(
-    180, int(os.getenv("OLLAMA_AUDIT_TOKENS", "300"))
+    120, int(os.getenv("OLLAMA_AUDIT_TOKENS", "180"))
 )
 REPAIR_TOKENS = max(
-    300, int(os.getenv("OLLAMA_REPAIR_TOKENS", "520"))
+    280, int(os.getenv("OLLAMA_REPAIR_TOKENS", "420"))
 )
 
 MIN_ARTICLE_WORDS = max(
@@ -74,7 +95,7 @@ EVIDENCE_PARALLEL = os.getenv(
 # One retry is allowed only for malformed/truncated evidence JSON.
 # The retry uses a smaller output contract, not another huge prompt.
 EVIDENCE_RETRY_TOKENS = max(
-    EVIDENCE_TOKENS, int(os.getenv("OLLAMA_EVIDENCE_RETRY_TOKENS", "520"))
+    EVIDENCE_TOKENS, int(os.getenv("OLLAMA_EVIDENCE_RETRY_TOKENS", "360"))
 )
 
 print(f"[TrendCurrent PIPELINE] {PIPELINE_VERSION}")
@@ -146,11 +167,21 @@ def _call(
     response_format="json",
 ):
     started = time.perf_counter()
-    threads = max(1, int(num_thread or NUM_THREADS))
+    # None means "do not send num_thread", allowing Ollama to auto-detect.
+    # Explicit num_thread still wins when supplied by a caller/environment.
+    threads = (
+        max(1, int(num_thread))
+        if num_thread is not None
+        else NUM_THREADS
+    )
+
+    batch = NUM_BATCH
 
     print(
         f"[TIMER] Ollama START | predict={num_predict} | temp={temperature} "
-        f"| prompt_chars={len(prompt)} | threads={threads}"
+        f"| prompt_chars={len(prompt)}"
+        + (f" | threads={threads}" if threads is not None else " | threads=AUTO")
+        + (f" | batch={batch}" if batch is not None else " | batch=AUTO")
     )
 
     kwargs = {
@@ -162,11 +193,16 @@ def _call(
             "top_k": 40,
             "num_ctx": NUM_CTX,
             "num_predict": num_predict,
-            "num_batch": NUM_BATCH,
-            "num_thread": threads,
         },
         "format": response_format,
     }
+
+    # Only send runner knobs when explicitly configured. This avoids overriding
+    # Ollama's own automatic hardware-aware choices.
+    if batch is not None:
+        kwargs["options"]["num_batch"] = batch
+    if threads is not None:
+        kwargs["options"]["num_thread"] = threads
 
     response = chat(**kwargs)
     raw = response.message.content or ""
@@ -192,9 +228,33 @@ def _call(
         if isinstance(eval_count, (int, float)):
             tok_s = eval_count / (eval_ns / 1_000_000_000)
 
+    prompt_eval_ns = timing.get("prompt_eval_duration")
+    prompt_eval_count = timing.get("prompt_eval_count")
+    prompt_tok_s = None
+    if isinstance(prompt_eval_ns, (int, float)) and prompt_eval_ns > 0:
+        if isinstance(prompt_eval_count, (int, float)):
+            prompt_tok_s = prompt_eval_count / (prompt_eval_ns / 1_000_000_000)
+
+    load_ns = timing.get("load_duration")
+    prompt_eval_ns = timing.get("prompt_eval_duration")
+    eval_ns = timing.get("eval_duration")
+
+    def _sec(value):
+        return value / 1_000_000_000 if isinstance(value, (int, float)) else None
+
+    load_s = _sec(load_ns)
+    prompt_s = _sec(prompt_eval_ns)
+    eval_s = _sec(eval_ns)
+
     print(
         f"[TIMER] Ollama END   | elapsed={elapsed:.2f}s "
         f"| response_chars={len(raw)}"
+        + (f" | load={load_s:.2f}s" if load_s is not None else "")
+        + (f" | prompt_eval={prompt_s:.2f}s" if prompt_s is not None else "")
+        + (f" | eval={eval_s:.2f}s" if eval_s is not None else "")
+        + (f" | prompt_tokens={prompt_eval_count}" if prompt_eval_count is not None else "")
+        + (f" | output_tokens={eval_count}" if eval_count is not None else "")
+        + (f" | prompt_tok_s={prompt_tok_s:.2f}" if prompt_tok_s is not None else "")
         + (f" | eval_tok_s={tok_s:.2f}" if tok_s is not None else "")
     )
 
