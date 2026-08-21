@@ -7,7 +7,7 @@ from config import MAX_ARTICLES_PER_RUN, LANGUAGE
 from rss import fetch_trends
 from news import fetch_news
 from prompt import build_prompt
-from ollama_client import generate
+from ollama_client import generate, extract_evidence
 from ollama import chat
 from config import MODEL
 from fact_guard import validate as fact_guard_validate
@@ -332,12 +332,12 @@ def validate_article(article):
     return True
 
 
-def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max_attempts=1):
+def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max_attempts=1, prelocked_evidence=None):
     last = None
 
     for i in range(max_attempts):
         try:
-            article = generate(prompt)
+            article = generate(prompt, evidence=prelocked_evidence)
             validate_article(article)
             article = enforce_headline_policy(article, trend)
             validate_article(article)
@@ -479,10 +479,19 @@ def main():
     # correctness AFTER a topic has been selected; it does not decide which
     # topics deserve production capacity.
     # ============================================================
+    # Keep a wider cheap candidate pool than the final article capacity.
+    # This allows the evidence-usability gate to reject a top-ranked topic
+    # and fall through to the next-ranked candidate instead of ending the
+    # production run with an unused article slot.
+    candidate_pool_size = max(
+        MAX_ARTICLES_PER_RUN * 4,
+        MAX_ARTICLES_PER_RUN + 3,
+    )
+
     candidate_trends = rank_trends(
         trends,
         processed,
-        limit=MAX_ARTICLES_PER_RUN,
+        limit=candidate_pool_size,
     )
 
     source_scored_candidates = []
@@ -517,12 +526,17 @@ def main():
         except Exception as e:
             print(f"[TOPIC FILTER] ERROR: {keyword}: {e}")
 
-    final_trends = select_final_candidates(
+    # Evidence usability is part of production candidate selection.
+    # Keep the full source-scored ranking available so a top topic that has
+    # unusable evidence does not consume the article slot.
+    evidence_candidate_pool = select_final_candidates(
         source_scored_candidates,
-        limit=MAX_ARTICLES_PER_RUN,
+        limit=len(source_scored_candidates),
     )
 
-    for trend in final_trends:
+    for trend in evidence_candidate_pool:
+        if generated >= MAX_ARTICLES_PER_RUN:
+            break
         keyword = trend["title"]
         news = trend["news"]
 
@@ -541,11 +555,37 @@ def main():
                 f"source_chars={len(fact_guard_source)}"
             )
 
+            # --------------------------------------------------------
+            # EVIDENCE USABILITY GATE
+            # --------------------------------------------------------
+            # Use the exact same source-grounded extractor as the universal
+            # fact-lock pipeline. If this candidate cannot produce at least
+            # one provenance-verified fact, skip it and try the next-ranked
+            # candidate instead of consuming the article slot.
+            print(
+                f"[TOPIC FILTER] EVIDENCE USABILITY CHECK | {keyword}"
+            )
+
+            try:
+                evidence_lock = extract_evidence(generation_prompt)
+                trend["_evidence_lock"] = evidence_lock
+                print(
+                    f"[TOPIC FILTER] EVIDENCE USABILITY PASS | "
+                    f"facts={len(evidence_lock.get('facts', []))} | {keyword}"
+                )
+            except Exception as evidence_error:
+                print(
+                    f"[TOPIC FILTER] EVIDENCE USABILITY DROP | "
+                    f"{keyword} | {evidence_error}"
+                )
+                continue
+
             article = generate_valid_article(
                 generation_prompt,
                 fact_guard_source,
                 reference_date,
                 trend,
+                prelocked_evidence=evidence_lock,
             )
 
             slug = slugify(keyword)

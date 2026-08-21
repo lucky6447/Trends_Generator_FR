@@ -54,8 +54,12 @@ SOURCE-LOCKED FACTUAL RULES:
   the uncertainty to the sources.
 - If sources conflict, do not guess or average them. Use only information that
   is clearly supported, or state the conflict when it is material.
-- If the sources contain insufficient information, write a shorter article.
-  Never add filler to reach a target length.
+- Use all relevant, distinct and source-supported factual information available
+  in the supplied articles when it materially helps the reader understand the story.
+- Do not compress a well-supported story into a minimal summary when the sources
+  contain additional relevant facts.
+- If the sources genuinely contain insufficient information, write a shorter article.
+- Never add filler, speculation or unsupported detail to reach a target length.
 
 CONCRETE STORY:
 - Cover only the specific news story represented by MAIN TOPIC.
@@ -189,13 +193,26 @@ STYLE:
 - No unsupported editorial conclusions.
 - Every sentence should add a concrete, source-supported fact or necessary
   attribution.
+- Expand the article when the supplied sources contain additional relevant
+  verified facts; do not omit useful facts merely to keep the article short.
+- Avoid repeating the same factual point in different wording. The introduction
+  should establish the story, while sections should add distinct information,
+  context or developments supported by the sources.
 - Use natural transitions without introducing new information.
 
 STRUCTURE:
 - Introduction.
 - 1 to 5 sections depending on the amount of verified material.
+- Use as many sections as are genuinely useful within the 1-5 section limit,
+  based on the distinct developments, facts or aspects supported by the sources.
 - Use fewer sections when the sources contain limited information.
 - Do not create sections merely to make the article longer.
+- When the sources contain multiple distinct verified developments, cover them
+  rather than collapsing them into a single minimal summary.
+- The introduction should summarize the core story without duplicating the
+  details that belong in the sections.
+- Each section should contribute materially new information rather than restating
+  the introduction or another section.
 - Sections may have different lengths according to the amount and importance
   of supported information.
 - Brief objective conclusion with no new facts.
@@ -209,7 +226,13 @@ Before returning the result:
 5. Remove any sentence that is unsupported, inferred, speculative or doubtful.
 6. Do not add new facts during the introduction, transitions, sections or
    conclusion.
-7. If evidence is limited, shorten the article instead of adding information.
+7. If evidence is genuinely limited, shorten the article instead of adding
+   information.
+8. If the evidence contains additional relevant verified facts, make sure they
+   are not unnecessarily omitted simply because the article can be written
+   more briefly.
+9. Check that the introduction and sections are complementary rather than
+   repetitive, and that distinct supported developments have been covered.
 
 Return ONLY valid JSON:
 {{

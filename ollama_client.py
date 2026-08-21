@@ -26,7 +26,7 @@ from config import MODEL, LANGUAGE
 #   * language-independent
 # ============================================================
 
-PIPELINE_VERSION = "universal-fact-lock-v2.1-balanced-entity-lock-v1-perf"
+PIPELINE_VERSION = "universal-fact-lock-v2.1-balanced-entity-lock-v2-evidence-gate"
 
 # IMPORTANT: Do not force a CPU thread count by default.
 # Ollama can auto-detect the runner's optimal thread count. A hard-coded
@@ -977,7 +977,19 @@ def _adaptive_min_words(evidence):
     return ADAPTIVE_MIN_5_PLUS
 
 
-def generate(prompt, retries=0):
+def extract_evidence(prompt):
+    """
+    Public evidence-usability gate.
+
+    Runs the same deterministic source-grounded evidence extraction used by the
+    universal fact-lock pipeline, but stops after producing the locked evidence.
+    A candidate passes this gate only when at least one provenance-verified fact
+    can be extracted from the supplied source material.
+    """
+    return _extract_evidence(prompt)
+
+
+def generate(prompt, retries=0, evidence=None):
     """
     Balanced universal pipeline.
 
@@ -1003,8 +1015,14 @@ def generate(prompt, retries=0):
         f"[TIMER] PIPELINE START | prompt_chars={len(prompt or '')}"
     )
 
-    print("[PIPELINE] Building balanced evidence lock...")
-    evidence = _extract_evidence(prompt)
+    if evidence is None:
+        print("[PIPELINE] Building balanced evidence lock...")
+        evidence = _extract_evidence(prompt)
+    else:
+        print(
+            f"[PIPELINE] Reusing preflight evidence lock | "
+            f"facts={len(evidence.get('facts', []))}"
+        )
 
     print("[PIPELINE] Generating evidence-locked article...")
     article = _generate_article(evidence)
