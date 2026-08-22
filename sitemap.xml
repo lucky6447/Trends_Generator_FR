@@ -73,6 +73,12 @@
     <priority>0.6</priority>
   </url>
   <url>
+    <loc>https://fr.trendcurrent.today/trends/actualit-s</loc>
+    <lastmod>2026-08-22</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
     <loc>https://fr.trendcurrent.today/trends/new-york-unit-sp-ciale</loc>
     <lastmod>2026-08-22</lastmod>
     <changefreq>monthly</changefreq>
