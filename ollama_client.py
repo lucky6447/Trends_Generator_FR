@@ -26,11 +26,10 @@ from config import MODEL, LANGUAGE
 #   * language-independent
 # ============================================================
 
-PIPELINE_VERSION = "universal-fact-lock-v2.1-balanced-entity-lock-v2-evidence-gate"
+PIPELINE_VERSION = "universal-fact-lock-v2.3.2-compact-evidence-json-fixed2"
 
 # IMPORTANT: Do not force a CPU thread count by default.
-# Ollama can auto-detect the runner's optimal thread count. A hard-coded
-# "16" can be slower on machines whose optimal physical-core count differs.
+# Ollama can auto-detect the runner's optimal thread count.
 # Set OLLAMA_NUM_THREADS explicitly only if benchmarking proves a fixed value
 # is faster on the production machine.
 _OLLAMA_THREADS_RAW = os.getenv("OLLAMA_NUM_THREADS", "").strip()
@@ -43,9 +42,7 @@ NUM_THREADS = (
 NUM_CTX = max(4096, int(os.getenv("OLLAMA_NUM_CTX", "6144")))
 
 # IMPORTANT: Do not force num_batch=512 by default.
-# Current Ollama versions can choose an automatic generation batch based on
-# available memory/context. Keep an explicit override available for controlled
-# benchmarking via OLLAMA_NUM_BATCH.
+# Keep an explicit override available for controlled benchmarking.
 _OLLAMA_BATCH_RAW = os.getenv("OLLAMA_NUM_BATCH", "").strip()
 NUM_BATCH = (
     max(32, int(_OLLAMA_BATCH_RAW))
@@ -63,7 +60,7 @@ EVIDENCE_TOKENS = max(
     280, int(os.getenv("OLLAMA_EVIDENCE_TOKENS", "320"))
 )
 EVIDENCE_MAX_FACTS = max(
-    4, int(os.getenv("OLLAMA_EVIDENCE_MAX_FACTS", "5"))
+    4, int(os.getenv("OLLAMA_EVIDENCE_MAX_FACTS", "6"))
 )
 
 ARTICLE_TOKENS = max(
@@ -168,13 +165,11 @@ def _call(
 ):
     started = time.perf_counter()
     # None means "do not send num_thread", allowing Ollama to auto-detect.
-    # Explicit num_thread still wins when supplied by a caller/environment.
     threads = (
         max(1, int(num_thread))
         if num_thread is not None
         else NUM_THREADS
     )
-
     batch = NUM_BATCH
 
     print(
@@ -197,8 +192,7 @@ def _call(
         "format": response_format,
     }
 
-    # Only send runner knobs when explicitly configured. This avoids overriding
-    # Ollama's own automatic hardware-aware choices.
+    # Only send runner knobs when explicitly configured.
     if batch is not None:
         kwargs["options"]["num_batch"] = batch
     if threads is not None:
@@ -235,16 +229,12 @@ def _call(
         if isinstance(prompt_eval_count, (int, float)):
             prompt_tok_s = prompt_eval_count / (prompt_eval_ns / 1_000_000_000)
 
-    load_ns = timing.get("load_duration")
-    prompt_eval_ns = timing.get("prompt_eval_duration")
-    eval_ns = timing.get("eval_duration")
-
     def _sec(value):
         return value / 1_000_000_000 if isinstance(value, (int, float)) else None
 
-    load_s = _sec(load_ns)
-    prompt_s = _sec(prompt_eval_ns)
-    eval_s = _sec(eval_ns)
+    load_s = _sec(timing.get("load_duration"))
+    prompt_s = _sec(timing.get("prompt_eval_duration"))
+    eval_s = _sec(timing.get("eval_duration"))
 
     print(
         f"[TIMER] Ollama END   | elapsed={elapsed:.2f}s "
@@ -353,14 +343,10 @@ _EVIDENCE_FORMAT = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "g": {"type": "string"},
                     "f": {"type": "string"},
-                    "e": {"type": "string"},
-                    "s": {"type": "string"},
-                    "d": {"type": "string"},
-                    "t": {"type": "string"},
+                    "x": {"type": "string"},
                 },
-                "required": ["g", "f", "e", "s", "d", "t"],
+                "required": ["f", "x"],
             },
         },
     },
@@ -368,8 +354,47 @@ _EVIDENCE_FORMAT = {
 }
 
 
+def _sentence_index_source(source):
+    """
+    Add deterministic sentence IDs to the source.
+
+    The model selects IDs; Python constructs the evidence excerpt directly
+    from the original source. This removes the fragile LLM-generated-excerpt
+    provenance step that was causing repeated 'excerpt not found in source'
+    rejections.
+    """
+    text = (source or "").strip()
+    if not text:
+        return "", {}
+
+    # Keep article headers/metadata as part of sentences.
+    # Split on sentence-ending punctuation followed by whitespace, while also
+    # handling closing quotes/brackets before the whitespace. Do not require
+    # the next character to be uppercase: this is important for multilingual
+    # sources, headlines, abbreviations and quoted text.
+    parts = re.split(
+        r'(?<=[.!?])(?:["”»’\'\)\]]+)?\s+',
+        text
+    )
+    parts = [p.strip() for p in parts if p.strip()]
+
+    # If the source has long blocks without punctuation, still expose them.
+    mapping = {}
+    indexed = []
+    for i, part in enumerate(parts, 1):
+        sid = f"S{i}"
+        mapping[sid] = part
+        indexed.append(f"[{sid}] {part}")
+
+    return "\n".join(indexed), mapping
+
+
 def _evidence_prompt(source, max_facts=None):
     limit = max_facts or EVIDENCE_MAX_FACTS
+    indexed_source, sentence_map = _sentence_index_source(source)
+
+    valid_ids = list(sentence_map.keys())
+    valid_id_text = ", ".join(valid_ids)
 
     return f"""
 You are TrendCurrent's source-evidence extractor.
@@ -377,73 +402,101 @@ You are TrendCurrent's source-evidence extractor.
 Read ONLY the SOURCE MATERIAL. Build evidence for ONE publishable news story.
 
 PRIMARY-EVENT RULE:
-- Identify the MAIN story/event in the supplied material.
-- Return facts ONLY from that main story. Exclude unrelated games, injuries, statements,
-  people, dates or incidents even when they share a person or topic.
-- ALL returned facts from the main story MUST use group "G1". Do not create G2/G3
-  for supporting details of the same story.
-- Do NOT stop after one fact if the source contains more directly useful facts.
-- Extract up to {limit} useful facts from the main event. Prefer 4-6 when available.
-- A useful fact can be the event itself, date, location, result/status, named people,
-  numbers, direct developments or other material details explicitly supported by the source.
-- CRITICAL ENTITY RULE: When the main story explicitly states a named person's role,
-  position, job title or other identity-defining attribute, ALWAYS extract that attribute
-  as a separate fact if it is relevant to the main event. Never omit an explicit role or
-  position merely because the event itself is already covered.
-- For person-related facts, name the person explicitly in the "f" field. Do not use pronouns
-  such as "he", "she" or "they" when the fact can be stated with the person's name.
-- Do not manufacture supporting facts just to reach a count.
+- Identify ONE coherent main story/event in the supplied material.
+- Return facts ONLY from that same story/event.
+- If the material contains multiple ARTICLE blocks or separate news stories sharing a broad keyword, choose ONE story and ignore the others.
+- Never combine two different events just because they concern the same person, keyword, programme, team, place or general subject.
+- Prefer facts that belong to the same concrete event/article cluster.
+- Extract as many distinct useful facts as the SAME story supports, up to {limit}.
+- Target 4-6 facts when the SAME story contains enough material.
+- Cover different factual dimensions when available: what happened, who/where, timing, numbers, status, and other directly relevant details.
+- Do not stop after the first fact merely because it is sufficient to identify the story.
+- Do not manufacture facts to reach a count.
 
 FACT RULES:
-- Every fact must be directly supported by its excerpt.
-- Preserve names, roles, dates, numbers and status exactly.
-- Never turn reported/expected/talks into confirmed facts.
+- Each fact must be explicitly supported by one source sentence.
+- "x" MUST be one of these VALID SENTENCE IDs: {valid_id_text}
+- Never invent or alter a sentence ID.
+- "f" must be a concise factual statement supported by that sentence.
+- Do NOT generate excerpts, source names, dates or status fields separately.
 - Do not infer motives, causes, consequences or significance.
 - Do not use outside knowledge.
-- Keep excerpts short (prefer <=160 characters).
-- For "s", return only the publisher/source name, never a URL.
-- Return ONLY JSON. No article and no commentary.
+- Preserve names, roles, dates, numbers and certainty exactly.
+- Never transfer attributes between named entities.
+- Return ONLY JSON.
 
-Use this compact JSON shape:
-{{"facts":[{{"g":"G1","f":"fact","e":"short excerpt","s":"publisher","d":"date or empty","t":"status or empty"}}]}}
+Use exactly this compact JSON shape:
+{{"facts":[{{"f":"fact","x":"S1"}}]}}
 
 SOURCE MATERIAL:
-{source}
+{indexed_source}
 """
+
+
+
+def _evidence_expansion_prompt(source):
+    indexed_source, sentence_map = _sentence_index_source(source)
+    valid_id_text = ", ".join(sentence_map.keys())
+    return f"""
+Extract the MAIN EVENT from this source and build a compact evidence ledger.
+
+Return ONLY JSON:
+{{"facts":[{{"f":"fact","x":"S1"}}]}}
+
+RULES:
+- Extract 4-{EVIDENCE_MAX_FACTS} distinct facts if supported; use fewer only when the source truly contains fewer.
+- ALL returned facts must belong to ONE coherent event/story.
+- If several ARTICLE blocks or separate stories appear in the source, choose one main story and ignore unrelated stories that merely share a keyword.
+- Do not combine separate programmes, broadcasts, people, matches, incidents or other events.
+- Do not repeat the same fact in different wording.
+- Cover different useful details: event, people/entities, timing, numbers, status, location or other directly relevant facts.
+- Every fact must be explicitly supported by one sentence.
+- "x" must be one of these VALID SENTENCE IDs: {valid_id_text}
+- Never invent or alter an ID.
+- No excerpts, source names, dates or status fields outside "f".
+- No outside knowledge.
+- Return ONLY JSON.
+
+SOURCE:
+{indexed_source}
+"""
+
 
 
 def _evidence_retry_prompt(source):
+    indexed_source, sentence_map = _sentence_index_source(source)
+    valid_id_text = ", ".join(sentence_map.keys())
+
     return f"""
-Extract the MAIN EVENT from this source. Return ONLY compact JSON.
+Extract the MAIN EVENT from this source.
 
-Use 2-6 facts if the source supports them; do not invent facts.
-All returned facts must belong to the same main event and MUST use group "G1".
-Exclude unrelated events. Every fact needs a short supporting excerpt copied from the source.
-If the main story explicitly states a named person's role, position, job title or identity
-attribute, ALWAYS include that as a separate fact.
-For person-related facts, use the person's full name rather than pronouns.
-For "s", use only the publisher/source name, never a URL.
+Return ONLY compact JSON:
+{{"facts":[{{"f":"fact","x":"S1"}}]}}
 
-{{"facts":[{{"g":"G1","f":"fact","e":"excerpt","s":"publisher","d":"date or empty","t":"status or empty"}}]}}
+RULES:
+- Return as many distinct facts as the source supports, up to {EVIDENCE_MAX_FACTS}.
+- Prefer 4-6 facts when the source contains enough material.
+- ALL facts must belong to ONE coherent main event/story.
+- If multiple ARTICLE blocks or separate stories share a keyword, choose one story only and do not mix them.
+- Cover different useful factual dimensions instead of repeating the same point.
+- All facts must belong to the same main event.
+- "x" must be one of these VALID SENTENCE IDs: {valid_id_text}
+- Never invent or alter a sentence ID.
+- "f" must be a concise supported fact.
+- Do not generate excerpts, source names, dates or status fields.
+- Do not invent facts or use outside knowledge.
 
 SOURCE:
-{source}
+{indexed_source}
 """
 
 
-def _source_excerpt_supported(source, excerpt):
-    """
-    Deterministic provenance guard.
 
-    The extractor may paraphrase the fact field, but the evidence excerpt must
-    actually occur in the supplied source. Whitespace is normalized only.
-    """
+def _source_excerpt_supported(source, excerpt):
     source_norm = re.sub(r"\s+", " ", (source or "")).strip().casefold()
     excerpt_norm = re.sub(r"\s+", " ", (excerpt or "")).strip().casefold()
-
     if not source_norm or not excerpt_norm:
         return False
-
     return excerpt_norm in source_norm
 
 
@@ -455,6 +508,7 @@ def _normalize_evidence(data, source_material=None):
     if not isinstance(raw_facts, list):
         raw_facts = []
 
+    _, sentence_map = _sentence_index_source(source_material or "")
     clean = []
     seen = set()
 
@@ -462,35 +516,32 @@ def _normalize_evidence(data, source_material=None):
         if not isinstance(item, dict):
             continue
 
-        group = str(item.get("g", "")).strip()
         fact = str(item.get("f", "")).strip()
-        excerpt = str(item.get("e", "")).strip()
-        source_name = str(item.get("s", "")).strip()
-        date = str(item.get("d", "")).strip()
-        status = str(item.get("t", "")).strip()
+        sentence_id = str(item.get("x", "")).strip()
 
-        if not group or not fact or not excerpt:
+        if not fact or not sentence_id:
             continue
 
-        # Provenance guard: the excerpt must be traceable to the supplied source.
-        # This prevents fabricated evidence from entering the factual lock.
-        if source_material is not None and not _source_excerpt_supported(source_material, excerpt):
-            print("[PIPELINE] Evidence excerpt rejected: not found in source")
+        excerpt = sentence_map.get(sentence_id, "").strip()
+        if not excerpt:
+            print(
+                f"[PIPELINE] Evidence sentence rejected: unknown source id {sentence_id}"
+            )
             continue
 
-        key = (group.lower(), fact.lower(), excerpt.lower())
+        key = (fact.lower(), sentence_id.lower())
         if key in seen:
             continue
         seen.add(key)
 
         clean.append({
             "id": f"F{len(clean) + 1}",
-            "group": group,
+            "group": "G1",
             "fact": fact,
             "excerpt": excerpt[:160],
-            "source": source_name[:80],
-            "date": date,
-            "status": status,
+            "source": "",
+            "date": "",
+            "status": "",
         })
 
         if len(clean) >= EVIDENCE_MAX_FACTS:
@@ -499,27 +550,11 @@ def _normalize_evidence(data, source_material=None):
     if not clean:
         raise ValueError("Evidence extraction produced no usable facts.")
 
-    # Select the group with the most facts. Tie-break by first appearance.
-    counts = {}
-    first_seen = {}
-    for index, fact in enumerate(clean):
-        group = fact["group"]
-        counts[group] = counts.get(group, 0) + 1
-        first_seen.setdefault(group, index)
-
-    primary = max(
-        counts,
-        key=lambda g: (counts[g], -first_seen[g]),
-    )
-
-    locked = [fact for fact in clean if fact["group"] == primary]
-    if not locked:
-        raise ValueError("Primary event group contains no usable facts.")
-
     return {
-        "primary_group": primary,
-        "facts": locked[:EVIDENCE_MAX_FACTS],
+        "primary_group": "G1",
+        "facts": clean[:EVIDENCE_MAX_FACTS],
     }
+
 
 
 def _extract_evidence(source):
@@ -544,14 +579,13 @@ def _extract_evidence(source):
             )
             maps.append(_normalize_evidence(data, source_material=chunk))
         except ValueError as exc:
-            # Only malformed/truncated evidence is retried.  The retry is
-            # compact, deterministic and deliberately smaller.
+            # Retry only malformed/truncated JSON. Provenance no longer depends
+            # on a model-written excerpt, so a valid response is not thrown away
+            # because of wording differences.
             if "Invalid Ollama JSON" not in str(exc):
                 raise
 
-            print(
-                f"[PIPELINE] Evidence JSON retry | chunk={index}"
-            )
+            print(f"[PIPELINE] Evidence JSON retry | chunk={index}")
             data = _call(
                 _evidence_retry_prompt(chunk),
                 temperature=0.0,
@@ -561,11 +595,24 @@ def _extract_evidence(source):
             )
             maps.append(_normalize_evidence(data, source_material=chunk))
 
-    # Merge only within the already selected primary group of each chunk.
-    # Different chunks remain different groups, so they cannot accidentally
-    # become one event.
     facts = []
     seen = set()
+
+    # If extraction is suspiciously sparse despite a large source, do one compact
+    # expansion pass over the same chunks. This preserves the compact JSON contract
+    # while preventing a rich source from collapsing to a single fact.
+    if len(maps) and sum(len(x.get("facts", [])) for x in maps) <= 1 and len(source or "") >= 7000:
+        print("[PIPELINE] Evidence sparse | requesting compact fact expansion...")
+        maps = []
+        for index, chunk in enumerate(chunks, 1):
+            data = _call(
+                _evidence_expansion_prompt(chunk),
+                temperature=0.0,
+                num_predict=EVIDENCE_TOKENS,
+                num_thread=NUM_THREADS,
+                response_format=_EVIDENCE_FORMAT,
+            )
+            maps.append(_normalize_evidence(data, source_material=chunk))
 
     for chunk_no, data in enumerate(maps, 1):
         group = f"C{chunk_no}-{data['primary_group']}"
@@ -588,21 +635,24 @@ def _extract_evidence(source):
     if not facts:
         raise ValueError("Evidence extraction produced no usable facts.")
 
-    # In normal one-chunk inputs this is the selected event.
-    # For multi-chunk inputs, choose the group with the most evidence.
+    # Keep the strongest evidence across all chunks instead of discarding
+    # an entire chunk just because another chunk produced more facts.
+    # Facts are already constrained to the same main event by the extractor.
+    locked = facts[:EVIDENCE_MAX_FACTS]
+
     group_counts = {}
-    for fact in facts:
+    for fact in locked:
         group_counts[fact["group"]] = group_counts.get(fact["group"], 0) + 1
 
-    primary_group = max(group_counts, key=group_counts.get)
-    locked = [
-        fact for fact in facts
-        if fact["group"] == primary_group
-    ]
+    primary_group = max(
+        group_counts,
+        key=group_counts.get,
+        default="C1-G1",
+    )
 
     evidence = {
         "primary_group": primary_group,
-        "facts": locked[:EVIDENCE_MAX_FACTS],
+        "facts": locked,
     }
 
     print(
@@ -706,6 +756,7 @@ Use ONLY the LOCKED EVIDENCE below.
 
 BALANCED FACT RULES:
 - Stay on the one locked event.
+- Treat every LOCKED EVIDENCE fact as belonging to the same event; never merge it with another event merely because names, topics or keywords overlap.
 - You may naturally paraphrase supported facts.
 - You may combine facts when they clearly describe the same event.
 - Do not add outside facts.
@@ -714,15 +765,20 @@ BALANCED FACT RULES:
   attribute may be stated only when that attribute is explicitly present in LOCKED EVIDENCE.
   If it is absent from LOCKED EVIDENCE, do not guess it. If LOCKED EVIDENCE explicitly
   gives a different attribute, never substitute another one.
+- ENTITY-TO-ENTITY LOCK: Never transfer a role, organization type, action, status or relationship
+  from one named entity to another. In particular, do not infer that a person or fictional character
+  is a company/production house/organization because a nearby sentence names a production company.
+- Keep each factual attribute attached only to the exact entity for which the evidence states it.
 - Preserve uncertainty and status.
 - Do not turn a report into a confirmed fact.
 - Do not use unsupported quotes.
 - Do not add generic filler or speculation.
 - Titles, descriptions and headings must also stay factual.
-- Aim for roughly 90-140 words when the evidence contains enough material.
-- Use the available supporting facts naturally; do not collapse a multi-fact story into a single sentence.
+- Aim for roughly 100-160 words when the evidence contains enough material.
+- Use the available supporting facts naturally. If 3 or more locked facts are available, develop the story across the intro and sections so the article explains the distinct supported details rather than reducing the story to one or two sentences.
+- For 3-4 facts, normally use at least 2 sections when the material supports it; for 5+ facts, normally use 2-4 sections.
 - If the evidence genuinely contains only one or two facts, a shorter article is acceptable.
-- Never add filler just to reach a word target.
+- Never add filler, repetition or unsupported detail just to reach a word target.
     - Return 1-4 sections only.
 
 Return ONLY the required JSON.
@@ -966,6 +1022,11 @@ def _audit_or_raise(article, evidence, label):
 # Public API
 # ============================================================
 
+def extract_evidence(source):
+    """Public compatibility wrapper for the evidence extractor."""
+    return _extract_evidence(source)
+
+
 def _adaptive_min_words(evidence):
     count = len(evidence.get("facts", [])) if isinstance(evidence, dict) else 0
     if MIN_ARTICLE_WORDS > 0:
@@ -975,18 +1036,6 @@ def _adaptive_min_words(evidence):
     if count <= 4:
         return ADAPTIVE_MIN_3_4
     return ADAPTIVE_MIN_5_PLUS
-
-
-def extract_evidence(prompt):
-    """
-    Public evidence-usability gate.
-
-    Runs the same deterministic source-grounded evidence extraction used by the
-    universal fact-lock pipeline, but stops after producing the locked evidence.
-    A candidate passes this gate only when at least one provenance-verified fact
-    can be extracted from the supplied source material.
-    """
-    return _extract_evidence(prompt)
 
 
 def generate(prompt, retries=0, evidence=None):
@@ -1015,14 +1064,14 @@ def generate(prompt, retries=0, evidence=None):
         f"[TIMER] PIPELINE START | prompt_chars={len(prompt or '')}"
     )
 
-    if evidence is None:
-        print("[PIPELINE] Building balanced evidence lock...")
-        evidence = _extract_evidence(prompt)
-    else:
+    if evidence is not None:
         print(
             f"[PIPELINE] Reusing preflight evidence lock | "
-            f"facts={len(evidence.get('facts', []))}"
+            f"facts={len(evidence.get("facts", []))}"
         )
+    else:
+        print("[PIPELINE] Building balanced evidence lock...")
+        evidence = _extract_evidence(prompt)
 
     print("[PIPELINE] Generating evidence-locked article...")
     article = _generate_article(evidence)
