@@ -56,10 +56,20 @@ SOURCE-LOCKED FACTUAL RULES:
   is clearly supported, or state the conflict when it is material.
 - Use all relevant, distinct and source-supported factual information available
   in the supplied articles when it materially helps the reader understand the story.
+- Before drafting, internally identify the distinct verified facts and developments
+  actually supported by the supplied articles. Treat those facts as a CLOSED FACTUAL
+  UNIVERSE for the article: do not expand that universe.
+- When several distinct verified facts are available, prefer covering an additional
+  unused fact over adding another sentence that merely explains or restates a fact
+  already covered.
+- Organise the available facts across the introduction and sections so that each
+  part contributes new information. Do not repeat the introduction in a section.
 - Do not compress a well-supported story into a minimal summary when the sources
   contain additional relevant facts.
 - If the sources genuinely contain insufficient information, write a shorter article.
 - Never add filler, speculation or unsupported detail to reach a target length.
+- Never make an article longer by inferring background, motives, causes, likely
+  consequences, missing details or contextual facts that are not explicitly supported.
 
 CONCRETE STORY:
 - Cover only the specific news story represented by MAIN TOPIC.
@@ -195,6 +205,9 @@ STYLE:
   attribution.
 - Expand the article when the supplied sources contain additional relevant
   verified facts; do not omit useful facts merely to keep the article short.
+- Expansion means broader coverage of verified facts, not greater elaboration of
+  facts already stated. If no additional verified fact remains, stop rather than
+  inventing detail to create more depth.
 - Avoid repeating the same factual point in different wording. The introduction
   should establish the story, while sections should add distinct information,
   context or developments supported by the sources.
@@ -209,10 +222,12 @@ STRUCTURE:
 - Do not create sections merely to make the article longer.
 - When the sources contain multiple distinct verified developments, cover them
   rather than collapsing them into a single minimal summary.
-- The introduction should summarize the core story without duplicating the
-  details that belong in the sections.
+- The introduction should establish the core story using only the most important
+  facts, while leaving additional verified details for the sections.
 - Each section should contribute materially new information rather than restating
-  the introduction or another section.
+  the introduction or another section. Before finalising, internally check that
+  each section contains at least one relevant factual point not already covered
+  elsewhere, unless the available evidence is genuinely too limited.
 - Sections may have different lengths according to the amount and importance
   of supported information.
 - Brief objective conclusion with no new facts.
