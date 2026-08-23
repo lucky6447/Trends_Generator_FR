@@ -8,13 +8,19 @@ def load_processed():
     if not PROCESSED_FILE.exists():
         return set()
 
-    return set(
-        json.loads(
+    try:
+        data = json.loads(
             PROCESSED_FILE.read_text(
                 encoding="utf-8"
             )
         )
-    )
+    except (json.JSONDecodeError, OSError):
+        return set()
+
+    if not isinstance(data, list):
+        return set()
+
+    return set(data)
 
 
 def save_processed(processed):

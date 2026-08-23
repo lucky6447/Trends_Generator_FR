@@ -47,6 +47,12 @@ TOPIC_MAX_CANDIDATES = max(
 TOPIC_MIN_PRE_SCORE = float(os.getenv("TOPIC_MIN_PRE_SCORE", "42"))
 TOPIC_MIN_FINAL_SCORE = float(os.getenv("TOPIC_MIN_FINAL_SCORE", "55"))
 
+# Production candidate quality tiers. These do not change the Topic Score
+# formula; they control priority before expensive news retrieval.
+TOPIC_TIER_A = float(os.getenv("TOPIC_TIER_A", "80"))
+TOPIC_TIER_B = float(os.getenv("TOPIC_TIER_B", "75"))
+TOPIC_TIER_C = float(os.getenv("TOPIC_TIER_C", "70"))
+
 # Production GEO priority is now market-aware. An explicit environment
 # override still wins, preserving the existing deployment control.
 COUNTRY_ALIASES = {
@@ -290,8 +296,13 @@ def _term_in_text(text: str, term: str) -> bool:
     pattern = rf"(?<!\w){re.escape(term)}(?!\w)"
     return re.search(pattern, text, re.IGNORECASE) is not None
 
-def _geo_score(title: str) -> Tuple[float, str]:
+def _geo_score(title: str, trend: Dict[str, Any] | None = None) -> Tuple[float, str]:
     t = _norm(title)
+
+    # Controlled Indonesia discovery candidates belong to the ID market even
+    # when the story itself is about an international entertainment entity.
+    if CURRENT_COUNTRY == "ID" and isinstance(trend, dict) and trend.get("id_discovery"):
+        return 15.0, "ID"
 
     # Strong explicit current production GEO preference, now tied to the
     # current market unless TOPIC_PRIORITY_GEOS explicitly overrides it.
@@ -357,7 +368,17 @@ def _pre_score(trend: Dict[str, Any]) -> Dict[str, Any]:
     else:
         freshness = 3.0
 
-    geo, geo_name = _geo_score(title)
+    # ID discovery candidates are already scoped by rss.py to the controlled
+    # Indonesian discovery case. Their headlines are often Korean/global
+    # entertainment stories, so requiring the literal word "Indonesia" in the
+    # headline would incorrectly classify them as GLOBAL.
+    #
+    # Preserve the normal GEO scoring for the generic pipeline, but explicitly
+    # mark controlled ID discovery candidates as ID-local for ranking.
+    if CURRENT_COUNTRY == "ID" and trend.get("id_discovery"):
+        geo, geo_name = 15.0, "ID"
+    else:
+        geo, geo_name = _geo_score(title, trend)
 
     news_patterns = _localized_patterns(NEWS_PATTERNS_BY_LANG)
     newsworthiness = min(
@@ -435,7 +456,34 @@ def rank_trends(trends: Sequence[Dict[str, Any]], processed: Iterable[str], limi
         max(limit * TOPIC_CANDIDATE_MULTIPLIER, 8),
         TOPIC_MAX_CANDIDATES,
     )
-    selected = scored[:pool_size]
+
+    # Quality-prioritized candidate pool:
+    #   80+      = highest priority
+    #   75-79.9  = strong
+    #   70-74.9  = acceptable
+    #   <70      = fallback only
+    #
+    # Strong topics must get the expensive retrieval capacity first. However,
+    # a weak trend batch must not result in zero production: fallback topics
+    # are admitted only when the higher tiers cannot fill the candidate pool.
+    tier_a = [x for x in scored if x["_topic"]["pre_score"] >= TOPIC_TIER_A]
+    tier_b = [x for x in scored if TOPIC_TIER_B <= x["_topic"]["pre_score"] < TOPIC_TIER_A]
+    tier_c = [x for x in scored if TOPIC_TIER_C <= x["_topic"]["pre_score"] < TOPIC_TIER_B]
+    tier_d = [x for x in scored if x["_topic"]["pre_score"] < TOPIC_TIER_C]
+
+    prioritized = tier_a + tier_b + tier_c
+    selected = prioritized[:pool_size]
+
+    if len(selected) < min(pool_size, limit):
+        fallback_needed = min(pool_size, limit) - len(selected)
+        selected.extend(tier_d[:fallback_needed])
+
+    print(
+        f"[TOPIC FILTER] QUALITY GATE | "
+        f"80+={len(tier_a)} | 75-79.9={len(tier_b)} | "
+        f"70-74.9={len(tier_c)} | <70 fallback={len(tier_d)} | "
+        f"selected={len(selected)}"
+    )
 
     print(
         f"[TOPIC FILTER] {len(trends)} trends -> "
@@ -468,11 +516,15 @@ def score_with_news(trend: Dict[str, Any], news: Sequence[Dict[str, Any]]) -> Di
         # This collapses www/mobile/news subdomains conservatively while
         # keeping unrelated domains independent. Fall back to the existing
         # source name when no URL is available.
+        # Prefer the publisher URL exposed by Google News RSS. The item
+        # `link` is normally a news.google.com redirect and must never be
+        # used as the publisher identity when a real publisher URL exists.
         url = _clean(
-            item.get("url")
-            or item.get("link")
-            or item.get("source_url")
+            item.get("source_url")
             or item.get("sourceUrl")
+            or item.get("source_href")
+            or item.get("url")
+            or item.get("link")
         )
         if url:
             try:
@@ -503,7 +555,12 @@ def score_with_news(trend: Dict[str, Any], news: Sequence[Dict[str, Any]]) -> Di
     # Strong penalty for a topic that has only one weak/duplicate source.
     evidence_penalty = 0.0
     if count < 2:
-        evidence_penalty = 30.0
+        # A controlled ID discovery candidate carries a fresh Google News seed
+        # from rss.py. Do not treat that seed as an ordinary generic topic with
+        # a hard single-source collapse; Fact Guard still remains the factual
+        # gate after generation. Keep the normal penalty for every other market.
+        if not (CURRENT_COUNTRY == "ID" and trend.get("id_discovery")):
+            evidence_penalty = 30.0
     elif len(source_names) <= 1:
         evidence_penalty = 6.0
     elif content_count == 0:
@@ -527,17 +584,28 @@ def score_with_news(trend: Dict[str, Any], news: Sequence[Dict[str, Any]]) -> Di
         "sourceability": round(sourceability, 2),
         "evidence_penalty": round(evidence_penalty, 2),
         "final_score": round(final_score, 2),
+        "id_discovery": bool(trend.get("id_discovery")),
     }
     return result
 
-def select_final_candidates(candidates: Sequence[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+def select_final_candidates(
+    candidates: Sequence[Dict[str, Any]],
+    limit: int,
+    min_score: float | None = None,
+) -> List[Dict[str, Any]]:
+    # Backward-compatible optional gate override. Existing callers that do not
+    # pass min_score keep the universal TOPIC_MIN_FINAL_SCORE behavior.
+    effective_min_score = (
+        TOPIC_MIN_FINAL_SCORE if min_score is None else float(min_score)
+    )
+
     viable = []
     for item in candidates:
         d = item.get("_topic_final") or {}
-        if d.get("final_score", 0) < TOPIC_MIN_FINAL_SCORE:
+        if d.get("final_score", 0) < effective_min_score:
             print(
                 f"[TOPIC FILTER] DROP AFTER NEWS | {item.get('title')} | "
-                f"final={d.get('final_score', 0):.1f} < {TOPIC_MIN_FINAL_SCORE:.1f}"
+                f"final={d.get('final_score', 0):.1f} < {effective_min_score:.1f}"
             )
             continue
         viable.append(item)

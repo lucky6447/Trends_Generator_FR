@@ -71,6 +71,26 @@ SOURCE-LOCKED FACTUAL RULES:
 - Never make an article longer by inferring background, motives, causes, likely
   consequences, missing details or contextual facts that are not explicitly supported.
 
+CLAIM DISCIPLINE — STRICT SOURCE GROUNDING:
+- Never strengthen, exaggerate, upgrade, or embellish a factual claim from the source.
+- Preserve the exact factual strength of the source.
+- Example: “held the team to one run” must never become “recorded a shutout”
+  or “kept the team scoreless.”
+- Never convert an implied or probable fact into a confirmed fact.
+- Never infer a person's role, title, position, status, or responsibility from
+  team/entity association or surrounding context.
+- A person's role/title may only be stated when explicitly supported by the source evidence.
+- If the source does not explicitly establish a role/title, omit the role/title
+  rather than infer it.
+- When uncertain between a stronger and weaker formulation, always use the weaker
+  formulation that is directly supported by the source.
+- Every named-person factual claim must be traceable to explicit source evidence.
+- Do not add factual detail merely because it is likely, conventional, or logically implied.
+- Never add general background facts, rules, definitions or domain knowledge
+  unless those facts are explicitly supported by the supplied sources.
+- A fact may be true in the real world and still be unusable if it is not
+  supported by the supplied sources.
+
 CONCRETE STORY:
 - Cover only the specific news story represented by MAIN TOPIC.
 - Identify the main story supported by the supplied sources.

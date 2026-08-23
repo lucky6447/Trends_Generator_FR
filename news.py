@@ -16,8 +16,7 @@ def clean(value):
 
 def extract_article(url):
     try:
-        response = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
-        downloaded = trafilatura.fetch_url(response.url)
+        downloaded = trafilatura.fetch_url(url)
         if downloaded:
             text = trafilatura.extract(
                 downloaded, include_comments=False, include_tables=False, include_links=False
@@ -47,7 +46,7 @@ def fetch_news(query, limit=20):
     url = (
         "https://news.google.com/rss/search?"
         f"q={quote_plus(query + ' when:7d')}"
-        "&hl=fr-FR&gl=FR&ceid=FR:fr"
+        "&hl=en-GB&gl=GB&ceid=GB:en"
     )
     feed = feedparser.parse(url)
     items = feed.entries[:limit]
@@ -57,10 +56,15 @@ def fetch_news(query, limit=20):
         source = ""
         if hasattr(item, "source"):
             source = clean(item.source.get("title"))
+        source_href = ""
+        if hasattr(item, "source"):
+            source_href = clean(item.source.get("href"))
+
         prepared.append({
             "title": clean(item.get("title")),
             "summary": clean(item.get("summary")),
             "source": source,
+            "source_href": source_href,
             "link": clean(item.get("link")),
             "published": clean(item.get("published")),
         })

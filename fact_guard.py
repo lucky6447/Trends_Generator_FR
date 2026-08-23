@@ -30,7 +30,7 @@ from config import MODEL
 #   3) no automatic article rewriting
 # ============================================================
 
-FACT_GUARD_VERSION = "fact-guard-v1.1.6-current-state-perf-auto-parallel-benchmark"
+FACT_GUARD_VERSION = "fact-guard-v1.1.8-current-state-event-date-trigger"
 
 # Performance configuration:
 # Threads and batch are intentionally left to Ollama by default.
@@ -376,6 +376,117 @@ def _extract_article_dates(article: Dict[str, Any]) -> List[date]:
     return unique
 
 
+def _source_has_multiple_event_dates(source: str) -> bool:
+    """
+    Conservative trigger for multi-event temporal auditing.
+
+    The source often contains several dates that are ONLY publication/update
+    dates. Counting all dates was too broad and could trigger a temporal audit
+    for an article whose source material contains no evidence of multiple
+    event instances.
+
+    We therefore count a date only when it appears near explicit event-language
+    in the source. This remains a trigger only: the focused temporal audit is
+    still the authority for deciding whether facts were actually conflated.
+    """
+    source_norm = _normalize(source)
+
+    event_context_patterns = [
+        r"\b(game|match|race|event|round|matchday|final|semifinal|quarterfinal)\b",
+        r"\b(win|wins|won|defeated|beat|beats|lost|lose|scored|finished|played|faced)\b",
+        r"\b(signed|signs|joined|appointed|elected|announced|released|launched|debut)\b",
+        r"\b(trailer|teaser|film|movie|series|album|single|premiere|release|released)\b",
+        r"\b(cancelled|canceled|postponed|rescheduled|scheduled|landfall|weakened|strengthened)\b",
+        r"\b(gewann|gewonnen|besiegte|spiel|rennen|runde|angekündigt|veröffentlicht)\b",
+        r"\b(gagné|battu|match|course|finale|sortie|annoncé)\b",
+        r"\b(ganó|venció|partido|carrera|final|lanzamiento|anunció)\b",
+        r"\b(vinto|battuto|partita|gara|finale|uscita|annunciato)\b",
+        r"\b(venceu|derrotou|partida|corrida|final|lançamento|anunciou)\b",
+    ]
+
+    event_spans = []
+    for pattern in event_context_patterns:
+        event_spans.extend(m.span() for m in re.finditer(pattern, source_norm))
+
+    if not event_spans:
+        return False
+
+    months = {
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "may": 5, "june": 6, "july": 7, "august": 8,
+        "september": 9, "october": 10, "november": 11, "december": 12,
+    }
+
+    date_occurrences = []
+
+    for m in re.finditer(r"\b(\d{4}-\d{2}-\d{2})\b", source_norm):
+        date_occurrences.append((m.start(), m.end(), m.group(1)))
+
+    for m in re.finditer(
+        r"\b(\d{1,2})\s+([a-z]+)\s+(\d{4})\b", source_norm
+    ):
+        month = months.get(m.group(2))
+        if month:
+            try:
+                date_occurrences.append((
+                    m.start(), m.end(),
+                    date(int(m.group(3)), month, int(m.group(1))).isoformat(),
+                ))
+            except ValueError:
+                pass
+
+    for m in re.finditer(
+        r"\b([a-z]+)\s+(\d{1,2}),\s+(\d{4})\b", source_norm
+    ):
+        month = months.get(m.group(1))
+        if month:
+            try:
+                date_occurrences.append((
+                    m.start(), m.end(),
+                    date(int(m.group(3)), month, int(m.group(2))).isoformat(),
+                ))
+            except ValueError:
+                pass
+
+    event_dates: set[str] = set()
+    CONTEXT_WINDOW = 180
+
+    publication_context_patterns = [
+        r"\bpublished\b", r"\bupdated\b", r"\bposted\b",
+        r"\bpublication\b", r"\bsource date\b", r"\bdate published\b",
+        r"\bpublished on\b", r"\bupdated on\b",
+        r"\bveröffentlicht\b", r"\baktualisiert\b",
+        r"\bpublié\b", r"\bmis à jour\b",
+        r"\bpublicado\b", r"\bactualizado\b",
+        r"\bpubblicato\b", r"\baggiornato\b",
+        r"\bpublicado\b", r"\batualizado\b",
+    ]
+
+    for start, end, iso_date in date_occurrences:
+        # Do not classify an explicit publication/update date as an event date
+        # merely because an event word appears elsewhere in the same source
+        # block. A short local context is enough to catch common feed metadata.
+        local_before = source_norm[max(0, start - 90):start]
+        local_after = source_norm[end:min(len(source_norm), end + 40)]
+        publication_context = any(
+            re.search(pattern, local_before) or re.search(pattern, local_after)
+            for pattern in publication_context_patterns
+        )
+        if publication_context:
+            continue
+
+        near_event = any(
+            abs(event_pos - start) <= CONTEXT_WINDOW
+            or abs(event_pos - end) <= CONTEXT_WINDOW
+            for span_start, span_end in event_spans
+            for event_pos in (span_start, span_end)
+        )
+        if near_event:
+            event_dates.add(iso_date)
+
+    return len(event_dates) >= 2
+
+
 def _deterministic_current_state_checks(
     article: Dict[str, Any],
     reference_date: date | None,
@@ -568,10 +679,10 @@ def _deterministic_checks(source: str, article: Dict[str, Any]) -> List[Dict[str
     # --------------------------------------------------------
 
     role_patterns = [
-        r"\\bmanager\\b", r"\\bcoach\\b", r"\\bhead coach\\b",
-        r"\\bplayer\\b", r"\\bmidfielder\\b", r"\\bdefender\\b",
-        r"\\bforward\\b", r"\\bpresident\\b", r"\\bceo\\b",
-        r"\\bowner\\b", r"\\bminister\\b", r"\\bmayor\\b",
+        r"\bmanager\b", r"\bcoach\b", r"\bhead coach\b",
+        r"\bplayer\b", r"\bmidfielder\b", r"\bdefender\b",
+        r"\bforward\b", r"\bpresident\b", r"\bceo\b",
+        r"\bowner\b", r"\bminister\b", r"\bmayor\b",
     ]
     article_has_role_claim = any(re.search(p, text_norm) for p in role_patterns)
 
@@ -593,11 +704,11 @@ def _deterministic_checks(source: str, article: Dict[str, Any]) -> List[Dict[str
     # --------------------------------------------------------
 
     temporal_patterns = [
-        r"\\b(joined|joins|signed|signs|moved|moves|transferred|transfer|departed|leaves|left)\\b",
-        r"\\b(on|since|from|as of)\\s+\\d{1,2}\\s+[a-z]+\\s+\\d{4}\\b",
-        r"\\b(on|since|from|as of)\\s+[a-z]+\\s+\\d{1,2},\\s+\\d{4}\\b",
-        r"\\b(\\d{4}-\\d{2}-\\d{2})\\b",
-        r"\\b(first|debut|latest|current|currently|today|yesterday)\\b",
+        r"\b(joined|joins|signed|signs|moved|moves|transferred|transfer|departed|leaves|left)\b",
+        r"\b(on|since|from|as of)\s+\d{1,2}\s+[a-z]+\s+\d{4}\b",
+        r"\b(on|since|from|as of)\s+[a-z]+\s+\d{1,2},\s+\d{4}\b",
+        r"\b(\d{4}-\d{2}-\d{2})\b",
+        r"\b(first|debut|latest|current|currently|today|yesterday)\b",
     ]
 
     if any(re.search(p, text_norm) for p in temporal_patterns):
@@ -1162,9 +1273,15 @@ STRICT RULES:
   Article: "A shot 61, while B struggled with 74."
   This is HIGH if the wording presents 61 and 74 as results from the same
   relevant round/day.
-- Do NOT infer a same-round relationship merely because facts appear in the
-  same source or article.
-- If the article explicitly identifies different rounds/dates, that is fine.
+- Do NOT infer a same-round, same-day, same-match, or same-event relationship
+  merely because facts appear in the same source or article.
+- Treat different event instances involving the same person, team, club,
+  organisation, or topic as separate unless the source explicitly supports
+  their connection. This includes separate games, matches, races, appearances,
+  performances, announcements, incidents, or developments on adjacent dates.
+- A fact from Event A must not be attached to Event B merely because the same
+  entity appears in both events.
+- If the article explicitly identifies different rounds/dates/events, that is fine.
 - If the source lacks enough temporal information to decide, use REVIEW.
 - HIGH requires a clear temporal contradiction established by the source.
 - Ignore style and grammar.
@@ -1456,13 +1573,38 @@ def validate(
     deterministic += _deterministic_current_state_checks(article, reference_date)
 
     temporal_signals = _temporal_consistency_signals(article)
-    run_temporal = (
-        temporal_signals["temporal"]
-        and temporal_signals["score"]
-        and temporal_signals["relation"]
-    )
 
     event_date_signals = _event_date_consistency_signals(article)
+
+    # Existing focused temporal trigger remains unchanged.
+    #
+    # Additional narrow trigger:
+    # If the article contains an explicit event date and event language, and
+    # the supplied source contains multiple distinct dates that are each near
+    # explicit event language, run the temporal audit even when the article has
+    # no score/comparison wording. Publication/update dates alone do not trigger
+    # this path.
+    #
+    # This specifically covers adjacent-event conflation, where two individually
+    # true facts about the same person/team can belong to different event
+    # instances (for example, separate games on consecutive days).
+    #
+    # The helper is ONLY a trigger. The focused temporal audit remains the
+    # authority for deciding whether the facts were actually conflated.
+    run_temporal = (
+        (
+            temporal_signals["temporal"]
+            and temporal_signals["score"]
+            and temporal_signals["relation"]
+        )
+        or
+        (
+            event_date_signals["event_language"]
+            and event_date_signals["explicit_date"]
+            and _source_has_multiple_event_dates(source)
+        )
+    )
+
     run_event_date = (
         (
             event_date_signals["event_language"]

@@ -6,7 +6,7 @@ from ollama import chat
 from config import MODEL
 
 
-FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.3-multi-issue"
+FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.4-multi-issue-event-safe"
 
 NUM_THREADS = max(1, int(os.getenv("FACT_GUARD_NUM_THREADS", "16")))
 NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
@@ -113,7 +113,7 @@ def _schema_ok(article: Dict[str, Any]) -> bool:
 
 def _supported_repair(issue: Dict[str, Any]) -> bool:
     """
-    v1.2 supports three narrowly-scoped production failure modes:
+    v1.3 supports three narrowly-scoped production failure modes:
 
     - wrong_entity_attribution:
       correct only when the source excerpt directly supports the
@@ -126,6 +126,21 @@ def _supported_repair(issue: Dict[str, Any]) -> bool:
     - event_date_mismatch:
       delete-only repair. Remove the unsupported date or temporal assertion
       without inventing, substituting, or inferring another date/status.
+
+    - wrong_amount:
+      exact source-grounded replacement only. The source excerpt must directly
+      support the corrected amount. Never calculate, estimate, or infer a new
+      amount. If the correction cannot be established directly, delete the
+      incorrect amount-bearing claim instead.
+
+    - wrong_fact:
+      delete-only repair. Remove the unsupported factual claim rather than
+      replacing it with outside knowledge or a guessed correction.
+
+    - cross_event_conflation / cross_round_conflation:
+      delete-only repair. Remove the smallest claim or sentence that incorrectly
+      attaches a fact from one event instance to another. Never reconstruct the
+      chronology or invent a replacement event/date/result.
 
     No other repair types are accepted.
     """
@@ -148,8 +163,13 @@ def _supported_repair(issue: Dict[str, Any]) -> bool:
     if issue_type in {"wrong_entity_attribution", "wrong_role"}:
         return bool(str(issue.get("source_excerpt", "")).strip())
 
-    if issue_type in {"unsupported_claim", "event_date_mismatch"}:
+    if issue_type in {"unsupported_claim", "event_date_mismatch", "wrong_fact",
+                      "cross_event_conflation", "cross_round_conflation",
+                      "cross_fact_temporal_consistency"}:
         return True
+
+    if issue_type == "wrong_amount":
+        return bool(str(issue.get("source_excerpt", "")).strip())
 
     return False
 
@@ -226,6 +246,38 @@ def repair(
                 "- Do not replace it with an inferred date or status.\n"
                 "- Preserve surrounding supported event wording."
             )
+        elif issue_type == "wrong_amount":
+            rules = (
+                "- Correct the amount ONLY when the source excerpt directly "
+                "supports the corrected amount.\n"
+                "- Preserve the exact source-supported amount and currency.\n"
+                "- Do not calculate, estimate, round, convert currency, or infer "
+                "a different amount.\n"
+                "- If the correction cannot be established directly from the "
+                "source excerpt, DELETE the smallest amount-bearing claim instead."
+            )
+        elif issue_type == "wrong_fact":
+            rules = (
+                "- DELETE-ONLY: remove the unsupported factual claim or the "
+                "smallest sentence containing it.\n"
+                "- Do not replace it with a fact from outside knowledge, even if "
+                "that replacement fact is likely or generally known."
+            )
+        elif issue_type in {
+            "cross_event_conflation",
+            "cross_round_conflation",
+            "cross_fact_temporal_consistency",
+        }:
+            rules = (
+                "- DELETE-ONLY: remove the smallest claim or sentence that "
+                "incorrectly combines facts from different event instances.\n"
+                "- Do not rewrite the chronology or merge the events.\n"
+                "- Do not substitute another date, result, amount, status, or "
+                "event unless that replacement is explicitly part of the "
+                "reported issue and directly supported by the source excerpt.\n"
+                "- Preserve all surrounding claims that remain independently "
+                "supported and belong to the main event."
+            )
         else:
             raise ValueError(f"Unsupported Fact Guard repair type: {issue_type}")
 
@@ -256,8 +308,8 @@ GLOBAL SAFETY RULES:
 ISSUE-SPECIFIC RULES:
 {issue_rules}
 
-FACT GUARD ISSUE:
-{json.dumps(issue, ensure_ascii=False, indent=2)}
+FACT GUARD ISSUES:
+{json.dumps(blocking, ensure_ascii=False, indent=2)}
 
 SOURCE MATERIAL:
 {source}
