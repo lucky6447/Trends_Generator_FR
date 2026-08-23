@@ -7,7 +7,7 @@ RSS_URL = "https://trends.google.com/trending/rss?geo=FR"
 
 # AI Article Generation
 COUNTRY = "France"
-LANGUAGE = "fr"
+LANGUAGE = "French"
 
 # Ollama Model
 MODEL = "qwen2.5:14b"
