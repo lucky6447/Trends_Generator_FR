@@ -726,5 +726,9 @@
   "coupe-de-france": {
     "published_at": "2026-08-23 14:49",
     "order": -182
+  },
+  "canal": {
+    "published_at": "2026-08-23 16:36",
+    "order": -183
   }
 }
