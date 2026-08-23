@@ -27,6 +27,7 @@ from __future__ import annotations
 import math
 import os
 import re
+from urllib.parse import urlparse
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
 
@@ -46,85 +47,185 @@ TOPIC_MAX_CANDIDATES = max(
 TOPIC_MIN_PRE_SCORE = float(os.getenv("TOPIC_MIN_PRE_SCORE", "42"))
 TOPIC_MIN_FINAL_SCORE = float(os.getenv("TOPIC_MIN_FINAL_SCORE", "55"))
 
-# Production GEO priority. During the current UK/US experiment this gives
-# those markets a meaningful advantage without hard-rejecting other stories.
-DEFAULT_PRIORITY_GEOS = ("US", "UK")
-_priority_geos_env = os.getenv("TOPIC_PRIORITY_GEOS", "")
-PRIORITY_GEOS = tuple(
-    x.strip().upper()
-    for x in (_priority_geos_env.split(",") if _priority_geos_env else DEFAULT_PRIORITY_GEOS)
-    if x.strip()
-)
+# Production GEO priority is now market-aware. An explicit environment
+# override still wins, preserving the existing deployment control.
+COUNTRY_ALIASES = {
+    "US": ("us", "usa", "united states", "united states of america", "america"),
+    "UK": ("uk", "gb", "gbr", "united kingdom", "great britain", "britain", "england", "scotland", "wales"),
+    "DE": ("de", "deu", "germany", "deutschland", "german", "deutsch"),
+    "IT": ("it", "ita", "italy", "italia", "italian", "italiano"),
+    "FR": ("fr", "fra", "france", "french", "français", "francais"),
+    "ES": ("es", "esp", "spain", "españa", "espana", "spanish", "español", "espanol"),
+    "PT": ("pt", "prt", "portugal", "portuguese", "português", "portugues"),
+    "BR": ("br", "bra", "brazil", "brasil", "brazilian", "brasileiro"),
+    "ID": ("id", "idn", "indonesia", "indonesian", "bahasa indonesia"),
+    "CA": ("ca", "canada", "canadian"),
+    "AU": ("au", "aus", "australia", "australian"),
+}
 
-SKIP_PATTERNS = (
-    " vs ",
-    " v ",
-    " live",
-    " score",
-    " result",
-    " calendario",
-    " alineación",
-    " prognóstico",
-    " stream",
-    " streaming",
-)
+# Keep the existing English signals and add only high-confidence localized
+# equivalents for the production markets. These remain deterministic regex
+# signals; they do not invoke an LLM or alter the pipeline flow.
+SKIP_PATTERNS_BY_LANG = {
+    "en": (" vs ", " v ", " live", " score", " result", "calendario", "alineación", "alineacion", "prognóstico", "pronostico", "stream", "streaming"),
+    "de": (" vs ", " v ", " live", " ergebnis", " spielstand", "stream", "streaming"),
+    "it": (" vs ", " v ", " live", " risultato", "punteggio", "stream", "streaming"),
+    "fr": (" vs ", " v ", " en direct", " score", " résultat", "resultat", "stream", "streaming"),
+    "es": (" vs ", " v ", " en vivo", " resultado", " marcador", "stream", "streaming", "calendario", "alineación", "alineacion", "pronóstico", "pronostico"),
+    "pt": (" vs ", " v ", " ao vivo", " resultado", " placar", "stream", "streaming", "calendário", "calendario"),
+    "id": (" vs ", " v ", " live", " skor", " hasil", "stream", "streaming", "jadwal"),
+}
 
-NOISE_PATTERNS = (
-    r"\bhoroscope\b",
-    r"\bhoroscopes\b",
-    r"\blottery results?\b",
-    r"\bweather forecast\b",
-    r"\bexchange rate\b",
-    r"\bprice forecast\b",
-    r"\bstock forecast\b",
-    r"\bflight status\b",
-)
+NOISE_PATTERNS_BY_LANG = {
+    "en": (
+        r"\bhoroscope(?:s)?\b", r"\blottery results?\b", r"\bweather forecast\b",
+        r"\bexchange rate\b", r"\bprice forecast\b", r"\bstock forecast\b", r"\bflight status\b",
+    ),
+    "de": (
+        r"\bhoroskop(?:e)?\b", r"\blotto(?:zahlen|ergebnisse)?\b", r"\bwetter(?:vorhersage|prognose)\b",
+        r"\bwechselkurs(?:e)?\b", r"\bpreisprognose(?:n)?\b", r"\baktienprognose(?:n)?\b", r"\bflugstatus\b",
+    ),
+    "it": (
+        r"\boroscopo(?:i)?\b", r"\brisultati della lotteria\b", r"\bprevisioni? del tempo\b",
+        r"\btasso di cambio\b", r"\bprevisioni? di prezzo\b", r"\bprevisioni? azionari[ae]\b", r"\bstato del volo\b",
+    ),
+    "fr": (
+        r"\bhoroscope(?:s)?\b", r"\brésultats? de loterie\b", r"\bprévisions? météo\b", r"\bprevisions? meteo\b",
+        r"\btaux de change\b", r"\bprévision(?:s)? de prix\b", r"\bprevision(?:s)? de prix\b", r"\bprévision(?:s)? boursière(?:s)?\b", r"\bstatut du vol\b",
+    ),
+    "es": (
+        r"\bhoróscopo(?:s)?\b", r"\bhoroscopo(?:s)?\b", r"\bresultados? de lotería\b", r"\bresultados? de loteria\b",
+        r"\bpronóstico del tiempo\b", r"\bpronostico del tiempo\b", r"\btipo de cambio\b", r"\bprevisión de precio\b", r"\bprevision de precio\b", r"\bpronóstico bursátil\b", r"\bpronostico bursatil\b", r"\bestado del vuelo\b",
+    ),
+    "pt": (
+        r"\bhoróscopo(?:s)?\b", r"\bhoroscopo(?:s)?\b", r"\bresultados? da loteria\b", r"\bprevisão do tempo\b", r"\bprevisao do tempo\b",
+        r"\btaxa de câmbio\b", r"\btaxa de cambio\b", r"\bprevisão de preço\b", r"\bprevisao de preco\b", r"\bprevisão de ações?\b", r"\bprevisao de acoes?\b", r"\bstatus do voo\b",
+    ),
+    "id": (
+        r"\bramalan\b", r"\bhasil lotre\b", r"\bprakiraan cuaca\b", r"\bkurs valuta asing\b",
+        r"\bprediksi harga\b", r"\bprediksi saham\b", r"\bstatus penerbangan\b",
+    ),
+}
 
-NEWS_PATTERNS = (
-    r"\bannounc(?:e|ed|es|ement)\b",
-    r"\bconfirm(?:ed|s|ation)?\b",
-    r"\bappoint(?:ed|ment|s)?\b",
-    r"\bsign(?:ed|s|ing)?\b",
-    r"\bjoin(?:ed|s|ing)?\b",
-    r"\bwin(?:s|ner|ning)?\b",
-    r"\bwon\b",
-    r"\bdefeat(?:ed|s)?\b",
-    r"\bkill(?:ed|s)?\b",
-    r"\bdie(?:d|s)?\b",
-    r"\bdeath\b",
-    r"\barrest(?:ed|s)?\b",
-    r"\bresign(?:ed|s|ation)?\b",
-    r"\blaunch(?:ed|es)?\b",
-    r"\brelease(?:d|s)?\b",
-    r"\bcrash(?:ed|es)?\b",
-    r"\bearthquake\b",
-    r"\bhurricane\b",
-    r"\bstorm\b",
-    r"\bfire\b",
-    r"\bshooting\b",
-    r"\battack\b",
-    r"\belection\b",
-    r"\bdecision\b",
-    r"\bcourt\b",
-    r"\btrial\b",
-    r"\bpolice\b",
-    r"\bgovernment\b",
-    r"\bminister\b",
-    r"\bpresident\b",
-)
+NEWS_PATTERNS_BY_LANG = {
+    "en": (
+        r"\bannounc(?:e|ed|es|ement)\b", r"\bconfirm(?:ed|s|ation)?\b", r"\bappoint(?:ed|ment|s)?\b",
+        r"\bsign(?:ed|s|ing)?\b", r"\bjoin(?:ed|s|ing)?\b", r"\bwin(?:s|ner|ning)?\b", r"\bwon\b",
+        r"\bdefeat(?:ed|s)?\b", r"\bkill(?:ed|s)?\b", r"\bdie(?:d|s)?\b", r"\bdeath\b",
+        r"\barrest(?:ed|s)?\b", r"\bresign(?:ed|s|ation)?\b", r"\blaunch(?:ed|es)?\b", r"\brelease(?:d|s)?\b",
+        r"\bcrash(?:ed|es)?\b", r"\bearthquake\b", r"\bhurricane\b", r"\bstorm\b", r"\bfire\b",
+        r"\bshooting\b", r"\battack\b", r"\belection\b", r"\bdecision\b", r"\bcourt\b", r"\btrial\b",
+        r"\bpolice\b", r"\bgovernment\b", r"\bminister\b", r"\bpresident\b",
+    ),
+    "de": (
+        r"\bankündig(?:t|ung|en)\b", r"\bbestätig(?:t|ung|en)\b", r"\bernenn(?:t|ung|en)\b",
+        r"\bunterschreib(?:t|en)\b", r"\bwechsel(?:t|n)?\b", r"\bsieg(?:t|e|en)?\b", r"\bgewinn(?:t|en)?\b",
+        r"\bniederlag(?:e|en)\b", r"\bgetötet\b", r"\bgestorben\b", r"\btod\b", r"\bfestgenommen\b",
+        r"\brücktritt\b", r"\bveröffentlicht\b", r"\bfreigelassen\b", r"\bunfall\b", r"\berdbeben\b",
+        r"\bsturm\b", r"\bbrand\b", r"\bschießerei\b", r"\bangriff\b", r"\bwahl\b", r"\bentscheidung\b",
+        r"\bgericht\b", r"\bprozess\b", r"\bpolizei\b", r"\bregierung\b", r"\bminister\b", r"\bpräsident\b",
+    ),
+    "it": (
+        r"\bannunc(?:ia|iato|iati|iamento)\b", r"\bconferm(?:a|ato|ata|are)\b", r"\bnomina(?:to|ta|re)?\b",
+        r"\bfirm(?:a|ato|ata|are)\b", r"\bader(?:isce|ito|ire)\b", r"\bvinc(?:e|ente|ere|ono)\b", r"\bsconfitt(?:a|o|e)\b",
+        r"\buccis(?:o|a|i|e)\b", r"\bmort(?:o|a|i|e)\b", r"\bdecesso\b", r"\barrest(?:ato|ata|ati|ate|o)\b",
+        r"\bdimissioni?\b", r"\blanc(?:io|iato|iata|iare)\b", r"\buscit(?:a|o|i|e)\b", r"\bincidente\b",
+        r"\bterremoto\b", r"\btempesta\b", r"\bincendio\b", r"\battacco\b", r"\belezi(?:one|oni)\b",
+        r"\bdecisione\b", r"\bcorte\b", r"\bprocesso\b", r"\bpolizia\b", r"\bgoverno\b", r"\bministro\b", r"\bpresidente\b",
+    ),
+    "fr": (
+        r"\bannonc(?:e|é|ée|ées|és|ement)\b", r"\bconfirm(?:e|é|ée|ation)\b", r"\bnomm(?:e|é|ée|ation)\b",
+        r"\bsign(?:e|é|ée|er)\b", r"\brejoint(?:e|s|re)?\b", r"\bgagn(?:e|é|ée|er)\b", r"\bvainc(?:u|re|queur)\b",
+        r"\bdéfait(?:e|es)?\b", r"\btu(?:é|ée|és|ées)\b", r"\bmort(?:e|s|es)?\b", r"\bdécès\b",
+        r"\barrest(?:é|ée|és|ées|ation)\b", r"\bdémission(?:s)?\b", r"\blanc(?:e|é|ée|ement)\b", r"\bsort(?:i|ie|ies)?\b",
+        r"\baccident\b", r"\bséisme\b", r"\btempête\b", r"\bincendie\b", r"\btir\b", r"\battaque\b",
+        r"\bélection(?:s)?\b", r"\bdécision\b", r"\bcour\b", r"\bprocès\b", r"\bpolice\b", r"\bgouvernement\b", r"\bministre\b", r"\bprésident\b",
+    ),
+    "es": (
+        r"\banunci(?:a|ó|ado|ada|amiento)\b", r"\bconfirm(?:a|ó|ado|ada|ación)\b", r"\bnombr(?:a|ó|ado|ada|amiento)\b",
+        r"\bfirm(?:a|ó|ado|ada|ar)\b", r"\bse une\b", r"\bgan(?:a|ó|ado|adora|ar)\b", r"\bvenc(?:e|ió|ido|ida|er)\b",
+        r"\bderrot(?:a|ó|ado|ada)\b", r"\bmat(?:ó|ado|ada|aron)\b", r"\bmuert(?:o|a|os|as)\b", r"\bmuerte\b",
+        r"\barrest(?:a|ó|ado|ada|o)\b", r"\bdimisi(?:ón|ones)\b", r"\blanz(?:a|ó|ado|ada|ar)\b", r"\bliber(?:a|ó|ado|ada)\b",
+        r"\baccidente\b", r"\bterremoto\b", r"\btormenta\b", r"\bincendio\b", r"\btiroteo\b", r"\bataque\b",
+        r"\belecci(?:ón|ones)\b", r"\bdecisi(?:ón|ones)\b", r"\bcorte\b", r"\bjuicio\b", r"\bpolicía\b", r"\bgobierno\b", r"\bministro\b", r"\bpresidente\b",
+    ),
+    "pt": (
+        r"\banunci(?:a|ou|ado|ada|amento)\b", r"\bconfirm(?:a|ou|ado|ada|ação)\b", r"\bnome(?:a|ou|ado|ada|ação)\b",
+        r"\bassina(?:la|ou|do|da|r)\b", r"\bentra(?:r|ou|do|da)\b", r"\bvence(?:u|r|dor|dora)\b", r"\bganh(?:a|ou|o|adora|ador)\b",
+        r"\bderrot(?:a|ou|ado|ada)\b", r"\bmort(?:o|a|os|as)\b", r"\bmorte\b", r"\bpres(?:o|a|os|as)\b",
+        r"\bpris(?:ão|oes)\b", r"\brenúncia\b", r"\brenuncia\b", r"\blanç(?:a|ou|ado|ada)\b", r"\bliber(?:a|ou|ado|ada)\b",
+        r"\bacidente\b", r"\bterremoto\b", r"\btempestade\b", r"\bincêndio\b", r"\bincendio\b", r"\btiroteio\b", r"\bataque\b",
+        r"\beleição(?:ões)?\b", r"\beleicao(?:oes)?\b", r"\bdecisão(?:ões)?\b", r"\bdecisao(?:oes)?\b", r"\btribunal\b", r"\bjulgamento\b", r"\bpolícia\b", r"\bpolicia\b", r"\bgoverno\b", r"\bministro\b", r"\bpresidente\b",
+    ),
+    "id": (
+        r"\bpengumuman\b", r"\bkonfirmasi\b", r"\bpenunjukan\b", r"\bmenandatangani\b", r"\bbergabung\b",
+        r"\bmenang\b", r"\bkemenangan\b", r"\bkalah\b", r"\bmembunuh\b", r"\btewas\b", r"\bkematian\b",
+        r"\bditangkap\b", r"\bpenangkapan\b", r"\bmengundurkan diri\b", r"\bpeluncuran\b", r"\bdirilis\b",
+        r"\bkecelakaan\b", r"\bgempa\b", r"\bbadai\b", r"\bkebakaran\b", r"\bpenembakan\b", r"\bserangan\b",
+        r"\bpemilu\b", r"\bkeputusan\b", r"\bpengadilan\b", r"\bpolisi\b", r"\bpemerintah\b", r"\bmenteri\b", r"\bpresiden\b",
+    ),
+}
 
 GEO_TERMS = {
-    "US": ("united states", "u.s.", "u.s", "america", "american", "usa"),
-    "UK": ("united kingdom", "uk", "britain", "british", "england", "scotland", "wales"),
+    "US": ("united states", "u.s.", "u.s", "us", "america", "american", "usa"),
+    "UK": ("united kingdom", "uk", "great britain", "britain", "british", "england", "scotland", "wales"),
+    "DE": ("germany", "german", "deutschland", "deutsch"),
+    "IT": ("italy", "italia", "italian", "italiano"),
+    "FR": ("france", "french", "français", "francais"),
+    "ES": ("spain", "españa", "espana", "spanish", "español", "espanol"),
+    "PT": ("portugal", "portuguese", "português", "portugues"),
+    "BR": ("brazil", "brasil", "brazilian", "brasileiro"),
+    "ID": ("indonesia", "indonesian", "bahasa indonesia"),
     "CA": ("canada", "canadian"),
     "AU": ("australia", "australian"),
 }
+
+LANGUAGE_BY_COUNTRY = {
+    "US": "en", "UK": "en", "CA": "en", "AU": "en",
+    "DE": "de", "IT": "it", "FR": "fr", "ES": "es",
+    "PT": "pt", "BR": "pt", "ID": "id",
+}
+
+def _localized_language() -> str:
+    return LANGUAGE_BY_COUNTRY.get(CURRENT_COUNTRY, "en")
+
+def _localized_patterns(mapping: Dict[str, Tuple[str, ...]]) -> Tuple[str, ...]:
+    language = _localized_language()
+    localized = mapping.get(language, mapping["en"])
+    if language == "en":
+        return localized
+    # Keep the original English signals active and add localized equivalents.
+    # Trend titles can remain English even on non-English markets.
+    return tuple(dict.fromkeys(mapping["en"] + localized))
+
+# Backward-compatible English aliases for any existing imports.
+SKIP_PATTERNS = SKIP_PATTERNS_BY_LANG["en"]
+NOISE_PATTERNS = NOISE_PATTERNS_BY_LANG["en"]
+NEWS_PATTERNS = NEWS_PATTERNS_BY_LANG["en"]
 
 def _clean(text: Any) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
 def _norm(text: Any) -> str:
     return _clean(text).casefold()
+
+def _country_code(value: Any) -> str:
+    text = _norm(value)
+    if not text:
+        return ""
+    for code, aliases in COUNTRY_ALIASES.items():
+        if text == code.casefold() or any(text == alias.casefold() for alias in aliases):
+            return code
+    return text.upper() if len(text) == 2 else ""
+
+CURRENT_COUNTRY = _country_code(COUNTRY)
+DEFAULT_PRIORITY_GEOS = (CURRENT_COUNTRY,) if CURRENT_COUNTRY else ("US", "UK")
+_priority_geos_env = os.getenv("TOPIC_PRIORITY_GEOS", "")
+PRIORITY_GEOS = tuple(
+    x.strip().upper()
+    for x in (_priority_geos_env.split(",") if _priority_geos_env else DEFAULT_PRIORITY_GEOS)
+    if x.strip()
+)
 
 def _tokens(text: Any) -> Set[str]:
     return {
@@ -182,32 +283,47 @@ def _published_age_hours(trend: Dict[str, Any]) -> float | None:
         dt = dt.replace(tzinfo=timezone.utc)
     return max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 3600)
 
+def _term_in_text(text: str, term: str) -> bool:
+    # GEO terms include short tokens such as "uk" and "us". Require a
+    # word/phrase boundary so entity names such as "chukwuemeka" cannot
+    # accidentally become UK matches.
+    pattern = rf"(?<!\w){re.escape(term)}(?!\w)"
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
 def _geo_score(title: str) -> Tuple[float, str]:
     t = _norm(title)
-    country = _norm(COUNTRY)
 
-    # Strong explicit current production GEO preference.
+    # Strong explicit current production GEO preference, now tied to the
+    # current market unless TOPIC_PRIORITY_GEOS explicitly overrides it.
     for geo in PRIORITY_GEOS:
-        if any(term in t for term in GEO_TERMS.get(geo, ())):
+        if any(_term_in_text(t, term) for term in GEO_TERMS.get(geo, ())):
             return 15.0, geo
 
-    # If config itself names a priority country, give a smaller local signal.
-    for geo, terms in GEO_TERMS.items():
-        if any(term in country for term in terms) and any(term in t for term in terms):
-            return 12.0, geo
+    # If the current config country is explicitly represented in the title,
+    # give the smaller local signal. This is now COUNTRY-aware across the
+    # supported production markets rather than hard-coded to US/UK/CA/AU.
+    if CURRENT_COUNTRY:
+        local_terms = GEO_TERMS.get(CURRENT_COUNTRY, ())
+        if any(_term_in_text(t, term) for term in local_terms):
+            return 12.0, CURRENT_COUNTRY
 
     return 5.0, "GLOBAL"
 
 def _noise_penalty(title: str) -> float:
     t = _norm(title)
-    if any(re.search(p, t) for p in NOISE_PATTERNS):
+    patterns = _localized_patterns(NOISE_PATTERNS_BY_LANG)
+    if any(re.search(p, t, re.IGNORECASE) for p in patterns):
         return 30.0
     return 0.0
 
 def _skip_reason(title: str) -> str | None:
     t = _norm(title)
-    for pattern in SKIP_PATTERNS:
-        if pattern in t:
+    patterns = _localized_patterns(SKIP_PATTERNS_BY_LANG)
+    for pattern in patterns:
+        if pattern.startswith(" ") or pattern.endswith(" "):
+            if pattern in t:
+                return f"existing skip pattern: {pattern.strip()}"
+        elif _term_in_text(t, pattern):
             return f"existing skip pattern: {pattern.strip()}"
     if _noise_penalty(title) >= 30:
         return "low-value utility/noise topic"
@@ -243,9 +359,10 @@ def _pre_score(trend: Dict[str, Any]) -> Dict[str, Any]:
 
     geo, geo_name = _geo_score(title)
 
+    news_patterns = _localized_patterns(NEWS_PATTERNS_BY_LANG)
     newsworthiness = min(
         15.0,
-        7.0 + 2.0 * sum(bool(re.search(p, _norm(title))) for p in NEWS_PATTERNS),
+        7.0 + 2.0 * sum(bool(re.search(p, _norm(title), re.IGNORECASE)) for p in news_patterns),
     )
 
     # Clear, entity-rich topics tend to be more usable than vague one-word
@@ -345,15 +462,42 @@ def score_with_news(trend: Dict[str, Any], news: Sequence[Dict[str, Any]]) -> Di
     news = [x for x in news if isinstance(x, dict)]
 
     count = len(news)
+
+    def _source_identity(item: Dict[str, Any]) -> str:
+        # Prefer publisher/domain identity when the fetcher exposes a URL.
+        # This collapses www/mobile/news subdomains conservatively while
+        # keeping unrelated domains independent. Fall back to the existing
+        # source name when no URL is available.
+        url = _clean(
+            item.get("url")
+            or item.get("link")
+            or item.get("source_url")
+            or item.get("sourceUrl")
+        )
+        if url:
+            try:
+                host = (urlparse(url).hostname or "").casefold().strip(".")
+            except Exception:
+                host = ""
+            if host:
+                host = re.sub(r"^(?:www|m|mobile|amp)\.", "", host)
+                return f"domain:{host}"
+
+        source = _norm(item.get("source"))
+        source = re.sub(r"[^a-z0-9]+", " ", source).strip()
+        return f"name:{source}" if source else ""
+
     source_names = {
-        _norm(x.get("source"))
-        for x in news
-        if _clean(x.get("source"))
+        identity
+        for identity in (_source_identity(x) for x in news)
+        if identity
     }
     content_count = sum(1 for x in news if len(_clean(x.get("content"))) >= 700)
-    title_count = sum(1 for x in news if _clean(x.get("title")))
 
-    # 0-20 sourceability: independent source count + usable article bodies.
+    # Keep the existing 0-20 sourceability formula intact, but make the
+    # independent-source component reflect publisher/domain identity rather
+    # than raw source-name spelling. This improves independence estimation
+    # without changing the scoring architecture or adding network/LLM work.
     sourceability = min(20.0, count * 2.0 + min(5.0, len(source_names)) + min(5.0, content_count))
 
     # Strong penalty for a topic that has only one weak/duplicate source.
