@@ -746,5 +746,9 @@
   "meteo": {
     "published_at": "2026-08-24 07:59",
     "order": -187
+  },
+  "stade-de-france": {
+    "published_at": "2026-08-24 12:37",
+    "order": -188
   }
 }

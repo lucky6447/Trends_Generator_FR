@@ -6,12 +6,12 @@ from ollama import chat
 from config import MODEL
 
 
-FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.4-multi-issue-event-safe"
+FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.6-full-type-safe"
 
 NUM_THREADS = max(1, int(os.getenv("FACT_GUARD_NUM_THREADS", "16")))
 NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
 NUM_BATCH = max(64, int(os.getenv("FACT_GUARD_NUM_BATCH", "512")))
-REPAIR_CTX = max(4096, int(os.getenv("FACT_GUARD_REPAIR_CTX", "4096")))
+REPAIR_CTX = max(8192, int(os.getenv("FACT_GUARD_REPAIR_CTX", "8192")))
 REPAIR_TOKENS = max(280, int(os.getenv("FACT_GUARD_REPAIR_TOKENS", "420")))
 
 
@@ -25,7 +25,7 @@ _ARTICLE_FORMAT = {
         "sections": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 5,
+            "maxItems": 6,
             "items": {
                 "type": "object",
                 "properties": {
@@ -97,7 +97,7 @@ def _schema_ok(article: Dict[str, Any]) -> bool:
             return False
 
     sections = article["sections"]
-    if not isinstance(sections, list) or not 1 <= len(sections) <= 5:
+    if not isinstance(sections, list) or not 1 <= len(sections) <= 6:
         return False
 
     for section in sections:
@@ -111,40 +111,62 @@ def _schema_ok(article: Dict[str, Any]) -> bool:
     return True
 
 
+def _normalize_issue_type(issue_type: str) -> str:
+    """Normalize harmless spelling/format variants emitted by the audits."""
+    value = str(issue_type or "").strip().casefold()
+    value = value.replace("-", "_").replace(" ", "_")
+    aliases = {
+        "unsupported_record": "unsupported_superlative",
+        "unsupported_superlative_claim": "unsupported_superlative",
+        "scope_exaggeration": "scope_inflation",
+        "exaggerated_scope": "scope_inflation",
+        "unsupported_causal_claim": "causal_claim",
+        "unsupported_motive": "causal_claim",
+        "unsupported_connection": "causal_claim",
+        "wrong_quote": "unsupported_quote",
+        "quote_attribution_error": "unsupported_quote",
+        "wrong_date": "event_date_mismatch",
+        "date_mismatch": "event_date_mismatch",
+        "wrong_event_date": "event_date_mismatch",
+        "wrong_event_status": "event_status_mismatch",
+        "status_mismatch": "event_status_mismatch",
+        "wrong_number": "wrong_fact",
+        "unsupported_number": "wrong_fact",
+        "wrong_location": "wrong_fact",
+        "wrong_name": "wrong_fact",
+        "wrong_team": "wrong_entity_attribution",
+        "wrong_organization": "wrong_entity_attribution",
+        "wrong_person": "wrong_entity_attribution",
+        "cross_day_conflation": "cross_event_conflation",
+        "cross_match_conflation": "cross_event_conflation",
+        "cross_week_conflation": "cross_event_conflation",
+    }
+    return aliases.get(value, value)
+
+
 def _supported_repair(issue: Dict[str, Any]) -> bool:
     """
-    v1.3 supports three narrowly-scoped production failure modes:
+    Validate that every HIGH/MEDIUM Fact Guard blocker has a safe repair path.
 
-    - wrong_entity_attribution:
-      correct only when the source excerpt directly supports the
-      correct attribution.
+    The repair taxonomy is intentionally closed.  Detection may report richer
+    explanations, but an unknown issue type must never be silently sent to the
+    LLM repair prompt.
 
-    - unsupported_claim:
-      delete-only repair. The unsupported claim is removed rather than
-      replaced with an inferred or guessed fact.
+    Repair classes:
+      1) SOURCE-CORRECTABLE:
+         wrong_entity_attribution / wrong_role / wrong_amount
+         may be corrected only when the source excerpt directly establishes
+         the correction.
 
-    - event_date_mismatch:
-      delete-only repair. Remove the unsupported date or temporal assertion
-      without inventing, substituting, or inferring another date/status.
+      2) DELETE-ONLY:
+         the safest action is to remove the unsupported or contradictory
+         claim rather than invent a replacement.
 
-    - wrong_amount:
-      exact source-grounded replacement only. The source excerpt must directly
-      support the corrected amount. Never calculate, estimate, or infer a new
-      amount. If the correction cannot be established directly, delete the
-      incorrect amount-bearing claim instead.
-
-    - wrong_fact:
-      delete-only repair. Remove the unsupported factual claim rather than
-      replacing it with outside knowledge or a guessed correction.
-
-    - cross_event_conflation / cross_round_conflation:
-      delete-only repair. Remove the smallest claim or sentence that incorrectly
-      attaches a fact from one event instance to another. Never reconstruct the
-      chronology or invent a replacement event/date/result.
-
-    No other repair types are accepted.
+      3) TEMPORAL DELETE-ONLY:
+         remove the smallest claim that incorrectly joins event instances or
+         assigns an unsupported date/status.
     """
-    issue_type = str(issue.get("type", "")).strip().casefold()
+    issue_type = _normalize_issue_type(issue.get("type", ""))
 
     severity_ok = (
         str(issue.get("severity", "")).strip().upper()
@@ -156,20 +178,37 @@ def _supported_repair(issue: Dict[str, Any]) -> bool:
         and bool(str(issue.get("claim", "")).strip())
         and bool(str(issue.get("reason", "")).strip())
     )
-
     if not common_ok:
         return False
 
-    if issue_type in {"wrong_entity_attribution", "wrong_role"}:
+    source_correctable = {
+        "wrong_entity_attribution",
+        "wrong_role",
+        "wrong_amount",
+    }
+
+    delete_only = {
+        "unsupported_claim",
+        "unsupported_superlative",
+        "scope_inflation",
+        "unsupported_quote",
+        "wrong_fact",
+        "causal_claim",
+        "event_status_mismatch",
+        "event_date_mismatch",
+        "cross_event_conflation",
+        "cross_round_conflation",
+        "cross_fact_temporal_consistency",
+        "cross_day_conflation",
+        "cross_match_conflation",
+        "cross_week_conflation",
+    }
+
+    if issue_type in source_correctable:
         return bool(str(issue.get("source_excerpt", "")).strip())
 
-    if issue_type in {"unsupported_claim", "event_date_mismatch", "wrong_fact",
-                      "cross_event_conflation", "cross_round_conflation",
-                      "cross_fact_temporal_consistency"}:
+    if issue_type in delete_only:
         return True
-
-    if issue_type == "wrong_amount":
-        return bool(str(issue.get("source_excerpt", "")).strip())
 
     return False
 
@@ -225,61 +264,91 @@ def repair(
 
     issue_rules_parts = []
     for index, issue in enumerate(blocking, 1):
-        issue_type = str(issue.get("type", "")).strip().casefold()
+        raw_issue_type = str(issue.get("type", "")).strip()
+        issue_type = _normalize_issue_type(raw_issue_type)
 
         if issue_type in {"wrong_entity_attribution", "wrong_role"}:
             rules = (
-                "- Correct the entity/role only when the source excerpt directly "
-                "establishes the correct entity or role.\n"
+                "- SOURCE-CORRECTABLE ONLY: correct the entity/role only when the "
+                "source excerpt directly establishes the correct entity or role.\n"
                 "- If the source does not establish the correction, DELETE the "
-                "incorrect attribution/role instead of guessing."
-            )
-        elif issue_type == "unsupported_claim":
-            rules = (
-                "- DELETE-ONLY: remove the unsupported claim or smallest sentence "
-                "containing it.\n"
-                "- Do not soften, paraphrase, reinterpret or replace it."
-            )
-        elif issue_type == "event_date_mismatch":
-            rules = (
-                "- DELETE-ONLY: remove the unsupported date/temporal assertion.\n"
-                "- Do not replace it with an inferred date or status.\n"
-                "- Preserve surrounding supported event wording."
+                "incorrect attribution/role instead of guessing.\n"
+                "- Do not transfer an action, quote, status, deadline, injury, "
+                "appointment, signing, departure, or decision between entities "
+                "merely because they are mentioned nearby."
             )
         elif issue_type == "wrong_amount":
             rules = (
-                "- Correct the amount ONLY when the source excerpt directly "
-                "supports the corrected amount.\n"
+                "- SOURCE-CORRECTABLE ONLY: correct the amount only when the source "
+                "excerpt directly supports the exact corrected amount.\n"
                 "- Preserve the exact source-supported amount and currency.\n"
                 "- Do not calculate, estimate, round, convert currency, or infer "
                 "a different amount.\n"
-                "- If the correction cannot be established directly from the "
-                "source excerpt, DELETE the smallest amount-bearing claim instead."
+                "- If the correction cannot be established directly, DELETE the "
+                "smallest amount-bearing claim instead."
             )
-        elif issue_type == "wrong_fact":
+        elif issue_type in {
+            "unsupported_claim",
+            "wrong_fact",
+            "causal_claim",
+            "unsupported_quote",
+            "scope_inflation",
+            "unsupported_superlative",
+        }:
             rules = (
-                "- DELETE-ONLY: remove the unsupported factual claim or the "
-                "smallest sentence containing it.\n"
-                "- Do not replace it with a fact from outside knowledge, even if "
-                "that replacement fact is likely or generally known."
+                "- DELETE-ONLY: remove the unsupported, exaggerated, misattributed, "
+                "or contradicted claim, using the smallest sentence/phrase that "
+                "can be removed safely.\n"
+                "- Do not soften it into another unsupported assertion.\n"
+                "- Do not replace it with outside knowledge, an inferred fact, a "
+                "different quote, a guessed number, or a broader/narrower claim.\n"
+                "- For unsupported_quote, remove the unsupported quoted wording "
+                "and preserve surrounding source-supported reporting where possible.\n"
+                "- For scope_inflation, remove only the unsupported universal/"
+                "nationwide scope assertion rather than inventing a narrower scope."
+            )
+        elif issue_type == "event_date_mismatch":
+            rules = (
+                "- DELETE-ONLY: remove the unsupported event date or temporal "
+                "assertion that conflicts with the source.\n"
+                "- Do not replace it with the publication date, reference date, "
+                "current date, feed date, or an inferred date.\n"
+                "- Preserve the surrounding event wording when it remains "
+                "source-supported.\n"
+                "- Do not turn a completed event into an upcoming event or vice versa."
+            )
+        elif issue_type == "event_status_mismatch":
+            rules = (
+                "- DELETE-ONLY: remove the smallest claim that assigns the event "
+                "the wrong status/state.\n"
+                "- Do not infer or substitute the opposite status unless the issue "
+                "itself explicitly provides a source-supported correction and the "
+                "correction is unambiguous.\n"
+                "- Preserve uncertainty and all independently supported context."
             )
         elif issue_type in {
             "cross_event_conflation",
             "cross_round_conflation",
             "cross_fact_temporal_consistency",
+            "cross_day_conflation",
+            "cross_match_conflation",
+            "cross_week_conflation",
         }:
             rules = (
                 "- DELETE-ONLY: remove the smallest claim or sentence that "
                 "incorrectly combines facts from different event instances.\n"
                 "- Do not rewrite the chronology or merge the events.\n"
                 "- Do not substitute another date, result, amount, status, or "
-                "event unless that replacement is explicitly part of the "
-                "reported issue and directly supported by the source excerpt.\n"
-                "- Preserve all surrounding claims that remain independently "
-                "supported and belong to the main event."
+                "event unless that replacement is explicitly part of the reported "
+                "issue and directly supported by the source excerpt.\n"
+                "- Preserve surrounding claims that remain independently supported "
+                "and belong to the main event."
             )
         else:
-            raise ValueError(f"Unsupported Fact Guard repair type: {issue_type}")
+            raise ValueError(
+                f"Unsupported Fact Guard repair type after normalization: "
+                f"{raw_issue_type!r} -> {issue_type!r}"
+            )
 
         issue_rules_parts.append(f"ISSUE {index} ({issue_type}):\n{rules}")
 
@@ -303,6 +372,7 @@ GLOBAL SAFETY RULES:
 - Do NOT infer missing information.
 - Preserve uncertainty when the source is uncertain.
 - Keep the article in its existing language.
+- Issue types may be normalized only for selecting a safe repair rule; the actual issue claim, reason, and source excerpt remain the authoritative repair target.
 - Return ONLY valid article JSON matching the required schema.
 
 ISSUE-SPECIFIC RULES:

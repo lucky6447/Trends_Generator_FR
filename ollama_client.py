@@ -82,7 +82,7 @@ MIN_ARTICLE_WORDS = max(
 ADAPTIVE_MIN_1_2 = max(0, int(os.getenv("OLLAMA_MIN_1_2_FACTS", "45")))
 ADAPTIVE_MIN_3_4 = max(0, int(os.getenv("OLLAMA_MIN_3_4_FACTS", "65")))
 ADAPTIVE_MIN_5_PLUS = max(0, int(os.getenv("OLLAMA_MIN_5_PLUS_FACTS", "85")))
-MAX_SECTIONS = 4
+MAX_SECTIONS = 6
 
 # Evidence is deliberately sequential on CPU.
 EVIDENCE_PARALLEL = os.getenv(
@@ -774,13 +774,18 @@ BALANCED FACT RULES:
 - Do not use unsupported quotes.
 - Do not add generic filler or speculation.
 - Titles, descriptions and headings must also stay factual.
-- Aim for roughly 100-160 words when the evidence contains enough material.
+- Let article length be determined by the amount and richness of the locked evidence.
+- For limited evidence, keep the article concise and complete.
+- For richer evidence, develop the article enough to cover the distinct relevant facts,
+  developments and factual dimensions available in the locked evidence.
+- Do not impose a fixed or target word count on richer stories.
+- Stop when the relevant evidence has been adequately covered.
+- Never add filler, repetition or unsupported detail to increase length.
 - Use the available supporting facts naturally. If 3 or more locked facts are available, develop the story across the intro and sections so the article explains the distinct supported details rather than reducing the story to one or two sentences.
-- For 3-4 facts, normally use at least 2 sections when the material supports it; for 5+ facts, normally use 2-4 sections.
+- For 3-4 facts, normally use at least 2 sections when the material supports it.
+- For richer evidence, use as many sections as are genuinely useful for presenting distinct supported facts and developments clearly.
+- Do not create sections merely to increase article length.
 - If the evidence genuinely contains only one or two facts, a shorter article is acceptable.
-- Never add filler, repetition or unsupported detail just to reach a word target.
-    - Return 1-4 sections only.
-
 Return ONLY the required JSON.
 
 LOCKED EVIDENCE:
