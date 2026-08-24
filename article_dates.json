@@ -742,5 +742,9 @@
   "sinner": {
     "published_at": "2026-08-24 05:21",
     "order": -186
+  },
+  "meteo": {
+    "published_at": "2026-08-24 07:59",
+    "order": -187
   }
 }
