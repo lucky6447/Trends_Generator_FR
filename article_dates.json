@@ -766,5 +766,9 @@
   "guerre-ukraine": {
     "published_at": "2026-08-25 00:59",
     "order": -192
+  },
+  "coupe-de-france-de-football": {
+    "published_at": "2026-08-25 03:15",
+    "order": -193
   }
 }
