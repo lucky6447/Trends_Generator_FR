@@ -320,6 +320,97 @@ def _geo_score(title: str, trend: Dict[str, Any] | None = None) -> Tuple[float, 
 
     return 5.0, "GLOBAL"
 
+# Routine weather/forecast is a hard topic exclusion.
+# Genuine major/extreme weather events remain eligible.
+ROUTINE_WEATHER_PATTERNS_BY_LANG = {
+    "en": (
+        r"\bweather\b", r"\bforecast\b", r"\bmeteo\b",
+        r"\btemperature forecast\b", r"\btemperatures? (?:hit|reach|rise|fall|drop|soar)\b",
+    ),
+    "de": (
+        r"\bwetter\b", r"\bwettervorhersage\b", r"\bwetterprognose\b",
+        r"\btemperatur(?:en)?(?:prognose)?\b",
+    ),
+    "it": (
+        r"\bmeteo\b", r"\bprevisioni? del tempo\b",
+        r"\bprevisioni? della temperatura\b",
+    ),
+    "fr": (
+        r"\bmétéo\b", r"\bmeteo\b", r"\bprévisions? météo\b",
+        r"\bprevisions? meteo\b", r"\bprévisions? de température\b",
+        r"\bprevisions? de temperature\b",
+    ),
+    "es": (
+        r"\btiempo\b", r"\bpronóstico del tiempo\b", r"\bpronostico del tiempo\b",
+        r"\bpronóstico de temperatura\b", r"\bpronostico de temperatura\b",
+    ),
+    "pt": (
+        r"\btempo\b", r"\bprevisão do tempo\b", r"\bprevisao do tempo\b",
+        r"\bprevisão de temperatura\b", r"\bprevisao de temperatura\b",
+    ),
+    "id": (
+        r"\bcuaca\b", r"\bprakiraan cuaca\b", r"\bprakiraan suhu\b",
+    ),
+}
+
+WEATHER_EVENT_PATTERNS_BY_LANG = {
+    "en": (
+        r"\bhurricane\b", r"\bcyclone\b", r"\btyphoon\b", r"\bflood(?:ing)?\b",
+        r"\bwildfire\b", r"\bheat emergency\b", r"\bheatwave\b",
+        r"\bweather disaster\b", r"\bmajor storm\b", r"\bsevere storm\b",
+        r"\bstorm (?:hits|strikes|causes|leaves|kills|forces)\b",
+    ),
+    "de": (
+        r"\bhurrikan\b", r"\bzyklon\b", r"\btaifun\b", r"\bhochwasser\b",
+        r"\büberschwemmung\b", r"\bwaldbrand\b", r"\bhitzewelle\b",
+        r"\bhitze-notstand\b", r"\bunwetter\b", r"\bschwerer sturm\b",
+        r"\bstarker sturm\b",
+    ),
+    "it": (
+        r"\buragano\b", r"\bciclone\b", r"\btaifone\b", r"\balluvion[ei]\b",
+        r"\binondazion[ei]\b", r"\bincendio boschivo\b", r"\bondata di calore\b",
+        r"\bemergenza caldo\b", r"\bforte tempesta\b", r"\btempesta grave\b",
+    ),
+    "fr": (
+        r"\bouragan\b", r"\bcyclone\b", r"\btyphon\b", r"\binondation(?:s)?\b",
+        r"\bincendie de forêt\b", r"\bcanicule\b", r"\burgence chaleur\b",
+        r"\btempête majeure\b", r"\btempête sévère\b", r"\bforte tempête\b",
+    ),
+    "es": (
+        r"\bhuracán\b", r"\bhuracan\b", r"\bciclón\b", r"\bciclon\b",
+        r"\btsunami\b", r"\binundación(?:es)?\b", r"\bincendio forestal\b",
+        r"\bola de calor\b", r"\bemergencia por calor\b",
+        r"\btormenta grave\b", r"\btormenta severa\b",
+    ),
+    "pt": (
+        r"\bfuracão\b", r"\bfuracao\b", r"\bciclone\b", r"\btaifão\b",
+        r"\btaifao\b", r"\binundação(?:ões)?\b", r"\bincêndio florestal\b",
+        r"\bonda de calor\b", r"\bemergência de calor\b",
+        r"\btempestade severa\b", r"\bforte tempestade\b",
+    ),
+    "id": (
+        r"\bbadai\b", r"\btopan\b", r"\bsiklon\b", r"\bbanjir\b",
+        r"\bkebakaran hutan\b", r"\bgelombang panas\b",
+        r"\bkeadaan darurat panas\b",
+    ),
+}
+
+def _all_localized_patterns(mapping: Dict[str, Tuple[str, ...]]) -> Tuple[str, ...]:
+    return tuple(dict.fromkeys(
+        pattern
+        for patterns in mapping.values()
+        for pattern in patterns
+    ))
+
+def _is_routine_weather(title: str) -> bool:
+    t = _norm(title)
+    weather = _all_localized_patterns(ROUTINE_WEATHER_PATTERNS_BY_LANG)
+    events = _all_localized_patterns(WEATHER_EVENT_PATTERNS_BY_LANG)
+    return (
+        any(re.search(p, t, re.IGNORECASE) for p in weather)
+        and not any(re.search(p, t, re.IGNORECASE) for p in events)
+    )
+
 def _noise_penalty(title: str) -> float:
     t = _norm(title)
     patterns = _localized_patterns(NOISE_PATTERNS_BY_LANG)
@@ -329,6 +420,8 @@ def _noise_penalty(title: str) -> float:
 
 def _skip_reason(title: str) -> str | None:
     t = _norm(title)
+    if _is_routine_weather(title):
+        return "routine weather/forecast topic"
     patterns = _localized_patterns(SKIP_PATTERNS_BY_LANG)
     for pattern in patterns:
         if pattern.startswith(" ") or pattern.endswith(" "):
