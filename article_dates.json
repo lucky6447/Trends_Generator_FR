@@ -774,5 +774,9 @@
   "pleine-lune": {
     "published_at": "2026-08-25 05:00",
     "order": -194
+  },
+  "marseille": {
+    "published_at": "2026-08-25 06:47",
+    "order": -195
   }
 }
