@@ -786,5 +786,9 @@
   "volodymyr-zelensky": {
     "published_at": "2026-08-25 14:29",
     "order": -197
+  },
+  "tourisme": {
+    "published_at": "2026-08-25 17:43",
+    "order": -198
   }
 }
