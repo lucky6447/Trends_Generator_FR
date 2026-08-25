@@ -778,5 +778,9 @@
   "marseille": {
     "published_at": "2026-08-25 06:47",
     "order": -195
+  },
+  "france-culture": {
+    "published_at": "2026-08-25 09:35",
+    "order": -196
   }
 }
