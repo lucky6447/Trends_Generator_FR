@@ -57,14 +57,14 @@ EVIDENCE_CHUNK_CHARS = max(
     7000, int(os.getenv("OLLAMA_EVIDENCE_CHUNK_CHARS", "14000"))
 )
 EVIDENCE_TOKENS = max(
-    280, int(os.getenv("OLLAMA_EVIDENCE_TOKENS", "320"))
+    320, int(os.getenv("OLLAMA_EVIDENCE_TOKENS", "420"))
 )
 EVIDENCE_MAX_FACTS = max(
     4, int(os.getenv("OLLAMA_EVIDENCE_MAX_FACTS", "6"))
 )
 
 ARTICLE_TOKENS = max(
-    420, int(os.getenv("OLLAMA_ARTICLE_TOKENS", "520"))
+    420, int(os.getenv("OLLAMA_ARTICLE_TOKENS", "600"))
 )
 AUDIT_TOKENS = max(
     120, int(os.getenv("OLLAMA_AUDIT_TOKENS", "180"))
@@ -87,6 +87,13 @@ MAX_SECTIONS = 6
 # Evidence is deliberately sequential on CPU.
 EVIDENCE_PARALLEL = os.getenv(
     "OLLAMA_EVIDENCE_PARALLEL", "0"
+).lower() not in {"0", "false", "no", "off"}
+
+# Sparse evidence expansion is expensive on CPU because it re-runs Ollama
+# over every evidence chunk. Keep it disabled by default; enable only for
+# controlled benchmarking with OLLAMA_EVIDENCE_EXPANSION=1.
+EVIDENCE_EXPANSION = os.getenv(
+    "OLLAMA_EVIDENCE_EXPANSION", "0"
 ).lower() not in {"0", "false", "no", "off"}
 
 # One retry is allowed only for malformed/truncated evidence JSON.
@@ -399,31 +406,42 @@ def _evidence_prompt(source, max_facts=None):
     return f"""
 You are TrendCurrent's source-evidence extractor.
 
-Read ONLY the SOURCE MATERIAL. Build evidence for ONE publishable news story.
+Read ALL of the SOURCE MATERIAL before deciding which facts to return.
 
-PRIMARY-EVENT RULE:
-- Identify ONE coherent main story/event in the supplied material.
-- Return facts ONLY from that same story/event.
-- If the material contains multiple ARTICLE blocks or separate news stories sharing a broad keyword, choose ONE story and ignore the others.
-- Never combine two different events just because they concern the same person, keyword, programme, team, place or general subject.
-- Prefer facts that belong to the same concrete event/article cluster.
-- Extract as many distinct useful facts as the SAME story supports, up to {limit}.
-- Target 4-6 facts when the SAME story contains enough material.
-- Cover different factual dimensions when available: what happened, who/where, timing, numbers, status, and other directly relevant details.
-- Do not stop after the first fact merely because it is sufficient to identify the story.
-- Do not manufacture facts to reach a count.
+PRIMARY-EVENT LOCK:
+- The supplied material has already been prefiltered to one coherent story cluster.
+- Treat the cluster as ONE story unless a sentence is clearly unrelated.
+- Do NOT reject the cluster merely because articles are repetitive versions of the same story.
+- Do NOT switch to a different event just because another entity or topic appears in one article.
+- Return facts from the SAME concrete event/story only.
+
+EVIDENCE COVERAGE:
+- Build the strongest possible evidence ledger from the SAME story.
+- Extract EVERY distinct, directly supported, useful fact you can find, up to {limit}.
+- When the source supports 4 or more distinct facts, you MUST return at least 4 facts.
+- Do NOT stop after one fact.
+- Do NOT stop after identifying the main event.
+- Prefer facts covering different dimensions when available: event/action, people/entities, opponent/location, date/status, score/number, qualification/stage, and other concrete developments.
+- Avoid duplicate facts that merely repeat the same point.
+- If fewer than 4 distinct facts are genuinely supported by the entire cluster, return all supported facts and no invented facts.
 
 FACT RULES:
-- Each fact must be explicitly supported by one source sentence.
+- Every fact MUST be explicitly supported by one source sentence.
 - "x" MUST be one of these VALID SENTENCE IDs: {valid_id_text}
-- Never invent or alter a sentence ID.
+- Never invent, alter, or guess a sentence ID.
 - "f" must be a concise factual statement supported by that sentence.
 - Do NOT generate excerpts, source names, dates or status fields separately.
-- Do not infer motives, causes, consequences or significance.
+- Do not infer motives, causes, consequences, significance, reputation, strength, expectations or likely outcomes.
 - Do not use outside knowledge.
 - Preserve names, roles, dates, numbers and certainty exactly.
 - Never transfer attributes between named entities.
+- Prefer a concrete source-supported fact over generic background wording.
 - Return ONLY JSON.
+
+IMPORTANT OUTPUT REQUIREMENT:
+- Before returning JSON, silently review the ENTIRE SOURCE MATERIAL for additional distinct supported facts.
+- Do not return only the first or most obvious fact when additional supported facts are present.
+- The target is 4-6 facts whenever the source material supports that many.
 
 Use exactly this compact JSON shape:
 {{"facts":[{{"f":"fact","x":"S1"}}]}}
@@ -600,10 +618,19 @@ def _extract_evidence(source):
 
     # If extraction is suspiciously sparse despite a large source, do one compact
     # expansion pass over the same chunks. This preserves the compact JSON contract
-    # while preventing a rich source from collapsing to a single fact.
-    if len(maps) and sum(len(x.get("facts", [])) for x in maps) <= 1 and len(source or "") >= 7000:
-        print("[PIPELINE] Evidence sparse | requesting compact fact expansion...")
-        maps = []
+    # while preventing a rich source from collapsing to too few facts.
+    initial_fact_count = sum(len(x.get("facts", [])) for x in maps)
+    if (
+        EVIDENCE_EXPANSION
+        and len(maps)
+        and initial_fact_count <= 2
+        and len(source or "") >= 7000
+    ):
+        print(
+            f"[PIPELINE] Evidence sparse | initial_facts={initial_fact_count} "
+            f"| source_chars={len(source or '')} | requesting compact fact expansion..."
+        )
+        expanded_maps = []
         for index, chunk in enumerate(chunks, 1):
             data = _call(
                 _evidence_expansion_prompt(chunk),
@@ -612,7 +639,12 @@ def _extract_evidence(source):
                 num_thread=NUM_THREADS,
                 response_format=_EVIDENCE_FORMAT,
             )
-            maps.append(_normalize_evidence(data, source_material=chunk))
+            expanded_maps.append(_normalize_evidence(data, source_material=chunk))
+
+        # Preserve the initial extraction and add any new valid facts from the
+        # expansion pass. The existing deduplication/limit logic below remains
+        # the single final lock mechanism.
+        maps.extend(expanded_maps)
 
     for chunk_no, data in enumerate(maps, 1):
         group = f"C{chunk_no}-{data['primary_group']}"

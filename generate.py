@@ -13,6 +13,7 @@ from config import MODEL
 from fact_guard import validate as fact_guard_validate
 from fact_guard_repair import repair as fact_guard_repair
 import json
+import unicodedata
 from html_generator import render_article, save_article
 from processed import load_processed, add_processed
 from index_generator import update_all
@@ -41,6 +42,134 @@ def slugify(text):
     text = re.sub(r"[^a-z0-9]+", "-", text)
     return text.strip("-")
 
+
+
+def _evidence_words(text):
+    """Return conservative significant tokens for deterministic story clustering."""
+    text = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode("ascii")
+    words = re.findall(r"[a-z0-9]+", text.casefold())
+    stop = {
+        "yang", "dan", "di", "ke", "dari", "untuk", "dengan", "ini", "itu", "yang", "telah",
+        "akan", "jadi", "sebuah", "para", "pada", "dalam", "atas", "oleh", "sebagai", "lebih",
+        "the", "and", "for", "with", "from", "this", "that", "has", "have", "was", "were", "are",
+        "its", "into", "after", "before", "over", "under", "about", "news", "today", "world"
+    }
+    return {w for w in words if len(w) >= 3 and w not in stop}
+
+
+def _jaccard(a, b):
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _select_evidence_story_sources(news, topic, min_sources=3, max_sources=6):
+    """Deterministically retain a coherent source cluster before Ollama.
+
+    This changes ONLY the evidence-extractor input. The original ``news`` list
+    remains untouched for Fact Guard and article generation.
+    """
+    items = list(news or [])
+    if len(items) <= max_sources:
+        return items
+
+    topic_words = _evidence_words(topic)
+    profiles = []
+    for idx, item in enumerate(items):
+        title = str(item.get("title", "")).strip()
+        summary = str(item.get("summary", "")).strip()
+        words = _evidence_words(title + " " + summary)
+        title_words = _evidence_words(title)
+        topic_overlap = len(title_words & topic_words)
+        profiles.append({
+            "idx": idx,
+            "words": words,
+            "title_words": title_words,
+            "topic_overlap": topic_overlap,
+            "topic_jaccard": _jaccard(title_words, topic_words),
+        })
+
+    # Anchor on the source whose title is most directly tied to the selected topic.
+    anchor = max(
+        profiles,
+        key=lambda x: (x["topic_overlap"], x["topic_jaccard"], -x["idx"]),
+    )
+
+    # Build the story cluster around the anchor using title/summary lexical overlap.
+    scored = []
+    for prof in profiles:
+        if prof["idx"] == anchor["idx"]:
+            sim = 1.0
+        else:
+            sim = _jaccard(anchor["words"], prof["words"])
+        scored.append((prof["idx"], sim, prof["topic_overlap"], prof["topic_jaccard"]))
+
+    cluster = [x for x in scored if x[0] == anchor["idx"] or x[1] >= 0.18]
+    cluster.sort(key=lambda x: (-x[1], -x[2], -x[3], x[0]))
+
+    # Keep at least a small corroboration set, choosing the closest remaining titles.
+    selected_indices = [x[0] for x in cluster[:max_sources]]
+    if len(selected_indices) < min_sources:
+        remaining = [x for x in scored if x[0] not in selected_indices]
+        remaining.sort(key=lambda x: (-x[1], -x[2], -x[3], x[0]))
+        selected_indices.extend(x[0] for x in remaining[: max(0, min_sources - len(selected_indices))])
+
+    selected_indices = sorted(dict.fromkeys(selected_indices))
+    selected = [items[i] for i in selected_indices]
+
+    print(
+        f"[TOPIC FILTER] Evidence story cluster | anchor={anchor['idx'] + 1} "
+        f"| kept={len(selected)}/{len(items)}"
+    )
+    for item in selected:
+        print(f"[TOPIC FILTER] Evidence source -> {str(item.get('title', '')).strip()}")
+
+    return selected
+
+
+def _build_evidence_source(news, topic=None):
+    """Build source-only evidence input from one deterministic story cluster."""
+    selected_news = _select_evidence_story_sources(news, topic)
+    compact_sources = []
+
+    for item in selected_news:
+        title = str(item.get("title", "")).strip()
+        summary = str(item.get("summary", "")).strip()
+        source = str(item.get("source", "")).strip()
+        published = str(item.get("published", "")).strip()
+        content = str(item.get("content", "")).strip()
+
+        compact_sources.append({
+            "title": title,
+            "source": source,
+            "published": published,
+            "summary": summary,
+            "content": content[:5000],
+        })
+
+    return "\n".join(
+        [
+            "SOURCE MATERIAL:",
+            *[
+                "\n".join(
+                    [
+                        f"ARTICLE {i}",
+                        f"Title: {item['title']}",
+                        f"Source: {item['source']}",
+                        f"Published: {item['published']}",
+                        "",
+                        "Summary:",
+                        item["summary"],
+                        "",
+                        "Full Article:",
+                        item["content"],
+                        "---",
+                    ]
+                )
+                for i, item in enumerate(compact_sources, 1)
+            ],
+        ]
+    )
 
 def _build_fact_guard_source(news):
     """
@@ -332,12 +461,47 @@ def validate_article(article):
     return True
 
 
+def _enrich_evidence_for_generation(evidence, trend):
+    """
+    Add deterministic topic context to the already locked evidence.
+
+    The article generator receives the evidence object, not the original trend prompt.
+    Keeping the exact selected topic inside that object reduces cross-story contamination
+    when Google News returns multiple related pages.
+    """
+    if not isinstance(evidence, dict):
+        raise Exception("Evidence lock is not an object.")
+
+    enriched = dict(evidence)
+    topic = str(trend.get("title", "")).strip()
+
+    if topic:
+        enriched["selected_topic"] = topic
+
+    # Keep only source headlines as lightweight scope anchors. The factual content remains
+    # in the existing locked fact records; these strings are not additional evidence.
+    headlines = []
+    for item in trend.get("news", [])[:8]:
+        title = str(item.get("title", "")).strip()
+        if title and title not in headlines:
+            headlines.append(title)
+
+    if headlines:
+        enriched["source_scope_headlines"] = headlines
+
+    return enriched
+
+
 def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max_attempts=1, prelocked_evidence=None):
     last = None
 
     for i in range(max_attempts):
         try:
-            article = generate(prompt, evidence=prelocked_evidence)
+            generation_evidence = _enrich_evidence_for_generation(
+                prelocked_evidence,
+                trend,
+            )
+            article = generate(prompt, evidence=generation_evidence)
             validate_article(article)
             article = enforce_headline_policy(article, trend)
             validate_article(article)
@@ -567,7 +731,16 @@ def main():
             )
 
             try:
-                evidence_lock = extract_evidence(generation_prompt)
+                evidence_source = _build_evidence_source(news, keyword)
+                print(
+                    f"[TOPIC FILTER] Evidence source prepared | "
+                    f"source_chars={len(evidence_source)}"
+                )
+                evidence_lock = extract_evidence(evidence_source)
+                evidence_lock = _enrich_evidence_for_generation(
+                    evidence_lock,
+                    trend,
+                )
                 trend["_evidence_lock"] = evidence_lock
                 print(
                     f"[TOPIC FILTER] EVIDENCE USABILITY PASS | "
