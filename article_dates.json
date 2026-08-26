@@ -814,5 +814,9 @@
   "league-cup": {
     "published_at": "2026-08-26 22:01",
     "order": -204
+  },
+  "nvidia-stock": {
+    "published_at": "2026-08-26 23:29",
+    "order": -205
   }
 }
