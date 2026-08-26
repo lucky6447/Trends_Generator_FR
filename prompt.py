@@ -242,12 +242,15 @@ STRUCTURE:
 - Do not create sections merely to make the article longer.
 - When the sources contain multiple distinct verified developments, cover them
   rather than collapsing them into a single minimal summary.
-- The introduction should establish the core story using only the most important
-  facts, while leaving additional verified details for the sections.
-- Each section should contribute materially new information rather than restating
-  the introduction or another section. Before finalising, internally check that
-  each section contains at least one relevant factual point not already covered
-  elsewhere, unless the available evidence is genuinely too limited.
+- STRUCTURE:
+- Introduction.
+- 1 to 5 sections depending on the amount of verified material.
+- Use as many sections as are genuinely useful within the 1-5 section limit,
+  based on the distinct developments, facts or aspects supported by the sources.
+- Use fewer sections when the sources contain limited information.
+- Do not create sections merely to make the article longer.
+- When the sources contain multiple distinct verified developments, cover them
+  rather than collapsing them into a single minimal summary.
 - Sections may have different lengths according to the amount and importance
   of supported information.
 - Brief objective conclusion with no new facts.

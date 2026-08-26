@@ -26,7 +26,7 @@ from config import MODEL, LANGUAGE
 #   * language-independent
 # ============================================================
 
-PIPELINE_VERSION = "universal-fact-lock-v2.3.2-compact-evidence-json-fixed2"
+PIPELINE_VERSION = "universal-fact-lock-v2.3.3-compact-evidence-json-fixed3-source-id-retry"
 
 # IMPORTANT: Do not force a CPU thread count by default.
 # Ollama can auto-detect the runner's optimal thread count.
@@ -510,6 +510,44 @@ SOURCE:
 
 
 
+def _evidence_invalid_id_retry_prompt(source, invalid_ids):
+    """
+    Retry evidence extraction when Ollama returns a provenance ID that does not
+    exist in the deterministic sentence map.
+
+    This is a narrow recovery path for model ID hallucination. It does not
+    reinterpret or remap an invalid ID to another sentence, because doing so
+    could attach a correct fact to the wrong source evidence.
+    """
+    indexed_source, sentence_map = _sentence_index_source(source)
+    valid_id_text = ", ".join(sentence_map.keys())
+    invalid_id_text = ", ".join(sorted(set(invalid_ids)))
+
+    return f"""
+You are retrying TrendCurrent's source-evidence extraction because the previous
+response used invalid provenance IDs: {invalid_id_text}.
+
+Return ONLY compact JSON:
+{{"facts":[{{"f":"fact","x":"S1"}}]}}
+
+STRICT PROVENANCE RULES:
+- Read the ENTIRE SOURCE MATERIAL again.
+- Every returned fact MUST be explicitly supported by one source sentence.
+- "x" MUST be one of these exact VALID SENTENCE IDs: {valid_id_text}
+- NEVER invent an ID.
+- NEVER reuse an ID from memory or from a previous response.
+- NEVER change an ID's number or format.
+- If a fact cannot be tied confidently to one of the valid IDs, omit that fact.
+- Return as many distinct supported facts as possible, up to {EVIDENCE_MAX_FACTS}.
+- Keep all facts within the same main event/story.
+- Do not infer motives, causes, significance, outcomes or outside facts.
+- Do not generate excerpts, source names, dates or status fields separately.
+
+SOURCE MATERIAL:
+{indexed_source}
+"""
+
+
 def _source_excerpt_supported(source, excerpt):
     source_norm = re.sub(r"\s+", " ", (source or "")).strip().casefold()
     excerpt_norm = re.sub(r"\s+", " ", (excerpt or "")).strip().casefold()
@@ -529,6 +567,7 @@ def _normalize_evidence(data, source_material=None):
     _, sentence_map = _sentence_index_source(source_material or "")
     clean = []
     seen = set()
+    invalid_ids = []
 
     for item in raw_facts:
         if not isinstance(item, dict):
@@ -542,9 +581,7 @@ def _normalize_evidence(data, source_material=None):
 
         excerpt = sentence_map.get(sentence_id, "").strip()
         if not excerpt:
-            print(
-                f"[PIPELINE] Evidence sentence rejected: unknown source id {sentence_id}"
-            )
+            invalid_ids.append(sentence_id)
             continue
 
         key = (fact.lower(), sentence_id.lower())
@@ -564,6 +601,12 @@ def _normalize_evidence(data, source_material=None):
 
         if len(clean) >= EVIDENCE_MAX_FACTS:
             break
+
+    # Never silently remap an invalid provenance ID. A wrong remap could make
+    # an otherwise correct fact appear source-supported by the wrong sentence.
+    if invalid_ids:
+        ids = ", ".join(sorted(set(invalid_ids)))
+        raise ValueError(f"Evidence returned unknown source ids: {ids}")
 
     if not clean:
         raise ValueError("Evidence extraction produced no usable facts.")
@@ -597,21 +640,44 @@ def _extract_evidence(source):
             )
             maps.append(_normalize_evidence(data, source_material=chunk))
         except ValueError as exc:
-            # Retry only malformed/truncated JSON. Provenance no longer depends
-            # on a model-written excerpt, so a valid response is not thrown away
-            # because of wording differences.
-            if "Invalid Ollama JSON" not in str(exc):
-                raise
+            message = str(exc)
 
-            print(f"[PIPELINE] Evidence JSON retry | chunk={index}")
-            data = _call(
-                _evidence_retry_prompt(chunk),
-                temperature=0.0,
-                num_predict=EVIDENCE_RETRY_TOKENS,
-                num_thread=NUM_THREADS,
-                response_format=_EVIDENCE_FORMAT,
-            )
-            maps.append(_normalize_evidence(data, source_material=chunk))
+            # Narrow retry for malformed/truncated JSON.
+            if "Invalid Ollama JSON" in message:
+                print(f"[PIPELINE] Evidence JSON retry | chunk={index}")
+                data = _call(
+                    _evidence_retry_prompt(chunk),
+                    temperature=0.0,
+                    num_predict=EVIDENCE_RETRY_TOKENS,
+                    num_thread=NUM_THREADS,
+                    response_format=_EVIDENCE_FORMAT,
+                )
+                maps.append(_normalize_evidence(data, source_material=chunk))
+                continue
+
+            # Narrow retry for model-generated provenance IDs that do not exist
+            # in the deterministic sentence map. Do NOT silently remap IDs.
+            if "Evidence returned unknown source ids:" in message:
+                invalid_ids = [
+                    item.strip()
+                    for item in message.split(":", 1)[1].split(",")
+                    if item.strip()
+                ]
+                print(
+                    f"[PIPELINE] Evidence provenance retry | chunk={index} "
+                    f"| invalid_ids={','.join(invalid_ids)}"
+                )
+                data = _call(
+                    _evidence_invalid_id_retry_prompt(chunk, invalid_ids),
+                    temperature=0.0,
+                    num_predict=EVIDENCE_RETRY_TOKENS,
+                    num_thread=NUM_THREADS,
+                    response_format=_EVIDENCE_FORMAT,
+                )
+                maps.append(_normalize_evidence(data, source_material=chunk))
+                continue
+
+            raise
 
     facts = []
     seen = set()

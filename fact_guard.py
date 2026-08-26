@@ -30,7 +30,7 @@ from config import MODEL
 #   3) no automatic article rewriting
 # ============================================================
 
-FACT_GUARD_VERSION = "fact-guard-v1.1.8-current-state-event-date-trigger"
+FACT_GUARD_VERSION = "fact-guard-v1.1.9-conservative-event-date-source-id"
 
 # Performance configuration:
 # Threads and batch are intentionally left to Ollama by default.
@@ -891,6 +891,74 @@ ARTICLE:
 """
 
 
+
+def _downgrade_publication_date_only_event_issues(
+    issues: List[Dict[str, Any]],
+    source: str,
+    article: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """
+    Keep publication/update dates from being treated as proof that the
+    underlying event is historical.
+
+    If the article has no explicit event date and the source does not provide
+    multiple event dates, a HIGH event_date_mismatch backed only by a
+    publication/update timestamp is a REVIEW signal, not a publication block.
+    """
+    if not issues:
+        return issues
+
+    if _extract_article_dates(article) or _source_has_multiple_event_dates(source):
+        return issues
+
+    publication_markers = (
+        "published",
+        "publication",
+        "date published",
+        "published on",
+        "updated",
+        "updated on",
+        "posted",
+        "source date",
+    )
+
+    cleaned = []
+    downgraded = 0
+
+    for issue in issues:
+        if (
+            issue.get("severity") == "HIGH"
+            and issue.get("type") == "event_date_mismatch"
+        ):
+            excerpt = _normalize(issue.get("source_excerpt", ""))
+            reason = _normalize(issue.get("reason", ""))
+            if (
+                any(marker in excerpt for marker in publication_markers)
+                or any(marker in reason for marker in publication_markers)
+            ):
+                item = dict(issue)
+                item["severity"] = "REVIEW"
+                item["reason"] = (
+                    str(issue.get("reason", "")).strip()
+                    + " Downgraded to REVIEW because the supplied evidence "
+                    "identifies a publication/update date but does not establish "
+                    "the underlying event date."
+                ).strip()
+                item["audit_layer"] = "focused_event_date_conservative"
+                cleaned.append(item)
+                downgraded += 1
+                continue
+        cleaned.append(issue)
+
+    if downgraded:
+        print(
+            "[FACT GUARD] Event-date publication-only issue(s) "
+            f"downgraded to REVIEW: {downgraded}"
+        )
+
+    return cleaned
+
+
 def _ollama_event_date_audit(source: str, article: Dict[str, Any], reference_date: date | None = None) -> Dict[str, Any]:
     _fact_guard_started = time.perf_counter()
     response = chat(
@@ -912,6 +980,12 @@ def _ollama_event_date_audit(source: str, article: Dict[str, Any], reference_dat
     issues = result.get("issues", [])
     if not isinstance(issues, list):
         issues = []
+
+    issues = _downgrade_publication_date_only_event_issues(
+        issues,
+        source,
+        article,
+    )
 
     clean = []
     for item in issues:

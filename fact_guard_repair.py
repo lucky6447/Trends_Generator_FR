@@ -6,7 +6,7 @@ from ollama import chat
 from config import MODEL
 
 
-FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.6-full-type-safe"
+FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.6.1-entity-attribution-aliases"
 
 NUM_THREADS = max(1, int(os.getenv("FACT_GUARD_NUM_THREADS", "16")))
 NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
@@ -137,6 +137,10 @@ def _normalize_issue_type(issue_type: str) -> str:
         "wrong_team": "wrong_entity_attribution",
         "wrong_organization": "wrong_entity_attribution",
         "wrong_person": "wrong_entity_attribution",
+        "wrong_show": "wrong_entity_attribution",
+        "wrong_character": "wrong_entity_attribution",
+        "wrong_team_attribution": "wrong_entity_attribution",
+        "wrong_org_attribution": "wrong_entity_attribution",
         "cross_day_conflation": "cross_event_conflation",
         "cross_match_conflation": "cross_event_conflation",
         "cross_week_conflation": "cross_event_conflation",

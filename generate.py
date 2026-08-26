@@ -1,3 +1,4 @@
+print("[TrendCurrent PIPELINE] universal-fact-lock-v2.3.3-compact-evidence-json-fixed14-stable-source-ids")
 import re
 import os
 import subprocess
@@ -5,7 +6,7 @@ from datetime import date
 
 from config import MAX_ARTICLES_PER_RUN, LANGUAGE
 from rss import fetch_trends
-from news import fetch_news
+from news import fetch_news, extract_article
 from prompt import build_prompt
 from ollama_client import generate, extract_evidence
 from ollama import chat
@@ -21,7 +22,8 @@ from topic_scorer import rank_trends, score_with_news, select_final_candidates
 
 REQUIRED_FIELDS = ["title", "description", "h1", "intro", "sections"]
 
-MIN_WORDS = 45
+# Article length is determined by the amount of usable verified evidence.
+# There is no artificial word-count target or evidence-count-based minimum.
 
 SKIP_PATTERNS = [
     " vs ",
@@ -42,6 +44,42 @@ def slugify(text):
     text = re.sub(r"[^a-z0-9]+", "-", text)
     return text.strip("-")
 
+
+def _build_related_story_query(title):
+    """Build a compact entity/event query for Google News corroboration.
+
+    Discovery headlines can be long publisher headlines. Re-searching the
+    entire headline is too restrictive and often returns no corroborating
+    results. Keep the core named entities/event words instead.
+    """
+    text = " ".join(str(title or "").split()).strip()
+    if not text:
+        return ""
+
+    # Remove common publisher suffixes when the discovery headline exposes one.
+    text = re.sub(
+        r"\s*[-|]\s*(?:suara\.com|wolipop|detikcom|detik\.com|"
+        r"antaranews|antara|jpnn|liputan6|fimela|inews|idn times|"
+        r"kapanlagi(?:\.com)?|haibunda|katadata(?:\.co\.id)?|"
+        r"rri(?:\.co\.id)?|sindonews(?:\.com)?|merdeka(?:\.com)?|"
+        r"kompas(?:\.com)?|grid\.id)\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove obvious source-headline scaffolding that does not identify the
+    # underlying story. Keep the entity/event itself.
+    text = re.sub(
+        r"^(?:sinopsis|daftar|rekomendasi|cara menonton|cara nonton|"
+        r"jadwal tayang)\s*[:!-]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    words = re.findall(r"[A-Za-z0-9À-ÿ']+", text)
+    return " ".join(words[:10])
 
 
 def _evidence_words(text):
@@ -153,6 +191,7 @@ def _build_evidence_source(news, topic=None):
             *[
                 "\n".join(
                     [
+                        f"SOURCE S{i}",
                         f"ARTICLE {i}",
                         f"Title: {item['title']}",
                         f"Source: {item['source']}",
@@ -444,7 +483,6 @@ def validate_article(article):
         raise Exception("Article should contain 1-5 well-structured sections.")
 
     titles = set()
-    words = len(article["intro"].split())
 
     for s in article["sections"]:
         if "title" not in s or "text" not in s:
@@ -452,13 +490,11 @@ def validate_article(article):
         if s["title"] in titles:
             raise Exception("Duplicate section title")
         titles.add(s["title"])
-        words += len(s["text"].split())
-
-    min_words = 45
-    if words < min_words:
-        raise Exception(f"Article too short ({words} words; minimum {min_words})")
 
     return True
+
+
+
 
 
 def _enrich_evidence_for_generation(evidence, trend):
@@ -492,7 +528,7 @@ def _enrich_evidence_for_generation(evidence, trend):
     return enriched
 
 
-def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max_attempts=1, prelocked_evidence=None):
+def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max_attempts=2, prelocked_evidence=None):
     last = None
 
     for i in range(max_attempts):
@@ -579,6 +615,12 @@ def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max
         except Exception as e:
             last = e
             print(f"Validation failed ({i+1}/{max_attempts}): {e}")
+
+            # A failed Fact Guard repair is terminal for this candidate.
+            # Re-generating from the same evidence only repeats the expensive
+            # audit/repair cycle instead of improving the underlying condition.
+            if "Fact Guard blocked article; repair failed:" in str(e):
+                break
 
     raise Exception(last)
 
@@ -668,13 +710,68 @@ def main():
                 f"\n[TOPIC FILTER] Retrieving sources for candidate: "
                 f"{keyword}"
             )
-            news = fetch_news(keyword)
+            # Discovery candidates already come from fresh Google News RSS.
+            # Re-query using the category discovery query rather than the full
+            # publisher headline; the latter is often too specific and can
+            # return zero results. The discovered item is retained as seed
+            # evidence so the exact fresh story is not lost.
+            discovery_query = trend.get("discovery_query")
+            seed = None
+            if discovery_query:
+                # The discovery headline is already a fresh story. Use it as
+                # seed evidence and make a second, entity-focused search for
+                # corroboration. Never discard the seed just because Google
+                # News cannot find the publisher headline again.
+                seed = dict(trend)
+                if not seed.get("content") and seed.get("link"):
+                    try:
+                        seed["content"] = extract_article(seed["link"])
+                    except Exception:
+                        seed["content"] = ""
+                entity_query = _build_related_story_query(keyword)
+                if not entity_query:
+                    entity_query = keyword.split(" - ")[0].strip()
 
-            if len(news) < 2:
-                print(
-                    f"[TOPIC FILTER] DROP AFTER NEWS | {keyword} | "
-                    f"only {len(news)} usable news result(s)"
-                )
+                # The discovery category is only a discovery hint. Never append it
+                # to the corroboration query: doing so can misclassify a local
+                # Indonesian artist as K-pop simply because the same headline was
+                # returned by a K-pop discovery query. Entity/event terms are safer.
+                search_query = entity_query
+
+                print(f"[TOPIC FILTER] Related story search: {search_query}")
+                news = fetch_news(search_query)
+                # If the seed page extracted very little text, borrow the RSS
+                # summary/content from the closest matching search result. This
+                # prevents a short publisher extraction from becoming the only
+                # evidence source when Google News already has the same story.
+                seed_title_norm = _normalise_headline(seed.get("title", ""))
+                if len(str(seed.get("content", "")).strip()) < 900 and news:
+                    best = None
+                    best_overlap = 0
+                    seed_words = {w for w in re.findall(r"[a-z0-9]+", seed_title_norm.casefold()) if len(w) >= 4}
+                    for candidate in news:
+                        cand_norm = _normalise_headline(candidate.get("title", ""))
+                        cand_words = {w for w in re.findall(r"[a-z0-9]+", cand_norm.casefold()) if len(w) >= 4}
+                        overlap = len(seed_words & cand_words)
+                        if overlap > best_overlap:
+                            best_overlap = overlap
+                            best = candidate
+                    if best is not None and best_overlap >= 2:
+                        if not seed.get("content") and best.get("content"):
+                            seed["content"] = best.get("content")
+                        if best.get("summary"):
+                            seed["summary"] = best.get("summary")
+
+                if seed.get("title") and not any(
+                    str(x.get("title", "")).strip().casefold() == str(seed.get("title", "")).strip().casefold()
+                    for x in news
+                ):
+                    news.insert(0, seed)
+            else:
+                news = fetch_news(keyword)
+
+            if not news:
+                print(f"[TOPIC FILTER] DROP AFTER NEWS | {keyword} | no usable news result(s)")
                 continue
 
             trend["news"] = news
@@ -764,7 +861,7 @@ def main():
             slug = slugify(keyword)
             article["slug"] = slug
 
-            save_article(slug, render_article(article))
+            save_article(slug, render_article(article, news=news))
 
             new_keywords.append(keyword)
             generated += 1
