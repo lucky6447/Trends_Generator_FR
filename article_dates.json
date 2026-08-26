@@ -822,5 +822,9 @@
   "avril-lavigne": {
     "published_at": "2026-08-27 00:35",
     "order": -206
+  },
+  "victor-belmondo": {
+    "published_at": "2026-08-27 02:01",
+    "order": -207
   }
 }
