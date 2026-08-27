@@ -234,26 +234,19 @@ STYLE:
 - Use natural transitions without introducing new information.
 
 STRUCTURE:
-- Introduction.
-- 1 to 5 sections depending on the amount of verified material.
-- Use as many sections as are genuinely useful within the 1-5 section limit,
-  based on the distinct developments, facts or aspects supported by the sources.
-- Use fewer sections when the sources contain limited information.
-- Do not create sections merely to make the article longer.
-- When the sources contain multiple distinct verified developments, cover them
-  rather than collapsing them into a single minimal summary.
-- STRUCTURE:
-- Introduction.
-- 1 to 5 sections depending on the amount of verified material.
-- Use as many sections as are genuinely useful within the 1-5 section limit,
-  based on the distinct developments, facts or aspects supported by the sources.
-- Use fewer sections when the sources contain limited information.
-- Do not create sections merely to make the article longer.
-- When the sources contain multiple distinct verified developments, cover them
-  rather than collapsing them into a single minimal summary.
-- Sections may have different lengths according to the amount and importance
-  of supported information.
-- Brief objective conclusion with no new facts.
+Write one concise lead paragraph that tells the reader the essential new development immediately. Do not repeat the topic wording mechanically. The introduction should establish the story, not retell it.
+
+Sections are optional. Create a section only when the evidence contains a distinct verified fact, development, or detail that adds genuinely new information beyond the introduction. Do not create a section merely to satisfy the article structure.
+
+Use 1-5 sections only when genuinely useful. Use fewer sections when the evidence is limited. If no additional distinct information remains, return an empty sections array.
+
+Each section must add genuinely new verified information. Never repeat, paraphrase or restate information already covered in the introduction or another section.
+
+When multiple distinct verified developments are available, cover them rather than collapsing them into a minimal summary. When the evidence contains only limited information, stop rather than inventing detail or padding the article.
+
+Sections may have different lengths according to the amount and importance of supported information.
+
+Brief objective conclusion with no new facts.
 
 FINAL FACTUAL SELF-CHECK:
 Before returning the result:
