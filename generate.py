@@ -177,12 +177,15 @@ def _build_evidence_source(news, topic=None):
         published = str(item.get("published", "")).strip()
         content = str(item.get("content", "")).strip()
 
+        # Preserve usable RSS evidence when publisher extraction is empty/short.
+        evidence_text = content if len(content) >= 300 else summary
+
         compact_sources.append({
             "title": title,
             "source": source,
             "published": published,
             "summary": summary,
-            "content": content[:5000],
+            "content": evidence_text[:5000],
         })
 
     return "\n".join(
@@ -524,6 +527,22 @@ def _enrich_evidence_for_generation(evidence, trend):
 
     if headlines:
         enriched["source_scope_headlines"] = headlines
+
+    # Evidence-density article length policy. When the locked evidence contains
+    # only one verified fact, the article must stay naturally concise rather
+    # than expanding a single fact into repetitive 150-200 word coverage.
+    # This is a generation instruction only; it never changes or weakens the
+    # underlying evidence lock or Fact Guard source.
+    facts = enriched.get("facts", [])
+    if isinstance(facts, list) and len(facts) == 1:
+        enriched["article_length_policy"] = (
+            "SINGLE-FACT EVIDENCE: Write a naturally short article. "
+            "Use only the single verified fact available. Do not pad, repeat, "
+            "generalize, speculate, or manufacture context to reach a word count. "
+            "Prefer a concise intro plus one short section when that is sufficient; "
+            "the article may be substantially shorter than a typical article. "
+            "Completeness and factual precision take priority over length."
+        )
 
     return enriched
 
