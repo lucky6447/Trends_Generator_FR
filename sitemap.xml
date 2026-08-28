@@ -109,6 +109,12 @@
     <priority>0.6</priority>
   </url>
   <url>
+    <loc>https://fr.trendcurrent.today/trends/cholet</loc>
+    <lastmod>2026-08-28</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
     <loc>https://fr.trendcurrent.today/trends/france-travail</loc>
     <lastmod>2026-08-28</lastmod>
     <changefreq>monthly</changefreq>

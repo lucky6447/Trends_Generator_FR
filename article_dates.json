@@ -866,5 +866,9 @@
   "france-travail": {
     "published_at": "2026-08-28 01:47",
     "order": -217
+  },
+  "cholet": {
+    "published_at": "2026-08-28 03:27",
+    "order": -218
   }
 }
