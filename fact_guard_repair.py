@@ -21,23 +21,16 @@ _ARTICLE_FORMAT = {
         "title": {"type": "string"},
         "description": {"type": "string"},
         "h1": {"type": "string"},
-        "intro": {"type": "string"},
-        "sections": {
+        "paragraphs": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 6,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "text": {"type": "string"},
-                },
-                "required": ["title", "text"],
-            },
+            "maxItems": 20,
+            "items": {"type": "string"},
         },
     },
-    "required": ["title", "description", "h1", "intro", "sections"],
+    "required": ["title", "description", "h1", "paragraphs"],
 }
+
 
 
 def _extract_json_object(text: str) -> Dict[str, Any]:
@@ -88,27 +81,24 @@ def _schema_ok(article: Dict[str, Any]) -> bool:
     if not isinstance(article, dict):
         return False
 
-    required = ("title", "description", "h1", "intro", "sections")
+    required = ("title", "description", "h1", "paragraphs")
     if any(key not in article for key in required):
         return False
 
-    for key in ("title", "description", "h1", "intro"):
+    for key in ("title", "description", "h1"):
         if not isinstance(article[key], str):
             return False
 
-    sections = article["sections"]
-    if not isinstance(sections, list) or not 1 <= len(sections) <= 6:
+    paragraphs = article["paragraphs"]
+    if not isinstance(paragraphs, list) or not 1 <= len(paragraphs) <= 20:
         return False
 
-    for section in sections:
-        if not isinstance(section, dict):
-            return False
-        if not isinstance(section.get("title"), str):
-            return False
-        if not isinstance(section.get("text"), str):
+    for paragraph in paragraphs:
+        if not isinstance(paragraph, str) or not paragraph.strip():
             return False
 
     return True
+
 
 
 def _normalize_issue_type(issue_type: str) -> str:
@@ -129,6 +119,7 @@ def _normalize_issue_type(issue_type: str) -> str:
         "date_mismatch": "event_date_mismatch",
         "wrong_event_date": "event_date_mismatch",
         "wrong_event_status": "event_status_mismatch",
+        "wrong_status": "event_status_mismatch",
         "status_mismatch": "event_status_mismatch",
         "wrong_number": "wrong_fact",
         "unsupported_number": "wrong_fact",
@@ -189,6 +180,7 @@ def _supported_repair(issue: Dict[str, Any]) -> bool:
         "wrong_entity_attribution",
         "wrong_role",
         "wrong_amount",
+        "wrong_temperature",
     }
 
     delete_only = {
@@ -378,6 +370,7 @@ GLOBAL SAFETY RULES:
 - Keep the article in its existing language.
 - Issue types may be normalized only for selecting a safe repair rule; the actual issue claim, reason, and source excerpt remain the authoritative repair target.
 - Return ONLY valid article JSON matching the required schema.
+- The universal article schema uses paragraphs only. Do not return intro, sections, FAQ, or other legacy fields.
 
 ISSUE-SPECIFIC RULES:
 {issue_rules}

@@ -1,4 +1,4 @@
-print("[TrendCurrent PIPELINE] universal-fact-lock-v2.3.3-compact-evidence-json-fixed14-stable-source-ids")
+print("[TrendCurrent PIPELINE] universal-fact-lock-v2.4-evidence-coverage-stable")
 import re
 import os
 import subprocess
@@ -20,7 +20,7 @@ from processed import load_processed, add_processed
 from index_generator import update_all
 from topic_scorer import rank_trends, score_with_news, select_final_candidates
 
-REQUIRED_FIELDS = ["title", "description", "h1", "intro", "sections"]
+REQUIRED_FIELDS = ["title", "description", "h1", "paragraphs"]
 
 # Article length is determined by the amount of usable verified evidence.
 # There is no artificial word-count target or evidence-count-based minimum.
@@ -101,8 +101,8 @@ def _jaccard(a, b):
     return len(a & b) / len(a | b)
 
 
-def _select_evidence_story_sources(news, topic, min_sources=3, max_sources=6):
-    """Deterministically retain a coherent source cluster before Ollama.
+def _select_evidence_story_sources(news, topic, min_sources=3, max_sources=12):
+    """Deterministically rank and retain the strongest source set before Ollama.
 
     This changes ONLY the evidence-extractor input. The original ``news`` list
     remains untouched for Fact Guard and article generation.
@@ -133,7 +133,10 @@ def _select_evidence_story_sources(news, topic, min_sources=3, max_sources=6):
         key=lambda x: (x["topic_overlap"], x["topic_jaccard"], -x["idx"]),
     )
 
-    # Build the story cluster around the anchor using title/summary lexical overlap.
+    # Rank all retrieved sources by story similarity, but do not discard sources
+    # solely because their wording differs from the anchor. The old hard lexical
+    # threshold was a major evidence-loss point: useful corroboration, alternate
+    # wording and even contradictory status reports could disappear before extraction.
     scored = []
     for prof in profiles:
         if prof["idx"] == anchor["idx"]:
@@ -142,15 +145,16 @@ def _select_evidence_story_sources(news, topic, min_sources=3, max_sources=6):
             sim = _jaccard(anchor["words"], prof["words"])
         scored.append((prof["idx"], sim, prof["topic_overlap"], prof["topic_jaccard"]))
 
-    cluster = [x for x in scored if x[0] == anchor["idx"] or x[1] >= 0.18]
-    cluster.sort(key=lambda x: (-x[1], -x[2], -x[3], x[0]))
+    scored.sort(key=lambda x: (-x[1], -x[2], -x[3], x[0]))
 
-    # Keep at least a small corroboration set, choosing the closest remaining titles.
-    selected_indices = [x[0] for x in cluster[:max_sources]]
+    # Preserve the strongest sources up to the cap. The evidence extractor is
+    # responsible for keeping one coherent event and rejecting unrelated material.
+    selected_indices = [x[0] for x in scored[:max_sources]]
+
     if len(selected_indices) < min_sources:
-        remaining = [x for x in scored if x[0] not in selected_indices]
-        remaining.sort(key=lambda x: (-x[1], -x[2], -x[3], x[0]))
-        selected_indices.extend(x[0] for x in remaining[: max(0, min_sources - len(selected_indices))])
+        selected_indices.extend(
+            x[0] for x in scored[len(selected_indices):min_sources]
+        )
 
     selected_indices = sorted(dict.fromkeys(selected_indices))
     selected = [items[i] for i in selected_indices]
@@ -479,24 +483,17 @@ def validate_article(article):
         if f not in article:
             raise Exception(f"Missing field: {f}")
 
-    if not isinstance(article["sections"], list):
-        raise Exception("Sections must be a list")
+    if not isinstance(article["paragraphs"], list):
+        raise Exception("paragraphs must be a list")
 
-    if not 1 <= len(article["sections"]) <= 5:
-        raise Exception("Article should contain 1-5 well-structured sections.")
+    if not article["paragraphs"]:
+        raise Exception("Article must contain at least one paragraph.")
 
-    titles = set()
-
-    for s in article["sections"]:
-        if "title" not in s or "text" not in s:
-            raise Exception("Invalid section")
-        if s["title"] in titles:
-            raise Exception("Duplicate section title")
-        titles.add(s["title"])
+    for paragraph in article["paragraphs"]:
+        if not isinstance(paragraph, str) or not paragraph.strip():
+            raise Exception("Invalid paragraph")
 
     return True
-
-
 
 
 
@@ -517,17 +514,26 @@ def _enrich_evidence_for_generation(evidence, trend):
     if topic:
         enriched["selected_topic"] = topic
 
-    # Keep only source headlines as lightweight scope anchors. The factual content remains
-    # in the existing locked fact records; these strings are not additional evidence.
-    headlines = []
-    for item in trend.get("news", [])[:8]:
-        title = str(item.get("title", "")).strip()
-        if title and title not in headlines:
-            headlines.append(title)
+    # IMPORTANT: Source/publisher attribution is not part of the article narrative.
+    # The model must synthesize the locked facts into a continuous news story.
+    # Source names/headlines may be used internally for provenance, but must not
+    # become "X reported..." / "Y said..." prose unless the attribution itself
+    # is an essential verified fact (for example, an official statement).
+    enriched["editorial_generation_policy"] = (
+        "NARRATIVE SYNTHESIS: Write the article as an original, continuous news "
+        "story from the locked verified facts. Do not organize paragraphs by source. "
+        "Do not mention publisher names, websites, source headlines, or phrases such "
+        "as 'reported by', 'according to [publisher]', 'X has reported', 'Y published', "
+        "or similar source-digest wording. State the verified information directly. "
+        "Only retain attribution when who made the statement or which official body "
+        "confirmed it is itself an essential part of the verified fact. Never use a "
+        "source headline to add specificity that the locked evidence does not support."
+    )
 
-    if headlines:
-        enriched["source_scope_headlines"] = headlines
-
+    # IMPORTANT: Do not pass publisher/source headlines into article generation.
+    # Headlines are discovery metadata and can contain claims that are stronger,
+    # newer, or more specific than the source body. The locked evidence facts are
+    # the sole factual authority for generation.
     # Evidence-density article length policy. When the locked evidence contains
     # only one verified fact, the article must stay naturally concise rather
     # than expanding a single fact into repetitive 150-200 word coverage.
@@ -539,8 +545,8 @@ def _enrich_evidence_for_generation(evidence, trend):
             "SINGLE-FACT EVIDENCE: Write a naturally short article. "
             "Use only the single verified fact available. Do not pad, repeat, "
             "generalize, speculate, or manufacture context to reach a word count. "
-            "Prefer a concise intro plus one short section when that is sufficient; "
-            "the article may be substantially shorter than a typical article. "
+            "The article may be "
+            "substantially shorter than a typical article. "
             "Completeness and factual precision take priority over length."
         )
 
@@ -558,6 +564,16 @@ def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max
             )
             article = generate(prompt, evidence=generation_evidence)
             validate_article(article)
+
+            locked_facts = generation_evidence.get("facts", [])
+            paragraph_text = " ".join(
+                str(p) for p in article.get("paragraphs", [])
+            ).strip()
+            if isinstance(locked_facts, list) and len(locked_facts) >= 3:
+                print(
+                    f"[EVIDENCE COVERAGE] locked_facts={len(locked_facts)} "
+                    f"| article_words={len(paragraph_text.split())}"
+                )
             article = enforce_headline_policy(article, trend)
             validate_article(article)
 

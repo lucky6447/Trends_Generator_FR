@@ -133,11 +133,48 @@ def _attach_remote_image(article, news=None):
 
 def render_article(article, news=None):
     article = _attach_remote_image(article, news=news)
-    return template.render(
+
+    if not isinstance(article, dict):
+        raise ValueError("Article must be an object before rendering.")
+
+    paragraphs = article.get("paragraphs")
+    if not isinstance(paragraphs, list) or not paragraphs:
+        raise ValueError("Article has no generated paragraph content.")
+
+    # Universal article contract: paragraphs only.
+    # Legacy intro/sections/FAQ are never rendered by this generator.
+    if "sections" in article or "faq" in article:
+        raise ValueError("Legacy article schema detected; expected universal paragraphs schema.")
+
+    # Fail closed: never publish raw source material or legacy section/FAQ dumps.
+    article_text = " ".join(str(p) for p in paragraphs)
+    forbidden = (
+        "SOURCE MATERIAL:",
+        "FULL ARTICLE:",
+        "ARTICLE 1",
+        "SOURCE S1",
+        "FREQUENTLY ASKED QUESTIONS",
+    )
+    if any(token.casefold() in article_text.casefold() for token in forbidden):
+        raise ValueError("Generated article contains raw source/template material.")
+
+    html = template.render(
         article=article,
         site_url=SITE_URL,
         language=LANGUAGE,
     )
+
+    # Template contract: verify that paragraph elements were rendered.
+    # Do not compare raw paragraph strings against autoescaped HTML: Jinja may
+    # legitimately encode characters such as &, <, >, quotes, or apostrophes.
+    rendered_paragraphs = re.findall(r"<p(?:\s[^>]*)?>(.*?)</p>", html, flags=re.S | re.I)
+    if len(rendered_paragraphs) < len(paragraphs):
+        raise ValueError(
+            f"Template rendered {len(rendered_paragraphs)} paragraphs; "
+            f"expected {len(paragraphs)}."
+        )
+
+    return html
 
 
 def save_article(slug,html):

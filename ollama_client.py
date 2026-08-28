@@ -57,14 +57,14 @@ EVIDENCE_CHUNK_CHARS = max(
     7000, int(os.getenv("OLLAMA_EVIDENCE_CHUNK_CHARS", "14000"))
 )
 EVIDENCE_TOKENS = max(
-    320, int(os.getenv("OLLAMA_EVIDENCE_TOKENS", "420"))
+    420, int(os.getenv("OLLAMA_EVIDENCE_TOKENS", "700"))
 )
 EVIDENCE_MAX_FACTS = max(
-    4, int(os.getenv("OLLAMA_EVIDENCE_MAX_FACTS", "6"))
+    4, int(os.getenv("OLLAMA_EVIDENCE_MAX_FACTS", "12"))
 )
 
 ARTICLE_TOKENS = max(
-    420, int(os.getenv("OLLAMA_ARTICLE_TOKENS", "600"))
+    520, int(os.getenv("OLLAMA_ARTICLE_TOKENS", "900"))
 )
 AUDIT_TOKENS = max(
     120, int(os.getenv("OLLAMA_AUDIT_TOKENS", "180"))
@@ -79,10 +79,9 @@ MIN_ARTICLE_WORDS = max(
 
 # Evidence-aware minimum. This prevents tiny articles when the ledger is rich,
 # while allowing genuinely short stories to remain short instead of padding.
-ADAPTIVE_MIN_1_2 = max(0, int(os.getenv("OLLAMA_MIN_1_2_FACTS", "45")))
-ADAPTIVE_MIN_3_4 = max(0, int(os.getenv("OLLAMA_MIN_3_4_FACTS", "65")))
-ADAPTIVE_MIN_5_PLUS = max(0, int(os.getenv("OLLAMA_MIN_5_PLUS_FACTS", "85")))
-MAX_SECTIONS = 6
+ADAPTIVE_MIN_1_2 = max(0, int(os.getenv("OLLAMA_MIN_1_2_FACTS", "0")))
+ADAPTIVE_MIN_3_4 = max(0, int(os.getenv("OLLAMA_MIN_3_4_FACTS", "0")))
+ADAPTIVE_MIN_5_PLUS = max(0, int(os.getenv("OLLAMA_MIN_5_PLUS_FACTS", "0")))
 
 # Evidence is deliberately sequential on CPU.
 EVIDENCE_PARALLEL = os.getenv(
@@ -363,38 +362,91 @@ _EVIDENCE_FORMAT = {
 
 def _sentence_index_source(source):
     """
-    Add deterministic sentence IDs to the source.
+    Build deterministic source-aware sentence IDs.
 
-    The model selects IDs; Python constructs the evidence excerpt directly
-    from the original source. This removes the fragile LLM-generated-excerpt
-    provenance step that was causing repeated 'excerpt not found in source'
-    rejections.
+    ARTICLE blocks are indexed independently (A1-S1, A1-S2, A2-S1...).
+    Title/source/published metadata is kept visible for scope, but is NOT
+    exposed as factual sentence evidence. Facts must come from Summary/Full
+    Article text so a sensational or conflicting headline cannot override
+    the body evidence.
     """
     text = (source or "").strip()
     if not text:
         return "", {}
 
-    # Keep article headers/metadata as part of sentences.
-    # Split on sentence-ending punctuation followed by whitespace, while also
-    # handling closing quotes/brackets before the whitespace. Do not require
-    # the next character to be uppercase: this is important for multilingual
-    # sources, headlines, abbreviations and quoted text.
-    parts = re.split(
-        r'(?<=[.!?])(?:["”»’\'\)\]]+)?\s+',
-        text
-    )
-    parts = [p.strip() for p in parts if p.strip()]
+    article_marker = re.compile(r"(?m)^\s*ARTICLE\s+(\d+)\s*$")
+    matches = list(article_marker.finditer(text))
 
-    # If the source has long blocks without punctuation, still expose them.
+    def split_sentences(block):
+        parts = re.split(
+            r'(?<=[.!?])(?:["”»’\'\)\]]+)?\s+',
+            block,
+        )
+        return [p.strip() for p in parts if p.strip()]
+
     mapping = {}
-    indexed = []
-    for i, part in enumerate(parts, 1):
+    indexed_parts = []
+
+    if matches:
+        prefix = text[:matches[0].start()].strip()
+        if prefix:
+            indexed_parts.append(prefix)
+
+        for pos, match in enumerate(matches):
+            article_no = match.group(1)
+            block_end = matches[pos + 1].start() if pos + 1 < len(matches) else len(text)
+            block = text[match.start():block_end].strip()
+
+            lines = block.splitlines()
+            header = lines[0].strip() if lines else f"ARTICLE {article_no}"
+            body = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+
+            indexed_parts.append(f"[A{article_no}-HEADER] {header}")
+
+            # Only expose factual content sections. Metadata is scope only.
+            factual_lines = []
+            in_fact = False
+            for line in body.splitlines():
+                stripped = line.strip()
+                low = stripped.casefold()
+                if low in {"summary:", "full article:"}:
+                    in_fact = True
+                    continue
+                if stripped == "---":
+                    in_fact = False
+                    continue
+                if in_fact and stripped:
+                    factual_lines.append(stripped)
+
+            factual_text = "\n".join(factual_lines).strip()
+            if not factual_text:
+                # Conservative fallback: if the source block has no explicit
+                # section labels, use its body, excluding obvious metadata lines.
+                kept = []
+                for line in body.splitlines():
+                    stripped = line.strip()
+                    low = stripped.casefold()
+                    if not stripped or low.startswith(("title:", "source:", "published:")):
+                        continue
+                    kept.append(stripped)
+                factual_text = "\n".join(kept).strip()
+
+            sentences = split_sentences(factual_text)
+            for sentence_no, sentence in enumerate(sentences, 1):
+                sid = f"A{article_no}-S{sentence_no}"
+                mapping[sid] = sentence
+                indexed_parts.append(f"[{sid}] {sentence}")
+            indexed_parts.append("---")
+
+        return "\n".join(indexed_parts), mapping
+
+    # Single unstructured source: preserve legacy S1... IDs.
+    sentences = split_sentences(text)
+    for i, sentence in enumerate(sentences, 1):
         sid = f"S{i}"
-        mapping[sid] = part
-        indexed.append(f"[{sid}] {part}")
-
-    return "\n".join(indexed), mapping
-
+        mapping[sid] = sentence
+        indexed_parts.append(f"[{sid}] {sentence}")
+    return "\n".join(indexed_parts), mapping
 
 def _evidence_prompt(source, max_facts=None):
     limit = max_facts or EVIDENCE_MAX_FACTS
@@ -418,7 +470,8 @@ PRIMARY-EVENT LOCK:
 EVIDENCE COVERAGE:
 - Build the strongest possible evidence ledger from the SAME story.
 - Extract EVERY distinct, directly supported, useful fact you can find, up to {limit}.
-- When the source supports 4 or more distinct facts, you MUST return at least 4 facts.
+- When the source supports 8 or more distinct useful facts, you MUST return at least 8 facts.
+- Do NOT stop at 4-6 facts when additional distinct useful facts are present.
 - Do NOT stop after one fact.
 - Do NOT stop after identifying the main event.
 - Prefer facts covering different dimensions when available: event/action, people/entities, opponent/location, date/status, score/number, qualification/stage, and other concrete developments.
@@ -436,15 +489,17 @@ FACT RULES:
 - Preserve names, roles, dates, numbers and certainty exactly.
 - Never transfer attributes between named entities.
 - Prefer a concrete source-supported fact over generic background wording.
+- Do not select a numeric or other materially conflicting claim merely from a headline or metadata.
+- When the factual bodies of sources conflict on a number, date, status or attribution and the conflict is not explicitly resolved, omit the disputed detail rather than choosing one by guesswork.
 - Return ONLY JSON.
 
 IMPORTANT OUTPUT REQUIREMENT:
 - Before returning JSON, silently review the ENTIRE SOURCE MATERIAL for additional distinct supported facts.
 - Do not return only the first or most obvious fact when additional supported facts are present.
-- The target is 4-6 facts whenever the source material supports that many.
+- The target is 8-12 facts whenever the source material supports that many; this is a coverage target, not a requirement to invent or pad facts.
 
 Use exactly this compact JSON shape:
-{{"facts":[{{"f":"fact","x":"S1"}}]}}
+{{"facts":[{{"f":"fact","x":"A1-S1"}}]}}
 
 SOURCE MATERIAL:
 {indexed_source}
@@ -459,17 +514,19 @@ def _evidence_expansion_prompt(source):
 Extract the MAIN EVENT from this source and build a compact evidence ledger.
 
 Return ONLY JSON:
-{{"facts":[{{"f":"fact","x":"S1"}}]}}
+{{"facts":[{{"f":"fact","x":"A1-S1"}}]}}
 
 RULES:
-- Extract 4-{EVIDENCE_MAX_FACTS} distinct facts if supported; use fewer only when the source truly contains fewer.
+- Extract 8-{EVIDENCE_MAX_FACTS} distinct facts when the source materially supports that many; use fewer only when the entire source genuinely contains fewer useful facts.
 - ALL returned facts must belong to ONE coherent event/story.
 - If several ARTICLE blocks or separate stories appear in the source, choose one main story and ignore unrelated stories that merely share a keyword.
 - Do not combine separate programmes, broadcasts, people, matches, incidents or other events.
 - Do not repeat the same fact in different wording.
 - Cover different useful details: event, people/entities, timing, numbers, status, location or other directly relevant facts.
-- Every fact must be explicitly supported by one sentence.
+- Every fact must be explicitly supported by one sentence from one source block.
+- When ARTICLE blocks are present, the provenance ID must identify both the source article and sentence (for example A2-S3).
 - "x" must be one of these VALID SENTENCE IDs: {valid_id_text}
+- Do not interpret SOURCE S2, ARTICLE 2, or any source label as a sentence ID.
 - Never invent or alter an ID.
 - No excerpts, source names, dates or status fields outside "f".
 - No outside knowledge.
@@ -489,16 +546,17 @@ def _evidence_retry_prompt(source):
 Extract the MAIN EVENT from this source.
 
 Return ONLY compact JSON:
-{{"facts":[{{"f":"fact","x":"S1"}}]}}
+{{"facts":[{{"f":"fact","x":"A1-S1"}}]}}
 
 RULES:
 - Return as many distinct facts as the source supports, up to {EVIDENCE_MAX_FACTS}.
-- Prefer 4-6 facts when the source contains enough material.
+- Prefer 8-{EVIDENCE_MAX_FACTS} facts when the source contains enough material; do not stop at 4-6 merely because that is sufficient to summarize the headline.
 - ALL facts must belong to ONE coherent main event/story.
 - If multiple ARTICLE blocks or separate stories share a keyword, choose one story only and do not mix them.
 - Cover different useful factual dimensions instead of repeating the same point.
 - All facts must belong to the same main event.
 - "x" must be one of these VALID SENTENCE IDs: {valid_id_text}
+- Do not interpret SOURCE S2, ARTICLE 2, or any source label as a sentence ID.
 - Never invent or alter a sentence ID.
 - "f" must be a concise supported fact.
 - Do not generate excerpts, source names, dates or status fields.
@@ -528,12 +586,13 @@ You are retrying TrendCurrent's source-evidence extraction because the previous
 response used invalid provenance IDs: {invalid_id_text}.
 
 Return ONLY compact JSON:
-{{"facts":[{{"f":"fact","x":"S1"}}]}}
+{{"facts":[{{"f":"fact","x":"A1-S1"}}]}}
 
 STRICT PROVENANCE RULES:
 - Read the ENTIRE SOURCE MATERIAL again.
 - Every returned fact MUST be explicitly supported by one source sentence.
 - "x" MUST be one of these exact VALID SENTENCE IDs: {valid_id_text}
+- SOURCE S2 / ARTICLE 2 are source labels, not sentence IDs.
 - NEVER invent an ID.
 - NEVER reuse an ID from memory or from a previous response.
 - NEVER change an ID's number or format.
@@ -733,10 +792,10 @@ def _extract_evidence(source):
     if not facts:
         raise ValueError("Evidence extraction produced no usable facts.")
 
-    # Keep the strongest evidence across all chunks instead of discarding
-    # an entire chunk just because another chunk produced more facts.
-    # Facts are already constrained to the same main event by the extractor.
-    locked = facts[:EVIDENCE_MAX_FACTS]
+    # Keep all provenance-verified facts across all chunks. Each chunk is already
+    # bounded by EVIDENCE_MAX_FACTS, so this preserves coverage without a second
+    # global truncation that could silently discard relevant evidence.
+    locked = facts
 
     group_counts = {}
     for fact in locked:
@@ -773,24 +832,22 @@ def _schema_ok(article):
     if not isinstance(article, dict):
         return False
 
-    required = ("title", "description", "h1", "intro", "sections")
+    required = ("title", "description", "h1", "paragraphs")
     if any(key not in article for key in required):
         return False
 
-    for key in ("title", "description", "h1", "intro"):
+    for key in ("title", "description", "h1"):
         if not isinstance(article[key], str):
             return False
 
-    sections = article["sections"]
-    if not isinstance(sections, list) or not 1 <= len(sections) <= MAX_SECTIONS:
+    paragraphs = article["paragraphs"]
+    if not isinstance(paragraphs, list) or not paragraphs:
         return False
 
-    for section in sections:
-        if not isinstance(section, dict):
+    for paragraph in paragraphs:
+        if not isinstance(paragraph, str):
             return False
-        if not isinstance(section.get("title"), str):
-            return False
-        if not isinstance(section.get("text"), str):
+        if not paragraph.strip():
             return False
 
     return True
@@ -801,12 +858,10 @@ def _word_count(article):
         article.get("title", ""),
         article.get("description", ""),
         article.get("h1", ""),
-        article.get("intro", ""),
     ]
 
-    for section in article.get("sections", []):
-        values.append(section.get("title", ""))
-        values.append(section.get("text", ""))
+    for paragraph in article.get("paragraphs", []):
+        values.append(paragraph)
 
     return len(" ".join(values).split())
 
@@ -821,34 +876,32 @@ _ARTICLE_FORMAT = {
         "title": {"type": "string"},
         "description": {"type": "string"},
         "h1": {"type": "string"},
-        "intro": {"type": "string"},
-        "sections": {
+        "paragraphs": {
             "type": "array",
             "minItems": 1,
-            "maxItems": MAX_SECTIONS,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "text": {"type": "string"},
-                },
-                "required": ["title", "text"],
-            },
+            "items": {"type": "string"},
         },
     },
     "required": [
         "title",
         "description",
         "h1",
-        "intro",
-        "sections",
+        "paragraphs",
     ],
 }
+
 
 
 def _article_prompt(evidence):
     return f"""
 Write a clear TrendCurrent news article in {LANGUAGE}.
+
+LANGUAGE LOCK:
+- The output language is {LANGUAGE}.
+- TITLE, DESCRIPTION, H1 and EVERY paragraph MUST be written in {LANGUAGE}.
+- The LOCKED EVIDENCE may be in another language. IGNORE its language and translate/paraphrase the supported facts into {LANGUAGE}.
+- Do not output English wording merely because the source evidence is in English.
+- Proper names, official names, team names, company names and other names may remain in their original form.
 
 Use ONLY the LOCKED EVIDENCE below.
 
@@ -871,7 +924,7 @@ BALANCED FACT RULES:
 - Do not turn a report into a confirmed fact.
 - Do not use unsupported quotes.
 - Do not add generic filler or speculation.
-- Titles, descriptions and headings must also stay factual.
+- Titles and descriptions must also stay factual.
 - Let article length be determined by the amount and richness of the locked evidence.
 - For limited evidence, keep the article concise and complete.
 - For richer evidence, develop the article enough to cover the distinct relevant facts,
@@ -879,11 +932,31 @@ BALANCED FACT RULES:
 - Do not impose a fixed or target word count on richer stories.
 - Stop when the relevant evidence has been adequately covered.
 - Never add filler, repetition or unsupported detail to increase length.
-- Use the available supporting facts naturally. If 3 or more locked facts are available, develop the story across the intro and sections so the article explains the distinct supported details rather than reducing the story to one or two sentences.
-- For 3-4 facts, normally use at least 2 sections when the material supports it.
-- For richer evidence, use as many sections as are genuinely useful for presenting distinct supported facts and developments clearly.
-- Do not create sections merely to increase article length.
+- Use the available supporting facts naturally. If 3 or more locked facts are available,
+  develop the story across multiple natural paragraphs so the article explains the distinct
+  details rather than reducing the story to one or two sentences.
+- Use multiple paragraphs when multiple distinct facts are supported.
+- Every paragraph must contribute a distinct, evidence-supported development.
+- Do NOT restate a fact already covered in another paragraph merely with different wording.
+- Do NOT turn separate facts into a stronger claim than the evidence supports.
+- Combine facts only when their relationship is explicitly supported; never infer chronology,
+  causality, agreement, intention, expectation, likelihood, or outcome from proximity alone.
+- Preserve certainty exactly: "reported", "interested", "close to", "expected", "agreed",
+  "rejected", "scheduled", and "confirmed" are not interchangeable.
+- When sources describe different stages or competing claims, present them as separate
+  factual developments rather than resolving the difference yourself.
+- Source names should not become the subject of paragraphs. Mention a source only when
+  attribution itself is materially relevant to the story.
+- If a fact is already represented clearly, do not repeat it merely to mention another source.
+- Do not split or create paragraphs merely to increase article length.
 - If the evidence genuinely contains only one or two facts, a shorter article is acceptable.
+Before returning the JSON, silently perform an evidence-entailment pass:
+- For every sentence, identify the locked fact(s) that directly support that exact claim.
+- If no locked fact directly supports it, remove or rewrite it.
+- If wording is more certain, specific, or causal than the evidence, weaken it to the exact
+  supported level.
+- Prefer omission over an attractive but unsupported inference.
+
 Return ONLY the required JSON.
 
 LOCKED EVIDENCE:
@@ -892,10 +965,13 @@ LOCKED EVIDENCE:
 
 
 def _generate_article(evidence):
+    fact_count = len(evidence.get("facts", [])) if isinstance(evidence, dict) else 0
+    # Give richer evidence a larger output budget without imposing a target length.
+    dynamic_tokens = max(ARTICLE_TOKENS, min(1400, 420 + fact_count * 80))
     article = _call(
         _article_prompt(evidence),
         temperature=0.04,
-        num_predict=ARTICLE_TOKENS,
+        num_predict=dynamic_tokens,
         num_thread=NUM_THREADS,
         response_format=_ARTICLE_FORMAT,
     )
@@ -956,6 +1032,13 @@ Flag only material factual problems:
 - unsupported quote/attribution
 - unsupported causal claim
 - mixing a separate event
+- materially incomplete coverage: a relevant, non-redundant locked fact is omitted
+
+COVERAGE RULE:
+- Treat the LOCKED EVIDENCE facts as the complete verified evidence inventory for this article.
+- The article does not need to repeat every fact verbatim, but every materially relevant, non-redundant fact should be represented in the article.
+- If a locked fact is genuinely relevant to the selected event and is absent from the article, report it as a HIGH error with type "omitted_relevant_fact".
+- Do not flag a fact that is redundant with another covered fact or not useful to the reader.
 
 Do NOT require identical wording.
 Do NOT use outside knowledge.
@@ -1040,6 +1123,7 @@ Repair this article using ONLY the LOCKED EVIDENCE and AUDIT.
 
 Rules:
 - Fix only the listed factual problems.
+- For omitted_relevant_fact issues, add the missing fact using ONLY the cited LOCKED EVIDENCE.
 - Delete unsupported material instead of inventing a replacement.
 - If an entity attribute conflicts with LOCKED EVIDENCE, delete the incorrect attribute or
   replace it only with the exact supported attribute from LOCKED EVIDENCE.
@@ -1079,24 +1163,16 @@ def _sanitize_article(article):
         "title": article["title"].strip(),
         "description": article["description"].strip(),
         "h1": article["h1"].strip(),
-        "intro": article["intro"].strip(),
-        "sections": [],
+        "paragraphs": [],
     }
 
-    for section in article["sections"]:
-        title = section["title"].strip()
-        text = section["text"].strip()
+    for paragraph in article["paragraphs"]:
+        text = paragraph.strip()
+        if text:
+            clean["paragraphs"].append(text)
 
-        if not title or not text:
-            continue
-
-        clean["sections"].append({
-            "title": title,
-            "text": text,
-        })
-
-    if not clean["sections"]:
-        raise ValueError("Article has no usable sections.")
+    if not clean["paragraphs"]:
+        raise ValueError("Article has no usable paragraphs.")
 
     return clean
 

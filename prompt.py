@@ -62,14 +62,43 @@ SOURCE-LOCKED FACTUAL RULES:
 - When several distinct verified facts are available, prefer covering an additional
   unused fact over adding another sentence that merely explains or restates a fact
   already covered.
-- Organise the available facts across the introduction and sections so that each
-  part contributes new information. Do not repeat the introduction in a section.
 - Do not compress a well-supported story into a minimal summary when the sources
   contain additional relevant facts.
 - If the sources genuinely contain insufficient information, write a shorter article.
 - Never add filler, speculation or unsupported detail to reach a target length.
 - Never make an article longer by inferring background, motives, causes, likely
   consequences, missing details or contextual facts that are not explicitly supported.
+
+EVIDENCE UTILIZATION — MANDATORY:
+- The article must make substantive use of the available verified evidence, not merely
+  acknowledge the main fact.
+- Before drafting, internally build a complete inventory of the distinct verified facts,
+  developments, dates, results, actions, reactions, consequences and useful context
+  contained in the supplied sources that belong to the MAIN TOPIC.
+- Treat that inventory as a coverage checklist. Do not stop drafting after covering only
+  the headline-level fact when additional relevant verified facts remain unused.
+- Cover every relevant distinct verified fact that materially improves the reader's
+  understanding of the story, unless it is redundant with a fact already covered.
+- When several relevant facts are available, the default is to USE them in the article.
+  Do not discard a useful verified fact merely because the article can already be
+  understood from the main fact.
+- Article length must be determined by the amount of useful verified evidence available.
+  More relevant evidence should normally produce a more complete article; less evidence
+  should produce a shorter article.
+- Never confuse "the story can be understood" with "the available evidence has been
+  adequately used." A minimally sufficient summary is not the goal when the sources
+  support materially richer coverage.
+- Do not stop after one or two paragraphs simply because the main event has been stated.
+  Continue while additional relevant, non-redundant verified facts remain.
+- Do not pad the article to satisfy this rule. Coverage means reporting additional
+  verified information, not explaining, paraphrasing or elaborating facts already stated.
+- If a supplied source contains a concrete relevant fact that is not present elsewhere,
+  prefer incorporating that fact over writing generic context or source-description text.
+- Before returning the article, internally compare the final paragraphs against the
+  complete evidence inventory and check for important relevant facts that were omitted.
+  Add any omitted relevant facts that can be stated directly and safely.
+- The final article should represent a faithful synthesis of the useful evidence available
+  across the supplied sources, not a minimal summary of the most obvious fact.
 
 CLAIM DISCIPLINE — STRICT SOURCE GROUNDING:
 - Never strengthen, exaggerate, upgrade, or embellish a factual claim from the source.
@@ -97,7 +126,6 @@ CONCRETE STORY:
 - Ignore unrelated or weakly related stories, even if they appear under the
   same Google Trends topic.
 - Do not combine independent events into one article.
-- Every section must concern the same main event or development.
 
 ============================================================
 PUBLICATION DATE != EVENT DATE - MANDATORY RULE
@@ -223,30 +251,31 @@ STYLE:
 - No unsupported editorial conclusions.
 - Every sentence should add a concrete, source-supported fact or necessary
   attribution.
-- Expand the article when the supplied sources contain additional relevant
-  verified facts; do not omit useful facts merely to keep the article short.
+- Every paragraph must contribute a new verified detail, development, consequence,
+  reaction, or piece of context. If no new information is available, do not create
+  another paragraph.
+- Use the available evidence fully: when additional relevant verified facts remain
+  unused, continue the article rather than stopping at a minimally sufficient summary.
+- Expand the article only by adding distinct verified information, never by elaborating
+  or restating facts already covered.
 - Expansion means broader coverage of verified facts, not greater elaboration of
   facts already stated. If no additional verified fact remains, stop rather than
   inventing detail to create more depth.
-- Avoid repeating the same factual point in different wording. The introduction
-  should establish the story, while sections should add distinct information,
-  context or developments supported by the sources.
+- Avoid repeating the same factual point in different wording.
+- Write ONE coherent news article as a natural sequence of verified paragraphs.
+- Do NOT create section headings, subheadings, labels or artificial article sections.
+- Do not create a heading merely to introduce or label a fact.
 - Use natural transitions without introducing new information.
 
 STRUCTURE:
-Write one concise lead paragraph that tells the reader the essential new development immediately. Do not repeat the topic wording mechanically. The introduction should establish the story, not retell it.
-
-Sections are optional. Create a section only when the evidence contains a distinct verified fact, development, or detail that adds genuinely new information beyond the introduction. Do not create a section merely to satisfy the article structure.
-
-Use 1-5 sections only when genuinely useful. Use fewer sections when the evidence is limited. If no additional distinct information remains, return an empty sections array.
-
-Each section must add genuinely new verified information. Never repeat, paraphrase or restate information already covered in the introduction or another section.
-
-When multiple distinct verified developments are available, cover them rather than collapsing them into a minimal summary. When the evidence contains only limited information, stop rather than inventing detail or padding the article.
-
-Sections may have different lengths according to the amount and importance of supported information.
-
-Brief objective conclusion with no new facts.
+- The article body consists entirely of natural paragraphs.
+- Do not create a separate introduction or lead paragraph.
+- Do not create section headings or an artificial conclusion.
+- Paragraph count must follow the amount of distinct verified information available.
+- If the evidence supports only one useful fact, write one concise paragraph.
+- If multiple distinct verified facts are supported, use multiple natural paragraphs.
+- Never split one fact into multiple paragraphs merely to increase length.
+- Never create a paragraph merely to satisfy a structural target.
 
 FINAL FACTUAL SELF-CHECK:
 Before returning the result:
@@ -255,24 +284,26 @@ Before returning the result:
 3. Check every number, date, time, status and result against the sources.
 4. For every important date, distinguish publication/update date from event date.
 5. Remove any sentence that is unsupported, inferred, speculative or doubtful.
-6. Do not add new facts during the introduction, transitions, sections or
-   conclusion.
+6. Do not add new facts during transitions or paragraphs.
 7. If evidence is genuinely limited, shorten the article instead of adding
    information.
 8. If the evidence contains additional relevant verified facts, make sure they
    are not unnecessarily omitted simply because the article can be written
    more briefly.
-9. Check that the introduction and sections are complementary rather than
-   repetitive, and that distinct supported developments have been covered.
+- Compare the article against the complete verified evidence inventory. If a
+  relevant, non-redundant verified fact is omitted, add it before returning.
+- Check that the article is not merely a minimal summary when the supplied evidence
+  supports materially richer coverage.
+9. Check that all paragraphs are complementary rather than repetitive, and that
+   distinct supported developments have been covered.
 
 Return ONLY valid JSON:
 {{
   "title": "",
   "description": "",
   "h1": "",
-  "intro": "",
-  "sections": [
-    {{"title": "", "text": ""}}
+  "paragraphs": [
+    ""
   ]
 }}
 """

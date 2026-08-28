@@ -27,8 +27,8 @@ def extract_article(url):
         pass
     return ""
 
-def filter_similar_articles(articles):
-    """Deduplicate only near-identical results; never cluster independent stories."""
+def filter_similar_articles(articles, max_results=12):
+    """Deduplicate near-identical headlines while preserving independent reports."""
     seen = set()
     result = []
     for article in articles:
@@ -38,9 +38,84 @@ def filter_similar_articles(articles):
             continue
         seen.add(key)
         result.append(article)
-        if len(result) >= 12:
+        if len(result) >= max(1, int(max_results)):
             break
     return result
+
+
+def fetch_news_multi(queries, per_query_limit=8, max_results=18):
+    """Fetch and merge several tightly scoped Google News searches.
+
+    RSS entries are deduplicated before article extraction so query expansion
+    increases source coverage without multiplying page downloads for duplicates.
+    """
+    clean_queries = []
+    seen_queries = set()
+    for query in queries or []:
+        q = " ".join(str(query or "").split()).strip()
+        key = q.casefold()
+        if not q or key in seen_queries:
+            continue
+        seen_queries.add(key)
+        clean_queries.append(q)
+
+    if not clean_queries:
+        return []
+
+    candidates = []
+    seen_links = set()
+    seen_titles = set()
+
+    for query in clean_queries:
+        url = (
+            "https://news.google.com/rss/search?"
+            f"q={quote_plus(query + ' when:7d')}"
+            "&hl=en-GB&gl=GB&ceid=GB:en"
+        )
+        feed = feedparser.parse(url)
+        for item in feed.entries[:max(1, int(per_query_limit))]:
+            title = clean(item.get("title"))
+            link = clean(item.get("link"))
+            title_key = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
+            link_key = link.casefold()
+            if not title_key or title_key in seen_titles or (link_key and link_key in seen_links):
+                continue
+            seen_titles.add(title_key)
+            if link_key:
+                seen_links.add(link_key)
+
+            source = ""
+            if hasattr(item, "source"):
+                source = clean(item.source.get("title"))
+            source_href = ""
+            if hasattr(item, "source"):
+                source_href = clean(item.source.get("href"))
+
+            candidates.append({
+                "title": title,
+                "summary": clean(item.get("summary")),
+                "source": source,
+                "source_href": source_href,
+                "link": link,
+                "published": clean(item.get("published")),
+            })
+
+            if len(candidates) >= max(1, int(max_results)):
+                break
+        if len(candidates) >= max(1, int(max_results)):
+            break
+
+    if not candidates:
+        return []
+
+    with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as executor:
+        contents = list(executor.map(lambda a: extract_article(a["link"]), candidates))
+
+    for article, content in zip(candidates, contents):
+        article["content"] = content
+
+    return filter_similar_articles(candidates, max_results=max_results)
+
 
 def fetch_news(query, limit=20):
     url = (
