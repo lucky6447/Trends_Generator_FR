@@ -108,9 +108,12 @@ def _select_evidence_story_sources(news, topic, min_sources=3, max_sources=12):
     remains untouched for Fact Guard and article generation.
     """
     items = list(news or [])
-    if len(items) <= max_sources:
-        return items
+    if not items:
+        return []
 
+    # Always run the deterministic story-selection step.
+    # Even exactly 12 retrieved sources can contain multiple stories
+    # when the topic is ambiguous (for example, "black panther").
     topic_words = _evidence_words(topic)
     profiles = []
     for idx, item in enumerate(items):
