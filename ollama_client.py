@@ -899,63 +899,59 @@ Write a clear TrendCurrent news article in {LANGUAGE}.
 LANGUAGE LOCK:
 - The output language is {LANGUAGE}.
 - TITLE, DESCRIPTION, H1 and EVERY paragraph MUST be written in {LANGUAGE}.
-- The LOCKED EVIDENCE may be in another language. IGNORE its language and translate/paraphrase the supported facts into {LANGUAGE}.
-- Do not output English wording merely because the source evidence is in English.
-- Proper names, official names, team names, company names and other names may remain in their original form.
+- The LOCKED EVIDENCE may be in another language. Translate/paraphrase only supported facts.
+- Proper names and official names may remain in their original form.
 
-Use ONLY the LOCKED EVIDENCE below.
+SOURCE-LOCKED FACTUAL RULES:
+- Use ONLY the LOCKED EVIDENCE below. It is the complete and closed factual universe.
+- Do not use outside knowledge, memory, source headlines, publication metadata or topic wording as evidence.
+- Every material sentence must be directly supported by the locked evidence. If a detail is not explicit, OMIT it.
+- Never invent, infer, strengthen or embellish facts.
 
-BALANCED FACT RULES:
-- Stay on the one locked event.
-- Treat every LOCKED EVIDENCE fact as belonging to the same event; never merge it with another event merely because names, topics or keywords overlap.
-- You may naturally paraphrase supported facts.
-- You may combine facts when they clearly describe the same event.
-- Do not add outside facts.
-- Do not invent dates, numbers, roles, locations, causes or motives.
-- ENTITY ATTRIBUTE LOCK: A person's role, position, job title or other identity-defining
-  attribute may be stated only when that attribute is explicitly present in LOCKED EVIDENCE.
-  If it is absent from LOCKED EVIDENCE, do not guess it. If LOCKED EVIDENCE explicitly
-  gives a different attribute, never substitute another one.
-- ENTITY-TO-ENTITY LOCK: Never transfer a role, organization type, action, status or relationship
-  from one named entity to another. In particular, do not infer that a person or fictional character
-  is a company/production house/organization because a nearby sentence names a production company.
-- Keep each factual attribute attached only to the exact entity for which the evidence states it.
-- Preserve uncertainty and status.
-- Do not turn a report into a confirmed fact.
-- Do not use unsupported quotes.
-- Do not add generic filler or speculation.
-- Titles and descriptions must also stay factual.
-- Let article length be determined by the amount and richness of the locked evidence.
-- For limited evidence, keep the article concise and complete.
-- For richer evidence, develop the article enough to cover the distinct relevant facts,
-  developments and factual dimensions available in the locked evidence.
-- Do not impose a fixed or target word count on richer stories.
-- Stop when the relevant evidence has been adequately covered.
-- Never add filler, repetition or unsupported detail to increase length.
-- Use the available supporting facts naturally. If 3 or more locked facts are available,
-  develop the story across multiple natural paragraphs so the article explains the distinct
-  details rather than reducing the story to one or two sentences.
-- Use multiple paragraphs when multiple distinct facts are supported.
-- Every paragraph must contribute a distinct, evidence-supported development.
-- Do NOT restate a fact already covered in another paragraph merely with different wording.
-- Do NOT turn separate facts into a stronger claim than the evidence supports.
-- Combine facts only when their relationship is explicitly supported; never infer chronology,
-  causality, agreement, intention, expectation, likelihood, or outcome from proximity alone.
-- Preserve certainty exactly: "reported", "interested", "close to", "expected", "agreed",
-  "rejected", "scheduled", and "confirmed" are not interchangeable.
-- When sources describe different stages or competing claims, present them as separate
-  factual developments rather than resolving the difference yourself.
-- Source names should not become the subject of paragraphs. Mention a source only when
-  attribution itself is materially relevant to the story.
-- If a fact is already represented clearly, do not repeat it merely to mention another source.
-- Do not split or create paragraphs merely to increase article length.
-- If the evidence genuinely contains only one or two facts, a shorter article is acceptable.
-Before returning the JSON, silently perform an evidence-entailment pass:
-- For every sentence, identify the locked fact(s) that directly support that exact claim.
-- If no locked fact directly supports it, remove or rewrite it.
-- If wording is more certain, specific, or causal than the evidence, weaken it to the exact
-  supported level.
-- Prefer omission over an attractive but unsupported inference.
+ENTITY AND ATTRIBUTION LOCK:
+- Never infer or transfer a person's role, title, position, employer, nationality, relationship or responsibility.
+- Keep every role, action, status and relationship attached only to the exact entity supported by evidence.
+- Never transfer an action from an organization to an individual or from one individual to another.
+- Never add a location unless the evidence explicitly establishes it for that exact event.
+- Never add an activity or characterization such as romantic, controversial, major or historic unless explicitly supported.
+- Attribute announcements, decisions, prices, actions and statements only to the exact person or organization named in the evidence.
+
+EVENT AND TIME LOCK:
+- Preserve the exact event status: scheduled != completed; announced != implemented; proposed/intended/predicted != completed; reported != confirmed.
+- Never describe a historical event as current or recent unless the evidence explicitly supports that status.
+- Publication/update date is NOT the event date. Never infer event date, weekday, timing or recency from publication metadata.
+- If the evidence does not establish an exact event date, do not invent one.
+- If multiple events from different dates are present, preserve chronology and do not merge them into one current event.
+- Do not use recently, today, currently, this week or latest unless explicitly supported by evidence.
+
+NUMBERS AND CLAIM STRENGTH:
+- Preserve names, numbers, prices, dates, scores, percentages and certainty exactly.
+- Never calculate or derive a new factual number.
+- Never upgrade a weaker claim into a stronger claim.
+- If evidence conflicts, do not guess or reconcile it; use only uncontested information or state the material conflict.
+
+COVERAGE:
+- Use the distinct, relevant verified facts available in the locked evidence.
+- Do not stop after only the headline-level fact when additional relevant evidence exists.
+- Prefer another distinct verified fact over repeating an existing one.
+- Every paragraph must add a distinct supported fact or development.
+- Do not pad, speculate, manufacture context or repeat facts to increase length.
+- Article length follows the amount of useful verified evidence.
+
+STYLE:
+- Natural, fluent {LANGUAGE}; professional, clear, objective and precise.
+- No clickbait, speculation, filler or unsupported conclusions.
+- Do not mention publisher/source names unless attribution itself is an essential verified fact.
+- Write ONE coherent article about ONE concrete story.
+
+HEADLINE:
+- Maximum 10 words AND 65 characters.
+- TITLE and H1 must be identical.
+- Use only the core verified entity and core verified development.
+- Do not add facts not present in locked evidence.
+
+FINAL ENTITLEMENT CHECK:
+Before returning JSON, silently check every sentence: identify the exact locked fact supporting it; verify every person, role, action, location and attribution; verify event date/status separately from publication date; and remove anything unsupported, inferred, stronger, newer or more specific than the evidence.
 
 Return ONLY the required JSON.
 
