@@ -121,6 +121,12 @@
     <priority>0.6</priority>
   </url>
   <url>
+    <loc>https://fr.trendcurrent.today/trends/todibo</loc>
+    <lastmod>2026-08-30</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
     <loc>https://fr.trendcurrent.today/trends/suisse</loc>
     <lastmod>2026-08-30</lastmod>
     <changefreq>monthly</changefreq>
