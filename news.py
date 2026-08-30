@@ -3,9 +3,29 @@ import feedparser
 import requests
 import trafilatura
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+MAX_NEWS_AGE_HOURS = 6.0
+
+def _age_hours(published):
+    if not published:
+        return None
+    try:
+        dt = parsedate_to_datetime(str(published))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 3600.0)
+    except Exception:
+        return None
+
+def _is_fresh_news(published):
+    age = _age_hours(published)
+    return age is not None and age <= MAX_NEWS_AGE_HOURS
+
 
 def clean(value):
     if not value:
@@ -69,7 +89,7 @@ def fetch_news_multi(queries, per_query_limit=8, max_results=18):
     for query in clean_queries:
         url = (
             "https://news.google.com/rss/search?"
-            f"q={quote_plus(query + ' when:7d')}"
+            f"q={quote_plus(query + ' when:6h')}"
             "&hl=en-GB&gl=GB&ceid=GB:en"
         )
         feed = feedparser.parse(url)
@@ -120,7 +140,7 @@ def fetch_news_multi(queries, per_query_limit=8, max_results=18):
 def fetch_news(query, limit=20):
     url = (
         "https://news.google.com/rss/search?"
-        f"q={quote_plus(query + ' when:7d')}"
+        f"q={quote_plus(query + ' when:6h')}"
         "&hl=en-GB&gl=GB&ceid=GB:en"
     )
     feed = feedparser.parse(url)

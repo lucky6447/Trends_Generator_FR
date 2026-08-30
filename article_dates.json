@@ -930,5 +930,9 @@
   "football-club-des-girondins-de-bordeaux": {
     "published_at": "2026-08-30 07:38",
     "order": -233
+  },
+  "suisse": {
+    "published_at": "2026-08-30 10:14",
+    "order": -234
   }
 }
