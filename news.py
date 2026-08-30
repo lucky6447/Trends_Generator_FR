@@ -90,12 +90,15 @@ def fetch_news_multi(queries, per_query_limit=8, max_results=18):
         url = (
             "https://news.google.com/rss/search?"
             f"q={quote_plus(query + ' when:6h')}"
-            "&hl=en-GB&gl=GB&ceid=GB:en"
+            "&hl=fr-FR&gl=FR&ceid=FR:fr"
         )
         feed = feedparser.parse(url)
         for item in feed.entries[:max(1, int(per_query_limit))]:
             title = clean(item.get("title"))
             link = clean(item.get("link"))
+            published = clean(item.get("published"))
+            if not _is_fresh_news(published):
+                continue
             title_key = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
             link_key = link.casefold()
             if not title_key or title_key in seen_titles or (link_key and link_key in seen_links):
@@ -117,7 +120,7 @@ def fetch_news_multi(queries, per_query_limit=8, max_results=18):
                 "source": source,
                 "source_href": source_href,
                 "link": link,
-                "published": clean(item.get("published")),
+                "published": published,
             })
 
             if len(candidates) >= max(1, int(max_results)):
@@ -141,13 +144,16 @@ def fetch_news(query, limit=20):
     url = (
         "https://news.google.com/rss/search?"
         f"q={quote_plus(query + ' when:6h')}"
-        "&hl=en-GB&gl=GB&ceid=GB:en"
+        "&hl=fr-FR&gl=FR&ceid=FR:fr"
     )
     feed = feedparser.parse(url)
     items = feed.entries[:limit]
 
     prepared = []
     for item in items:
+        published = clean(item.get("published"))
+        if not _is_fresh_news(published):
+            continue
         source = ""
         if hasattr(item, "source"):
             source = clean(item.source.get("title"))
@@ -161,7 +167,7 @@ def fetch_news(query, limit=20):
             "source": source,
             "source_href": source_href,
             "link": clean(item.get("link")),
-            "published": clean(item.get("published")),
+            "published": published,
         })
 
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(prepared)))) as executor:
