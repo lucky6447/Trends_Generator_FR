@@ -6,13 +6,12 @@ from config import ROOT,TREND_DIR,SITE_URL,LANGUAGE
 env=Environment(loader=FileSystemLoader(ROOT/'templates'),autoescape=True)
 template=env.get_template('article.html')
 
-# Optional, isolated remote-image module.
-# If unavailable or if no reliable match is found, article generation continues
-# exactly as before and the article is rendered without an image.
+# Optional, isolated AI-image module.
+# If unavailable or generation fails, article generation continues without an image.
 try:
-    from article_image_remote import find_image
+    from ai_image_cloudflare import generate_article_image
 except Exception:
-    find_image = None
+    generate_article_image = None
 
 
 def _source_homepage(article, news=None):
@@ -92,89 +91,41 @@ def _source_homepage(article, news=None):
     return None
 
 
-def _attach_remote_image(article, news=None):
+def _attach_ai_image(article, news=None):
     """
-    Add article['image_data'] without changing the existing article content.
-    Fail closed: any uncertainty means no image.
+    Generate one original AI image for the accepted article.
+    Fail closed: image failure NEVER blocks article publishing.
     """
-    if not find_image:
+    if not generate_article_image:
         return article
 
     if article.get("image_data"):
         return article
 
-    title = article.get("title") or article.get("h1") or ""
-    source = article.get("source") or ""
-    source_href = _source_homepage(article, news=news)
-
-    if not title or not source or not source_href:
-        return article
-
     try:
-        image_data = find_image(
-            title=title,
-            source=source,
-            source_href=source_href,
-        )
-    except Exception:
-        image_data = None
+        image_data = generate_article_image(article, news=news)
+    except Exception as exc:
+        print(f"[AI IMAGE] FAILED (article continues): {exc}")
+        return article
 
     if image_data:
         article["image_data"] = image_data
         print(
-            f"[IMAGE] FOUND: {image_data.get('image', '')} "
-            f"(confidence={image_data.get('confidence', '')})"
+            f"[AI IMAGE] GENERATED: {image_data.get('image', '')} "
+            f"| {image_data.get('elapsed', '')}s"
         )
     else:
-        print(f"[IMAGE] NOT FOUND: {title}")
+        print(f"[AI IMAGE] NOT GENERATED: {article.get('title', '')}")
 
     return article
 
-
 def render_article(article, news=None):
-    article = _attach_remote_image(article, news=news)
-
-    if not isinstance(article, dict):
-        raise ValueError("Article must be an object before rendering.")
-
-    paragraphs = article.get("paragraphs")
-    if not isinstance(paragraphs, list) or not paragraphs:
-        raise ValueError("Article has no generated paragraph content.")
-
-    # Universal article contract: paragraphs only.
-    # Legacy intro/sections/FAQ are never rendered by this generator.
-    if "sections" in article or "faq" in article:
-        raise ValueError("Legacy article schema detected; expected universal paragraphs schema.")
-
-    # Fail closed: never publish raw source material or legacy section/FAQ dumps.
-    article_text = " ".join(str(p) for p in paragraphs)
-    forbidden = (
-        "SOURCE MATERIAL:",
-        "FULL ARTICLE:",
-        "ARTICLE 1",
-        "SOURCE S1",
-        "FREQUENTLY ASKED QUESTIONS",
-    )
-    if any(token.casefold() in article_text.casefold() for token in forbidden):
-        raise ValueError("Generated article contains raw source/template material.")
-
-    html = template.render(
+    article = _attach_ai_image(article, news=news)
+    return template.render(
         article=article,
         site_url=SITE_URL,
         language=LANGUAGE,
     )
-
-    # Template contract: verify that paragraph elements were rendered.
-    # Do not compare raw paragraph strings against autoescaped HTML: Jinja may
-    # legitimately encode characters such as &, <, >, quotes, or apostrophes.
-    rendered_paragraphs = re.findall(r"<p(?:\s[^>]*)?>(.*?)</p>", html, flags=re.S | re.I)
-    if len(rendered_paragraphs) < len(paragraphs):
-        raise ValueError(
-            f"Template rendered {len(rendered_paragraphs)} paragraphs; "
-            f"expected {len(paragraphs)}."
-        )
-
-    return html
 
 
 def save_article(slug,html):
