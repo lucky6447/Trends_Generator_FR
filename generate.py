@@ -1,4 +1,4 @@
-print("[TrendCurrent PIPELINE] universal-fact-lock-v2.4-evidence-coverage-stable + story-coherence-v1.1")
+print("[TrendCurrent PIPELINE] universal-fact-lock-v2.4-evidence-gate")
 import re
 import os
 import subprocess
@@ -19,7 +19,6 @@ from html_generator import render_article, save_article
 from processed import load_processed, add_processed
 from index_generator import update_all
 from topic_scorer import rank_trends, score_with_news, select_final_candidates
-from story_coherence import filter_evidence as filter_story_coherence
 
 REQUIRED_FIELDS = ["title", "description", "h1", "paragraphs"]
 
@@ -372,10 +371,7 @@ def _repair_headline(article, trend):
     """Repair only title/H1 when the model violates the editorial headline policy."""
     current_title = str(article.get("title", "")).strip()
     current_h1 = str(article.get("h1", "")).strip()
-    topic = str(
-        trend.get("_story_anchor")
-        or trend.get("title", "")
-    ).strip()
+    topic = str(trend.get("title", "")).strip()
 
     source_titles = [
         str(x.get("title", "")).strip()
@@ -521,10 +517,6 @@ def _enrich_evidence_for_generation(evidence, trend):
     if topic:
         enriched["selected_topic"] = topic
 
-    story_anchor = str(enriched.get("story_anchor", "")).strip()
-    if story_anchor:
-        enriched["selected_story_anchor"] = story_anchor
-
     # IMPORTANT: Source/publisher attribution is not part of the article narrative.
     # The model must synthesize the locked facts into a continuous news story.
     # Source names/headlines may be used internally for provenance, but must not
@@ -564,7 +556,7 @@ def _enrich_evidence_for_generation(evidence, trend):
     return enriched
 
 
-def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max_attempts=2, prelocked_evidence=None):
+def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max_attempts=1, prelocked_evidence=None):
     last = None
 
     for i in range(max_attempts):
@@ -769,11 +761,6 @@ def main():
                 # corroboration. Never discard the seed just because Google
                 # News cannot find the publisher headline again.
                 seed = dict(trend)
-                # Preserve the concrete discovery story selected upstream.
-                # Story Coherence uses this as a locked story identity hint;
-                # it must not replace it with another entity/story.
-                if seed.get("title"):
-                    trend["_story_anchor_hint"] = str(seed.get("title")).strip()
                 if not seed.get("content") and seed.get("link"):
                     try:
                         seed["content"] = extract_article(seed["link"])
@@ -885,39 +872,26 @@ def main():
                     f"source_chars={len(evidence_source)}"
                 )
                 evidence_lock = extract_evidence(evidence_source)
-
-                # --------------------------------------------------------
-                # STORY COHERENCE BOUNDARY
-                # --------------------------------------------------------
-                # Evidence extraction is provenance-safe but may contain
-                # multiple independent stories when the discovery topic is
-                # ambiguous (for example a shared surname/entity). Apply one
-                # isolated editorial coherence gate before the writer sees
-                # the evidence. This does not alter discovery, scoring,
-                # freshness, evidence extraction, evidence density or
-                # Fact Guard.
-                evidence_lock = filter_story_coherence(
-                    evidence_lock,
-                    keyword,
-                    news,
-                    story_anchor_hint=trend.get("_story_anchor_hint", ""),
-                )
-
                 evidence_lock = _enrich_evidence_for_generation(
                     evidence_lock,
                     trend,
                 )
-                if evidence_lock.get("story_anchor"):
-                    trend["_story_anchor"] = evidence_lock["story_anchor"]
                 trend["_evidence_lock"] = evidence_lock
                 print(
                     f"[TOPIC FILTER] EVIDENCE USABILITY PASS | "
                     f"facts={len(evidence_lock.get('facts', []))} | {keyword}"
                 )
             except Exception as evidence_error:
+                # Terminal candidate rejection: this topic has no usable
+                # source-locked evidence. It consumes ZERO article slots and
+                # the pipeline immediately falls through to the next ranked
+                # candidate. Never retry an already-rejected evidence
+                # candidate or add another repair layer here.
+                trend["_production_status"] = "REJECT"
+                trend["_production_reject_reason"] = str(evidence_error)
                 print(
-                    f"[TOPIC FILTER] EVIDENCE USABILITY DROP | "
-                    f"{keyword} | {evidence_error}"
+                    f"[TOPIC FILTER] REJECT | article_slot=0 | "
+                    f"{keyword} | evidence={evidence_error}"
                 )
                 continue
 
@@ -926,6 +900,7 @@ def main():
                 fact_guard_source,
                 reference_date,
                 trend,
+                max_attempts=1,
                 prelocked_evidence=evidence_lock,
             )
 
@@ -940,7 +915,15 @@ def main():
             print(f"OK -> {slug}.html")
 
         except Exception as e:
-            print(f"ERROR: {keyword}: {e}")
+            # Any candidate that fails after evidence lock is terminal for this
+            # run. Do not retry the same expensive candidate; move immediately
+            # to the next ranked topic. The article counter remains unchanged.
+            trend["_production_status"] = "REJECT"
+            trend["_production_reject_reason"] = str(e)
+            print(
+                f"[GENERATION] REJECT | article_slot=0 | "
+                f"{keyword} | {e}"
+            )
 
     try:
         update_all()
