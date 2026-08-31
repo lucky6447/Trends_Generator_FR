@@ -149,7 +149,7 @@ footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1p
 <style id="tc-date-navigation-css">
 .tc-date-navigation{margin:0 0 28px;padding:14px 16px;background:#0f1b2d;border:1px solid rgba(75,130,255,.2);border-radius:16px;box-shadow:0 12px 30px rgba(0,0,0,.22)}
 .tc-date-navigation-title{margin:0 0 10px;color:#f3f6ff;font-size:14px;font-weight:700}
-.tc-date-navigation-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:2px 2px 5px}
+.tc-date-navigation-row{display:flex;flex-wrap:nowrap;align-items:center;gap:8px;padding:2px 2px 5px;min-width:0}
 .tc-date-navigation-scroll{display:flex;align-items:center;gap:8px;min-width:0;flex:1 1 auto;overflow-x:auto;overflow-y:hidden;scrollbar-width:none;-ms-overflow-style:none;-webkit-overflow-scrolling:touch}
 .tc-date-navigation-scroll::-webkit-scrollbar{display:none}
 .tc-date-link{flex:0 0 auto;display:inline-flex;align-items:center;gap:7px;min-height:42px;padding:0 12px;border:1px solid rgba(59,130,246,.25);border-radius:10px;background:#101b2d;color:#c9d6ee;text-decoration:none;font-size:14px;font-weight:600;white-space:nowrap;transition:.2s}
@@ -416,9 +416,16 @@ footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1p
 </section>
 
 <div class="container">
-<div class="tc-date-navigation" aria-label="Articles par date"><div class="tc-date-navigation-title">Articles par date</div><div class="tc-date-navigation-row"><div class="tc-date-navigation-scroll"><a class="tc-date-link" href="/date/2026-08-31/"><span>Aujourd’hui</span><span class="tc-date-count">7</span></a><a class="tc-date-link" href="/date/2026-08-30/"><span>Hier</span><span class="tc-date-count">13</span></a><a class="tc-date-link" href="/date/2026-08-29/"><span>29 août 2026</span><span class="tc-date-count">6</span></a><a class="tc-date-link" href="/date/2026-08-28/"><span>28 août 2026</span><span class="tc-date-count">6</span></a><a class="tc-date-link" href="/date/2026-08-27/"><span>27 août 2026</span><span class="tc-date-count">10</span></a><a class="tc-date-link" href="/date/2026-08-26/"><span>26 août 2026</span><span class="tc-date-count">7</span></a><a class="tc-date-link" href="/date/2026-08-25/"><span>25 août 2026</span><span class="tc-date-count">7</span></a></div><details class="tc-date-more"><summary>Plus de dates</summary><div class="tc-date-more-list"><a class="tc-date-link" href="/date/2026-08-24/"><span>24 août 2026</span><span class="tc-date-count">8</span></a><a class="tc-date-link" href="/date/2026-08-23/"><span>23 août 2026</span><span class="tc-date-count">7</span></a><a class="tc-date-link" href="/date/2026-08-22/"><span>22 août 2026</span><span class="tc-date-count">7</span></a><a class="tc-date-link" href="/date/2026-08-21/"><span>21 août 2026</span><span class="tc-date-count">1</span></a><a class="tc-date-link" href="/date/2026-08-20/"><span>20 août 2026</span><span class="tc-date-count">4</span></a><a class="tc-date-link" href="/date/2026-08-19/"><span>19 août 2026</span><span class="tc-date-count">10</span></a><a class="tc-date-link" href="/date/2026-08-18/"><span>18 août 2026</span><span class="tc-date-count">8</span></a><a class="tc-date-link" href="/date/2026-08-17/"><span>17 août 2026</span><span class="tc-date-count">9</span></a><a class="tc-date-link" href="/date/2026-08-16/"><span>16 août 2026</span><span class="tc-date-count">2</span></a><a class="tc-date-link" href="/date/2026-08-15/"><span>15 août 2026</span><span class="tc-date-count">5</span></a><a class="tc-date-link" href="/date/2026-08-14/"><span>14 août 2026</span><span class="tc-date-count">4</span></a><a class="tc-date-link" href="/date/2026-08-12/"><span>12 août 2026</span><span class="tc-date-count">5</span></a><a class="tc-date-link" href="/date/2026-08-11/"><span>11 août 2026</span><span class="tc-date-count">121</span></a></div></details></div></div>
+<div class="tc-date-navigation" aria-label="Articles par date"><div class="tc-date-navigation-title">Articles par date</div><div class="tc-date-navigation-row"><div class="tc-date-navigation-scroll"><a class="tc-date-link" href="/date/2026-08-31/"><span>Aujourd’hui</span><span class="tc-date-count">8</span></a><a class="tc-date-link" href="/date/2026-08-30/"><span>Hier</span><span class="tc-date-count">13</span></a><a class="tc-date-link" href="/date/2026-08-29/"><span>29 août 2026</span><span class="tc-date-count">6</span></a><a class="tc-date-link" href="/date/2026-08-28/"><span>28 août 2026</span><span class="tc-date-count">6</span></a><a class="tc-date-link" href="/date/2026-08-27/"><span>27 août 2026</span><span class="tc-date-count">10</span></a><a class="tc-date-link" href="/date/2026-08-26/"><span>26 août 2026</span><span class="tc-date-count">7</span></a><a class="tc-date-link" href="/date/2026-08-25/"><span>25 août 2026</span><span class="tc-date-count">7</span></a></div><details class="tc-date-more"><summary>Plus de dates</summary><div class="tc-date-more-list"><a class="tc-date-link" href="/date/2026-08-24/"><span>24 août 2026</span><span class="tc-date-count">8</span></a><a class="tc-date-link" href="/date/2026-08-23/"><span>23 août 2026</span><span class="tc-date-count">7</span></a><a class="tc-date-link" href="/date/2026-08-22/"><span>22 août 2026</span><span class="tc-date-count">7</span></a><a class="tc-date-link" href="/date/2026-08-21/"><span>21 août 2026</span><span class="tc-date-count">1</span></a><a class="tc-date-link" href="/date/2026-08-20/"><span>20 août 2026</span><span class="tc-date-count">4</span></a><a class="tc-date-link" href="/date/2026-08-19/"><span>19 août 2026</span><span class="tc-date-count">10</span></a><a class="tc-date-link" href="/date/2026-08-18/"><span>18 août 2026</span><span class="tc-date-count">8</span></a><a class="tc-date-link" href="/date/2026-08-17/"><span>17 août 2026</span><span class="tc-date-count">9</span></a><a class="tc-date-link" href="/date/2026-08-16/"><span>16 août 2026</span><span class="tc-date-count">2</span></a><a class="tc-date-link" href="/date/2026-08-15/"><span>15 août 2026</span><span class="tc-date-count">5</span></a><a class="tc-date-link" href="/date/2026-08-14/"><span>14 août 2026</span><span class="tc-date-count">4</span></a><a class="tc-date-link" href="/date/2026-08-12/"><span>12 août 2026</span><span class="tc-date-count">5</span></a><a class="tc-date-link" href="/date/2026-08-11/"><span>11 août 2026</span><span class="tc-date-count">121</span></a></div></details></div></div>
 
 <div class="grid">
+
+<a class="card" href="/trends/el-nino-meteo.html">
+<div class="date">2026-08-11 08:48</div>
+<h2>El Niño : Le phénomène météorologique historique qui va bouleverser l&#39;hiver 2026-2027</h2>
+
+<span class="btn">Lire la suite →</span>
+</a>
 
 <a class="card" href="/trends/el-khoumisti.html">
 <div class="date">2026-08-11 08:48</div>
@@ -535,13 +542,6 @@ footer{padding:30px 20px 40px;text-align:center;color:var(--muted);border-top:1p
 <a class="card" href="/trends/ben-shelton.html">
 <div class="date">2026-08-11 08:48</div>
 <h2>Ben Shelton poursuit sa défense du titre à Montréal</h2>
-
-<span class="btn">Lire la suite →</span>
-</a>
-
-<a class="card" href="/trends/banques.html">
-<div class="date">2026-08-11 08:48</div>
-<h2>Les banques françaises en pleine actualité : Société Générale et BNP Paribas face à la concurrence</h2>
 
 <span class="btn">Lire la suite →</span>
 </a>

@@ -205,7 +205,7 @@ _DATE_NAV_CSS = r"""
 <style id="tc-date-navigation-css">
 .tc-date-navigation{margin:0 0 28px;padding:14px 16px;background:#0f1b2d;border:1px solid rgba(75,130,255,.2);border-radius:16px;box-shadow:0 12px 30px rgba(0,0,0,.22)}
 .tc-date-navigation-title{margin:0 0 10px;color:#f3f6ff;font-size:14px;font-weight:700}
-.tc-date-navigation-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:2px 2px 5px}
+.tc-date-navigation-row{display:flex;flex-wrap:nowrap;align-items:center;gap:8px;padding:2px 2px 5px;min-width:0}
 .tc-date-navigation-scroll{display:flex;align-items:center;gap:8px;min-width:0;flex:1 1 auto;overflow-x:auto;overflow-y:hidden;scrollbar-width:none;-ms-overflow-style:none;-webkit-overflow-scrolling:touch}
 .tc-date-navigation-scroll::-webkit-scrollbar{display:none}
 .tc-date-link{flex:0 0 auto;display:inline-flex;align-items:center;gap:7px;min-height:42px;padding:0 12px;border:1px solid rgba(59,130,246,.25);border-radius:10px;background:#101b2d;color:#c9d6ee;text-decoration:none;font-size:14px;font-weight:600;white-space:nowrap;transition:.2s}
