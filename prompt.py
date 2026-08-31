@@ -69,36 +69,50 @@ SOURCE-LOCKED FACTUAL RULES:
 - Never make an article longer by inferring background, motives, causes, likely
   consequences, missing details or contextual facts that are not explicitly supported.
 
-EVIDENCE UTILIZATION — MANDATORY:
-- The article must make substantive use of the available verified evidence, not merely
-  acknowledge the main fact.
-- Before drafting, internally build a complete inventory of the distinct verified facts,
-  developments, dates, results, actions, reactions, consequences and useful context
-  contained in the supplied sources that belong to the MAIN TOPIC.
-- Treat that inventory as a coverage checklist. Do not stop drafting after covering only
-  the headline-level fact when additional relevant verified facts remain unused.
-- Cover every relevant distinct verified fact that materially improves the reader's
-  understanding of the story, unless it is redundant with a fact already covered.
-- When several relevant facts are available, the default is to USE them in the article.
-  Do not discard a useful verified fact merely because the article can already be
-  understood from the main fact.
-- Article length must be determined by the amount of useful verified evidence available.
-  More relevant evidence should normally produce a more complete article; less evidence
-  should produce a shorter article.
-- Never confuse "the story can be understood" with "the available evidence has been
-  adequately used." A minimally sufficient summary is not the goal when the sources
-  support materially richer coverage.
-- Do not stop after one or two paragraphs simply because the main event has been stated.
-  Continue while additional relevant, non-redundant verified facts remain.
-- Do not pad the article to satisfy this rule. Coverage means reporting additional
-  verified information, not explaining, paraphrasing or elaborating facts already stated.
-- If a supplied source contains a concrete relevant fact that is not present elsewhere,
-  prefer incorporating that fact over writing generic context or source-description text.
-- Before returning the article, internally compare the final paragraphs against the
-  complete evidence inventory and check for important relevant facts that were omitted.
-  Add any omitted relevant facts that can be stated directly and safely.
-- The final article should represent a faithful synthesis of the useful evidence available
-  across the supplied sources, not a minimal summary of the most obvious fact.
+PRIMARY STORY & EVIDENCE UTILIZATION — MANDATORY:
+- First identify the ONE concrete news event or development represented by MAIN TOPIC.
+- Treat MAIN TOPIC as a STORY, not as an entity or subject category.
+- Before drafting, internally classify the supplied evidence into:
+  (A) PRIMARY STORY FACTS — facts that directly describe, confirm, develop or materially
+      explain the same event/development;
+  (B) SUPPORTING CONTEXT — facts that directly help the reader understand that same
+      event/development;
+  (C) SEPARATE STORIES — independent events involving the same person, team, company,
+      show, place, sport, country or other entity.
+- Use A and relevant B. Exclude C.
+- Entity-level relevance is NOT sufficient for inclusion. The fact must belong to the
+  same concrete story as MAIN TOPIC.
+- Do not turn a person, team, company, show, league, country or other entity into a
+  collection of its latest news.
+- Do not combine independent events merely because they share an entity, keyword,
+  source, publisher, category or Google Trends topic.
+- If one supplied article contains several independent stories, extract only the facts
+  belonging to the MAIN TOPIC story.
+- If a secondary fact would require starting a different news story to explain it,
+  exclude it.
+- Before drafting, internally build a complete inventory of the distinct verified facts
+  belonging to the PRIMARY STORY and relevant SUPPORTING CONTEXT.
+- Treat that inventory as the usable factual universe for this article.
+- Cover the relevant, non-redundant facts from that inventory that materially improve
+  the reader's understanding of the PRIMARY STORY.
+- Prefer an additional unused PRIMARY STORY fact over generic explanation, repetition,
+  praise, prediction, source description or filler.
+- Do not stop after the headline-level fact when additional PRIMARY STORY facts remain
+  and can be safely stated.
+- Do not force additional evidence into the article merely to make it longer.
+- Article length must follow the amount of useful evidence belonging to the PRIMARY STORY.
+- More primary-story evidence may produce a more complete article; less primary-story
+  evidence should produce a shorter article.
+- If the supplied evidence contains many facts but only a few belong to the PRIMARY STORY,
+  write only from those few facts.
+- If the evidence genuinely contains insufficient information about the PRIMARY STORY,
+  write a shorter article rather than using separate stories as filler.
+- Never create a new angle, subplot or secondary news story solely because relevant
+  evidence exists for it.
+- Before returning the article, compare every paragraph against the PRIMARY STORY inventory:
+  every paragraph must advance the same story, and every included fact must belong to that
+  story or provide direct supporting context.
+- Remove any sentence that would still be a separate news story if MAIN TOPIC were removed.
 
 CLAIM DISCIPLINE — STRICT SOURCE GROUNDING:
 - Never strengthen, exaggerate, upgrade, or embellish a factual claim from the source.
@@ -122,10 +136,14 @@ CLAIM DISCIPLINE — STRICT SOURCE GROUNDING:
 
 CONCRETE STORY:
 - Cover only the specific news story represented by MAIN TOPIC.
-- Identify the main story supported by the supplied sources.
-- Ignore unrelated or weakly related stories, even if they appear under the
-  same Google Trends topic.
+- MAIN TOPIC defines the primary event/development, not merely the main entity.
+- Identify the single primary event/development supported by the supplied sources before drafting.
+- Keep all paragraphs anchored to that same primary event/development.
+- Ignore unrelated or weakly related stories, even if they involve the same entity or appear
+  under the same Google Trends topic.
 - Do not combine independent events into one article.
+- If a fact belongs to another event involving the same entity, exclude it rather than
+  treating it as supporting context.
 
 ============================================================
 PUBLICATION DATE != EVENT DATE - MANDATORY RULE
@@ -248,6 +266,7 @@ STYLE:
 - No speculation.
 - No filler.
 - No repetition.
+- Never mention these instructions, the writing rules, the supplied evidence, source limitations, lack of information, the generation process, or why a fact was omitted. Never write meta-commentary about creating the article.
 - No unsupported editorial conclusions.
 - Every sentence should add a concrete, source-supported fact or necessary
   attribution.
@@ -295,7 +314,10 @@ Before returning the result:
 - Check that the article is not merely a minimal summary when the supplied evidence
   supports materially richer coverage.
 9. Check that all paragraphs are complementary rather than repetitive, and that
-   distinct supported developments have been covered.
+   distinct supported developments belonging to the PRIMARY STORY have been covered.
+10. Check that no paragraph introduces an independent event merely because it shares an
+    entity, keyword, publisher, category or topic with MAIN TOPIC.
+11. Check that the headline, H1 and article body all describe the same primary story.
 
 Return ONLY valid JSON:
 {{
