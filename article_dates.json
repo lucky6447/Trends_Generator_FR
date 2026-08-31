@@ -1006,5 +1006,9 @@
   "crue-soudaine-grand-canyon": {
     "published_at": "2026-08-31 14:30",
     "order": -252
+  },
+  "loto-du-patrimoine": {
+    "published_at": "2026-08-31 15:47",
+    "order": -253
   }
 }
