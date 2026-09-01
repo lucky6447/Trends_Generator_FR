@@ -16,12 +16,12 @@
 <title>{{ article.title }}</title>
 <meta name="description" content="{{ article.description }}">
 
-<link rel="canonical" href="{{ site_url }}/trends/{{ article.slug }}.html">
+<link rel="canonical" href="{{ site_url }}/trends/{{ article.slug }}">
 
 <meta property="og:type" content="article">
 <meta property="og:title" content="{{ article.title }}">
 <meta property="og:description" content="{{ article.description }}">
-<meta property="og:url" content="{{ site_url }}/trends/{{ article.slug }}.html">
+<meta property="og:url" content="{{ site_url }}/trends/{{ article.slug }}">
 {% if article.image_data and article.image_data.image %}
 <meta property="og:image" content="{{ article.image_data.image }}">
 {% endif %}
@@ -332,7 +332,7 @@ margin-bottom:20px;
 "@type":"Article",
 "headline":"{{ article.title }}",
 "description":"{{ article.description }}",
-"url":"{{ site_url }}/trends/{{ article.slug }}.html",
+"url":"{{ site_url }}/trends/{{ article.slug }}",
 {% if article.image_data and article.image_data.image %}
 "image":"{{ article.image_data.image }}",
 {% endif %}

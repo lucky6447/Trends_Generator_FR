@@ -12,9 +12,12 @@ Environment:
     TC_AI_IMAGE_WEBP_QUALITY default "80"
     CLOUDFLARE_ACCOUNT_ID_2 optional second Cloudflare account ID
     CLOUDFLARE_API_TOKEN_2 optional second Cloudflare API token
+    CLOUDFLARE_ACCOUNT_ID_3 optional third Cloudflare account ID
+    CLOUDFLARE_API_TOKEN_3 optional third Cloudflare API token
 
 The image layer is isolated from article generation.
-It receives only visual prose (description/intro), never source headlines.
+It receives the article headline as the primary visual source, with description/intro
+as secondary context. Named people are never used as visual subjects.
 Cloudflare's FLUX endpoint does not accept width/height, so the returned
 image is prepared locally as a natural 3:2, 1024x683 WebP format.
 """
@@ -28,26 +31,27 @@ import urllib.error
 import urllib.request
 import urllib.parse
 import io
+import re
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
 
+
 from config import ROOT, SITE_URL
 
-try:
-    from huggingface_hub import InferenceClient
-except ImportError:
-    InferenceClient = None
 
-
+# Cloudflare account pool.
+# All three accounts are required for production rotation. Do not silently
+# continue with only one account: that would defeat quota failover.
 ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 
-# Optional second Cloudflare account used only after the primary account
-# reaches its Workers AI daily free quota.
 ACCOUNT_ID_2 = os.getenv("CLOUDFLARE_ACCOUNT_ID_2", "").strip()
 API_TOKEN_2 = os.getenv("CLOUDFLARE_API_TOKEN_2", "").strip()
+
+ACCOUNT_ID_3 = os.getenv("CLOUDFLARE_ACCOUNT_ID_3", "").strip()
+API_TOKEN_3 = os.getenv("CLOUDFLARE_API_TOKEN_3", "").strip()
 
 ENABLED = os.getenv("TC_AI_IMAGE_ENABLED", "1").strip().lower() not in {
     "0", "false", "no", "off"
@@ -61,36 +65,7 @@ TIMEOUT = int(os.getenv("TC_AI_IMAGE_TIMEOUT", "180"))
 
 MODEL = "@cf/black-forest-labs/flux-1-schnell"
 
-# Person-image route: only used when the article slug resolves to a verified
-# human on Wikipedia/Wikidata. All other images continue through Cloudflare.
-HF_TOKENS = [
-    os.getenv("HF_TOKEN_1", "").strip(),
-    os.getenv("HF_TOKEN_2", "").strip(),
-    os.getenv("HF_TOKEN_3", "").strip(),
-]
-# Backward compatibility with the old single-token variable.
-if not any(HF_TOKENS):
-    legacy_token = os.getenv("HF_TOKEN", "").strip()
-    if legacy_token:
-        HF_TOKENS = [legacy_token]
 
-HF_PERSON_MODEL = os.getenv(
-    "TC_HF_PERSON_MODEL",
-    "black-forest-labs/FLUX.1-Kontext-dev",
-).strip()
-HF_PROVIDER = os.getenv("TC_HF_PERSON_PROVIDER", "fal-ai").strip()
-HF_PERSON_TIMEOUT = int(os.getenv("TC_HF_PERSON_TIMEOUT", "300"))
-PERSON_IMAGE_ENABLED = os.getenv(
-    "TC_HF_PERSON_IMAGE_ENABLED", "1"
-).strip().lower() not in {"0", "false", "no", "off"}
-PERSON_REF_DIR = Path(ROOT) / "assets" / "person_refs"
-PERSON_REF_DIR.mkdir(parents=True, exist_ok=True)
-
-WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
-WIKIPEDIA_UA = (
-    "TrendCurrent/1.0 (AI editorial image reference retrieval; "
-    "https://trendcurrent.today)"
-)
 
 IMAGE_DIR = Path(ROOT) / "assets" / "articles"
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -101,424 +76,787 @@ def _clean(text: Any, limit: int = 1200) -> str:
     return text[:limit]
 
 
-def _build_prompt(article: dict, news: list | None = None) -> str:
-    """Build a focused visual prompt within Cloudflare's 2048-character limit."""
+def _infer_visual_lock(
+    title: str,
+    description: str,
+    intro: str,
+) -> dict[str, str]:
+    """Infer a deterministic, multi-signal visual subject lock.
 
-    description = _clean(article.get("description"), 350)
+    The classifier is intentionally local: it consumes no AI/Cloudflare neurons.
+    It scores multiple visual domains instead of using "first keyword wins".
+
+    Output:
+        type       = stable story domain
+        label      = compact visual-domain label for logging/prompting
+        subject    = concrete visual direction selected from the article
+        forbidden  = category-specific negative visual directions
+
+    Design goals:
+    - headline gets the strongest weight
+    - description/intro provide supporting evidence
+    - multi-word phrases beat isolated generic words
+    - multiple matching domains are resolved by weighted score
+    - concrete sub-subjects are selected where safely inferable
+    - named people remain context, never the visual subject
+    - broad roundups intentionally fall back to a broad but coherent visual anchor
+    """
+
+    title = _clean(title, 320)
+    description = _clean(description, 500)
+    intro = _clean(intro, 500)
+
+    title_text = title.lower()
+    desc_text = description.lower()
+    intro_text = intro.lower()
+    full_text = " ".join((title_text, desc_text, intro_text))
+
+    # Each rule:
+    # (story_type, label, broad_subject, forbidden, phrase_weights, word_weights)
+    #
+    # Phrase weights are deliberately higher than single-word weights.
+    # This prevents generic words such as "final", "show", "market", "study",
+    # "court" or "policy" from dominating a story merely because they appear once.
+    rules = [
+        {
+            "type": "weather",
+            "label": "WEATHER / ATMOSPHERIC EVENT",
+            "broad_subject": (
+                "the specific weather condition or atmospheric event described by "
+                "the article, shown through its affected environment, landscape, "
+                "infrastructure or sky"
+            ),
+            "forbidden": (
+                "weather presenters, generic people, unrelated sports, unrelated "
+                "events, generic city stock imagery"
+            ),
+            "phrases": {
+                "tropical storm": 10, "tropical cyclone": 10, "winter storm": 10,
+                "severe weather": 9, "heat wave": 9, "cold snap": 9,
+                "flash flood": 10, "flood warning": 9, "storm surge": 10,
+                "storm warning": 9, "weather warning": 9, "hurricane warning": 10,
+                "tornado warning": 10, "blizzard warning": 10,
+                "heavy rainfall": 8, "record rainfall": 8,
+            },
+            "words": {
+                "hurricane": 7, "tornado": 7, "thunderstorm": 7, "blizzard": 7,
+                "snowfall": 6, "flooding": 6, "flood": 5, "wildfire": 6,
+                "drought": 6, "heatwave": 6, "rainfall": 5, "snow": 4,
+            },
+        },
+        {
+            "type": "sports",
+            "label": "SPORT / MATCH",
+            "broad_subject": (
+                "the specific sport, playing surface, equipment, venue, match or "
+                "competition identified by the article"
+            ),
+            "forbidden": (
+                "unrelated sports, generic business scenes, generic celebrity "
+                "portraits, unrelated people"
+            ),
+            "phrases": {
+                "tennis match": 10, "football match": 10, "soccer match": 10,
+                "basketball game": 10, "baseball game": 10, "hockey game": 10,
+                "golf tournament": 10, "grand prix": 10, "formula 1": 10,
+                "formula one": 10, "world cup": 9, "champions league": 10,
+                "playoff game": 9, "playoff series": 9, "final match": 8,
+                "quarterfinal match": 9, "semifinal match": 9,
+            },
+            "words": {
+                "tennis": 7, "football": 7, "soccer": 7, "basketball": 7,
+                "baseball": 7, "hockey": 7, "golf": 7, "cricket": 7,
+                "rugby": 7, "boxing": 7, "ufc": 7, "marathon": 6,
+                "tournament": 5, "playoffs": 5, "playoff": 5, "championship": 5,
+                "race": 4, "match": 4, "game": 2,
+            },
+        },
+        {
+            "type": "theatre",
+            "label": "THEATRE / STAGE",
+            "broad_subject": (
+                "the theatre production, stage, theatrical set, venue interior, "
+                "stage lighting or clearly theatrical production elements"
+            ),
+            "forbidden": (
+                "tennis, football, basketball, baseball, stadiums, athletes, "
+                "unrelated sports, generic celebrity portraits, generic people"
+            ),
+            "phrases": {
+                "west end": 10, "broadway musical": 10, "theatre production": 10,
+                "theater production": 10, "stage production": 9,
+                "musical production": 9, "theatrical production": 10,
+            },
+            "words": {
+                "theatre": 7, "theater": 7, "broadway": 7, "stage": 6,
+                "musical": 6, "production": 3, "revival": 5, "barbican": 6,
+                "cast": 3,
+            },
+        },
+        {
+            "type": "court",
+            "label": "COURT / LEGAL PROCEEDING",
+            "broad_subject": (
+                "a concrete courtroom, legal hearing, jury setting, judge's bench, "
+                "court building or legal proceeding environment described by the story"
+            ),
+            "forbidden": (
+                "portraits of named people, unrelated sports, generic offices, "
+                "generic crowds, unrelated government scenes"
+            ),
+            "phrases": {
+                "court ruling": 9, "court decision": 9, "court hearing": 10,
+                "court case": 9, "court battle": 9, "legal battle": 8,
+                "supreme court": 10, "court of appeals": 10,
+                "criminal trial": 10, "civil trial": 10, "jury trial": 10,
+                "lawsuit against": 8, "lawsuit over": 8,
+            },
+            "words": {
+                "courtroom": 8, "court": 5, "jury": 7, "trial": 7, "verdict": 7,
+                "lawsuit": 6, "hearing": 6, "judge": 6, "sentenced": 7,
+                "convicted": 7, "acquitted": 7, "litigation": 6,
+            },
+        },
+        {
+            "type": "politics",
+            "label": "GOVERNMENT / POLITICS",
+            "broad_subject": (
+                "the relevant government building, parliament, official chamber, "
+                "ballot box, election setting, campaign environment, policy setting "
+                "or other concrete political setting described by the article"
+            ),
+            "forbidden": (
+                "portraits of named politicians, unrelated sports, generic business "
+                "meetings, generic people, unrelated entertainment"
+            ),
+            "phrases": {
+                "midterm elections": 12, "midterm election": 12,
+                "presidential election": 12, "general election": 11,
+                "election campaign": 11, "political campaign": 11,
+                "campaign funding": 10, "campaign finance": 10,
+                "election results": 10, "election race": 10,
+                "white house": 12, "u.s. capitol": 12, "us capitol": 12,
+                "house of representatives": 11, "senate race": 11,
+                "senate election": 11, "congressional race": 11,
+                "congressional election": 11, "trade policy": 8,
+                "foreign policy": 8, "executive order": 9,
+            },
+            "words": {
+                "president": 6, "presidential": 6, "prime": 3, "minister": 6,
+                "government": 6, "parliament": 7, "congress": 7, "senate": 7,
+                "election": 7, "vote": 4, "voting": 5, "political": 5,
+                "policy": 4, "cabinet": 6, "legislation": 6, "republican": 5,
+                "democrat": 5, "midterms": 8, "pac": 5,
+            },
+        },
+        {
+            "type": "business",
+            "label": "BUSINESS / FINANCE",
+            "broad_subject": (
+                "the specific business, financial market, transaction, workplace, "
+                "store, factory, bank or physical business setting described"
+            ),
+            "forbidden": (
+                "generic corporate handshakes, generic meetings, unrelated sports, "
+                "portraits, unrelated political scenes"
+            ),
+            "phrases": {
+                "stock market": 11, "financial markets": 10, "share price": 9,
+                "stock prices": 9, "quarterly earnings": 10, "earnings report": 10,
+                "merger agreement": 10, "acquisition deal": 10,
+                "business deal": 8, "interest rates": 9, "central bank": 10,
+                "banking crisis": 10, "market crash": 11, "economic growth": 8,
+            },
+            "words": {
+                "company": 4, "corporate": 5, "business": 5, "shares": 6,
+                "stock": 6, "stocks": 6, "market": 4, "markets": 4,
+                "earnings": 6, "revenue": 6, "profit": 6, "acquisition": 7,
+                "merger": 7, "investment": 6, "investor": 6, "bank": 5,
+                "banking": 6, "economy": 5, "economic": 5, "inflation": 6,
+            },
+        },
+        {
+            "type": "transport",
+            "label": "TRANSPORT / INFRASTRUCTURE",
+            "broad_subject": (
+                "the specific aircraft, train, airport, railway, road, vehicle or "
+                "transport infrastructure involved in the story"
+            ),
+            "forbidden": (
+                "generic people, unrelated sports, generic city stock imagery, "
+                "unrelated business scenes"
+            ),
+            "phrases": {
+                "flight cancellations": 10, "flight delays": 10,
+                "travel disruption": 10, "air traffic": 9, "train service": 9,
+                "rail service": 9, "road closure": 10, "highway closure": 10,
+                "traffic accident": 9, "car crash": 10, "plane crash": 10,
+                "train crash": 10,
+            },
+            "words": {
+                "flight": 5, "flights": 5, "airline": 6, "airport": 7,
+                "aircraft": 7, "plane": 6, "train": 7, "railway": 7,
+                "rail": 6, "subway": 7, "metro": 7, "bus": 5, "road": 4,
+                "highway": 6, "traffic": 5, "crash": 6, "collision": 7,
+                "vehicle": 4, "transport": 5,
+            },
+        },
+        {
+            "type": "science_space",
+            "label": "SCIENCE / SPACE",
+            "broad_subject": (
+                "the specific scientific subject, spacecraft, laboratory, instrument, "
+                "experiment or astronomical phenomenon described"
+            ),
+            "forbidden": (
+                "generic scientists posing, unrelated people, unrelated sports, "
+                "generic offices, unrelated technology stock imagery"
+            ),
+            "phrases": {
+                "space mission": 10, "rocket launch": 10, "lunar mission": 10,
+                "mars mission": 10, "climate study": 9, "scientific study": 9,
+                "medical study": 8, "research team": 7, "space telescope": 10,
+                "deep space": 9,
+            },
+            "words": {
+                "nasa": 8, "space": 7, "rocket": 7, "launch": 5, "satellite": 7,
+                "astronaut": 7, "moon": 6, "mars": 7, "planet": 6,
+                "telescope": 7, "mission": 4, "scientist": 5, "research": 6,
+                "study": 4, "laboratory": 7, "lab": 6, "experiment": 6,
+                "discovery": 4,
+            },
+        },
+        {
+            "type": "technology",
+            "label": "TECHNOLOGY / DIGITAL",
+            "broad_subject": (
+                "the specific device, software concept, computing hardware, digital "
+                "interface or technology environment described"
+            ),
+            "forbidden": (
+                "generic people using laptops, unrelated sports, generic office "
+                "scenes, unrelated business meetings"
+            ),
+            "phrases": {
+                "artificial intelligence": 11, "ai model": 9, "machine learning": 10,
+                "social media": 9, "smartphone app": 9, "mobile app": 9,
+                "cyber attack": 10, "cyberattack": 10, "data breach": 10,
+                "computer chip": 10, "semiconductor chip": 10,
+                "operating system": 9, "generative ai": 11,
+            },
+            "words": {
+                "ai": 5, "software": 6, "app": 5, "iphone": 7, "android": 7,
+                "google": 5, "microsoft": 5, "apple": 5, "chip": 7,
+                "processor": 7, "robot": 6, "robotics": 7, "cyber": 6,
+                "internet": 5, "technology": 5, "tech": 4, "computer": 6,
+                "smartphone": 7,
+            },
+        },
+        {
+            "type": "disaster",
+            "label": "DISASTER / EMERGENCY",
+            "broad_subject": (
+                "the specific disaster, damaged environment, emergency infrastructure "
+                "or response setting, without graphic injury"
+            ),
+            "forbidden": (
+                "graphic injury, gore, unrelated sports, generic people, unrelated "
+                "city stock imagery"
+            ),
+            "phrases": {
+                "natural disaster": 10, "emergency response": 9,
+                "mass evacuation": 10, "building collapse": 10,
+                "structural collapse": 10, "rescue operation": 9,
+                "search and rescue": 9, "volcanic eruption": 11,
+                "forest fire": 10, "house fire": 10,
+            },
+            "words": {
+                "earthquake": 8, "wildfire": 8, "volcanic": 7, "volcano": 8,
+                "eruption": 8, "disaster": 6, "emergency": 6, "evacuation": 7,
+                "rescue": 6, "explosion": 7, "collapse": 7, "fire": 5,
+            },
+        },
+        {
+            "type": "entertainment",
+            "label": "ENTERTAINMENT",
+            "broad_subject": (
+                "the specific film, television, music, concert, award, exhibition "
+                "or entertainment production setting described by the article"
+            ),
+            "forbidden": (
+                "portraits or likenesses of named people, unrelated sports, generic "
+                "crowds, unrelated business or political scenes"
+            ),
+            "phrases": {
+                "red carpet": 10, "film premiere": 10, "movie premiere": 10,
+                "music festival": 10, "award ceremony": 10, "awards ceremony": 10,
+                "television series": 9, "tv series": 9, "streaming series": 9,
+                "box office": 9, "concert tour": 9,
+            },
+            "words": {
+                "film": 5, "movie": 6, "cinema": 6, "actor": 5, "actress": 5,
+                "singer": 5, "album": 6, "song": 5, "concert": 7, "music": 5,
+                "premiere": 7, "television": 5, "series": 5, "show": 3,
+                "grammy": 7, "oscars": 7, "award": 5, "awards": 5,
+            },
+        },
+    ]
+
+    def occurrences(text: str, term: str) -> int:
+        # Word-boundary matching for short/general words. Multi-word phrases
+        # are naturally matched as exact normalized substrings.
+        if " " in term or "-" in term:
+            return text.count(term)
+        return len(re.findall(rf"(?<!\w){re.escape(term)}(?!\w)", text))
+
+    def score_rule(rule: dict) -> tuple[float, int, int]:
+        score = 0.0
+        phrase_hits = 0
+        word_hits = 0
+
+        # Headline is intentionally dominant because it normally represents the
+        # article's actual central story better than incidental body context.
+        for term, weight in rule["phrases"].items():
+            hits = occurrences(title_text, term)
+            if hits:
+                score += hits * weight * 3.0
+                phrase_hits += hits
+            hits = occurrences(desc_text, term)
+            if hits:
+                score += hits * weight * 1.35
+                phrase_hits += hits
+            hits = occurrences(intro_text, term)
+            if hits:
+                score += hits * weight
+                phrase_hits += hits
+
+        for term, weight in rule["words"].items():
+            hits = occurrences(title_text, term)
+            if hits:
+                score += hits * weight * 2.0
+                word_hits += hits
+            hits = occurrences(desc_text, term)
+            if hits:
+                score += hits * weight * 1.0
+                word_hits += hits
+            hits = occurrences(intro_text, term)
+            if hits:
+                score += hits * weight * 0.75
+                word_hits += hits
+
+        return score, phrase_hits, word_hits
+
+    scored = []
+    for rule in rules:
+        score, phrase_hits, word_hits = score_rule(rule)
+        if score > 0:
+            scored.append((score, phrase_hits, word_hits, rule))
+
+    # No recognized domain: retain the safe general route.
+    if not scored:
+        return {
+            "type": "general",
+            "label": "GENERAL NEWS",
+            "subject": (
+                "the most concrete non-person object, place, event, physical setting "
+                "or visible consequence explicitly described by the headline"
+            ),
+            "forbidden": (
+                "generic stock people, generic business meetings, generic conferences, "
+                "unrelated sports, unrelated celebrities, unrelated scenes"
+            ),
+        }
+
+    scored.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    best_score, best_phrases, best_words, best_rule = scored[0]
+
+    # If two domains are close, prefer the one with stronger headline evidence.
+    # This is deliberately deterministic and avoids arbitrary rule-order wins.
+    if len(scored) > 1:
+        second_score, second_phrases, second_words, second_rule = scored[1]
+        if second_score >= best_score * 0.88:
+            # Headline-only evidence gets priority in close cases.
+            best_headline_score = (
+                sum(
+                    occurrences(title_text, term) * weight * 3.0
+                    for term, weight in best_rule["phrases"].items()
+                )
+                + sum(
+                    occurrences(title_text, term) * weight * 2.0
+                    for term, weight in best_rule["words"].items()
+                )
+            )
+            second_headline_score = (
+                sum(
+                    occurrences(title_text, term) * weight * 3.0
+                    for term, weight in second_rule["phrases"].items()
+                )
+                + sum(
+                    occurrences(title_text, term) * weight * 2.0
+                    for term, weight in second_rule["words"].items()
+                )
+            )
+
+            if second_headline_score > best_headline_score:
+                best_rule = second_rule
+                best_score = second_score
+                best_phrases = second_phrases
+                best_words = second_words
+
+    story_type = best_rule["type"]
+    label = best_rule["label"]
+    subject = best_rule["broad_subject"]
+    forbidden = best_rule["forbidden"]
+
+    # Concrete visual-subject refinements. These are intentionally conservative:
+    # only use them when strong phrases in the article support them.
+    if story_type == "politics":
+        if occurrences(full_text, "white house") > 0:
+            subject = (
+                "the White House and its surrounding official government setting, "
+                "with architecture and grounds as the dominant visual subject"
+            )
+        elif occurrences(full_text, "u.s. capitol") > 0 or occurrences(full_text, "us capitol") > 0:
+            subject = (
+                "the U.S. Capitol and surrounding congressional setting, with the "
+                "Capitol building as the dominant visual subject"
+            )
+        elif occurrences(full_text, "house of representatives") > 0:
+            subject = (
+                "the U.S. House of Representatives / congressional chamber setting, "
+                "with government architecture as the dominant visual subject"
+            )
+        elif occurrences(full_text, "senate") > 0 and (
+            occurrences(full_text, "race") > 0
+            or occurrences(full_text, "election") > 0
+            or occurrences(full_text, "elections") > 0
+        ):
+            subject = (
+                "a U.S. Senate election or congressional setting, represented through "
+                "the Capitol, Senate chamber or official election environment"
+            )
+        elif (
+            occurrences(full_text, "election campaign") > 0
+            or occurrences(full_text, "political campaign") > 0
+            or occurrences(full_text, "campaign funding") > 0
+            or occurrences(full_text, "campaign finance") > 0
+            or occurrences(full_text, "midterm elections") > 0
+            or occurrences(full_text, "midterm election") > 0
+        ):
+            subject = (
+                "a U.S. election campaign setting, such as campaign infrastructure, "
+                "ballot boxes, polling-place environment or official election signage "
+                "without readable text"
+            )
+
+    elif story_type == "weather":
+        if occurrences(full_text, "hurricane") or occurrences(full_text, "tropical storm"):
+            subject = (
+                "the hurricane or tropical storm itself, shown through the affected "
+                "coastline, buildings, infrastructure, rain, wind and dramatic sky"
+            )
+        elif occurrences(full_text, "tornado"):
+            subject = (
+                "the tornado and affected landscape or infrastructure, shown safely "
+                "without people or graphic damage"
+            )
+        elif occurrences(full_text, "flood"):
+            subject = (
+                "the flooding and its affected streets, buildings, roads or landscape, "
+                "with water and environmental impact as the dominant subject"
+            )
+        elif occurrences(full_text, "snow") or occurrences(full_text, "blizzard"):
+            subject = (
+                "the snow or blizzard conditions affecting the described environment, "
+                "roads, buildings or landscape"
+            )
+
+    elif story_type == "sports":
+        sport_subjects = [
+            ("tennis", "a tennis-specific court, racket, net and match environment"),
+            ("football", "a football-specific pitch, stadium or match environment"),
+            ("soccer", "a soccer-specific pitch, stadium or match environment"),
+            ("basketball", "a basketball-specific court, arena or game environment"),
+            ("baseball", "a baseball-specific field, stadium or game environment"),
+            ("hockey", "an ice hockey-specific rink, goal or game environment"),
+            ("golf", "a golf course and golf-specific competition environment"),
+            ("cricket", "a cricket-specific pitch, stadium or match environment"),
+            ("rugby", "a rugby-specific pitch, stadium or match environment"),
+            ("boxing", "a boxing ring and boxing-specific competition environment"),
+            ("formula 1", "a Formula 1 racing circuit, car and race environment"),
+            ("formula one", "a Formula 1 racing circuit, car and race environment"),
+        ]
+        for term, refined in sport_subjects:
+            if occurrences(full_text, term):
+                subject = refined
+                break
+
+    elif story_type == "transport":
+        if occurrences(full_text, "airport") or occurrences(full_text, "flight"):
+            subject = (
+                "the specific airport, aircraft or aviation environment involved in "
+                "the story, with aviation infrastructure as the dominant subject"
+            )
+        elif occurrences(full_text, "train") or occurrences(full_text, "rail"):
+            subject = (
+                "the specific train, railway or rail infrastructure involved in the "
+                "story, shown as a concrete transport setting"
+            )
+        elif occurrences(full_text, "road") or occurrences(full_text, "highway"):
+            subject = (
+                "the specific road or highway infrastructure and its described traffic "
+                "or disruption, without generic city stock imagery"
+            )
+
+    elif story_type == "science_space":
+        if occurrences(full_text, "nasa") or occurrences(full_text, "rocket launch"):
+            subject = (
+                "the specific NASA space mission, rocket or launch environment described "
+                "by the story, with the spacecraft or launch infrastructure dominant"
+            )
+        elif occurrences(full_text, "mars"):
+            subject = (
+                "the Mars-related scientific or space subject described by the story, "
+                "represented through spacecraft, planetary terrain or scientific equipment"
+            )
+        elif occurrences(full_text, "laboratory") or occurrences(full_text, "lab"):
+            subject = (
+                "the specific laboratory, scientific equipment or research environment "
+                "described by the article"
+            )
+
+    elif story_type == "technology":
+        if occurrences(full_text, "artificial intelligence") or occurrences(full_text, "generative ai"):
+            subject = (
+                "the specific artificial-intelligence technology or computing environment "
+                "described by the story, shown through relevant hardware or digital systems"
+            )
+        elif occurrences(full_text, "cyber attack") or occurrences(full_text, "cyberattack") or occurrences(full_text, "data breach"):
+            subject = (
+                "the cybersecurity or data-security environment described by the story, "
+                "shown through computing infrastructure and security systems"
+            )
+
+    elif story_type == "disaster":
+        if occurrences(full_text, "earthquake"):
+            subject = (
+                "the earthquake's affected built environment, infrastructure or landscape, "
+                "without graphic injury"
+            )
+        elif occurrences(full_text, "wildfire") or occurrences(full_text, "forest fire"):
+            subject = (
+                "the wildfire and affected landscape, smoke, vegetation or infrastructure, "
+                "without graphic injury"
+            )
+        elif occurrences(full_text, "volcanic eruption"):
+            subject = (
+                "the volcanic eruption, volcano and affected landscape, shown without "
+                "graphic injury"
+            )
+
+    elif story_type == "court":
+        if occurrences(full_text, "supreme court"):
+            subject = (
+                "the U.S. Supreme Court building and formal judicial setting, with "
+                "architecture and institutional context as the dominant subject"
+            )
+        elif occurrences(full_text, "courtroom") or occurrences(full_text, "court hearing"):
+            subject = (
+                "a courtroom or formal legal hearing setting, with the judge's bench, "
+                "jury area and legal environment as the dominant subject"
+            )
+
+    # If the winning domain is supported only weakly, retain its broad subject
+    # rather than fabricating a more specific object.
+    if best_score < 8 and best_phrases == 0 and best_words <= 1:
+        story_type = "general"
+        label = "GENERAL NEWS"
+        subject = (
+            "the most concrete non-person object, place, event, physical setting "
+            "or visible consequence explicitly described by the headline"
+        )
+        forbidden = (
+            "generic stock people, generic business meetings, generic conferences, "
+            "unrelated sports, unrelated celebrities, unrelated scenes"
+        )
+
+    return {
+        "type": story_type,
+        "label": label,
+        "subject": subject,
+        "forbidden": forbidden,
+    }
+
+
+def _build_prompt(article: dict, news: list | None = None) -> str:
+    """Build a locked, headline-first visual prompt within Cloudflare's 2048-char limit.
+
+    A lightweight story-type classifier creates a visual subject lock before FLUX
+    generation. The classifier is local and consumes no AI/Cloudflare neurons.
+    """
+
+    title = _clean(article.get("title") or article.get("h1"), 260)
+    description = _clean(article.get("description"), 300)
     intro = _clean(
         article.get("intro")
         or (article.get("paragraphs") or [""])[0],
-        50,
+        100,
     )
 
-    if not description and not intro:
-        description = "Show the central real-world subject or event as an editorial news photograph."
+    if not title:
+        title = "the central subject or event described by the article"
+
+    lock = _infer_visual_lock(title, description, intro)
 
     prompt = f"""
 Create ONE photorealistic editorial news photograph in a natural 3:2 composition.
 
-PRIMARY NEWS EVENT:
-{description}
+ARTICLE HEADLINE — PRIMARY SOURCE:
+{title}
 
-SUPPORTING CONTEXT:
+STORY TYPE — VISUAL SUBJECT LOCK:
+{lock["label"]}
+
+PRIMARY VISUAL SUBJECT — LOCKED:
+{lock["subject"]}
+
+This visual lock is mandatory. Build the image around the PRIMARY VISUAL SUBJECT.
+Do not reinterpret the story into another category. Do not substitute a generic stock
+image. The image must be immediately recognizable as belonging to the locked story type.
+
+STRICT SUBJECT CONTROL:
+- Depict the concrete non-person subject, place, object, event or setting described.
+- If the headline names a person, the person is CONTEXT ONLY, not the visual subject.
+- Do not create a portrait, likeness, celebrity recreation or recognizable face of a named person.
+- People are NOT allowed merely to make the image look like a news photograph.
+- If people are not essential to the locked subject, use ZERO HUMAN FIGURES.
+- Never introduce an unrelated human activity or unrelated visual category.
+
+LOCKED NEGATIVE SUBJECTS:
+{lock["forbidden"]}
+
+COMBINED HEADLINES:
+If the headline contains a secondary condition such as weather, delays, disruption or
+cancellation, keep the LOCKED PRIMARY SUBJECT dominant. The secondary condition may
+support it but must never replace it.
+
+EXAMPLE:
+If the story is a theatre production, show the theatre stage, set, venue or production
+environment. Do NOT turn a theatre story into a sports scene, city stock photo or portrait.
+If the story is a tennis match, show tennis-specific court/equipment/action. Do NOT replace
+it with another sport or generic people.
+
+SECONDARY ARTICLE CONTEXT:
+{description}
 {intro}
 
-Make the PRIMARY NEWS EVENT the clear visual subject. Create one specific,
-coherent real-world scene that directly represents what the article reports,
-not merely its broad topic. Use supporting context only to improve the setting.
-Do not combine unrelated events or let secondary details replace the main event.
+Use secondary context only to clarify the locked subject. Do not allow names of people,
+secondary stories or incidental details to override the visual subject lock.
+Create ONE specific, coherent real-world scene directly representing the article.
+Do not invent unsupported facts, objects, locations or activities.
 
-IDENTITY ACCURACY:
-When a specific real person is named or clearly described in the PRIMARY NEWS EVENT,
-that exact person must be the visual subject. Do not replace the named person with
-a generic person, lookalike, unrelated public figure, or another person from the
-same profession. Preserve supported identity cues such as age range, sex, facial
-structure, hair and overall appearance as closely as possible. If multiple named
-people are present, keep their identities distinct and never merge or swap them.
-Do not invent additional people unless the PRIMARY NEWS EVENT requires them.
+PEOPLE RULE:
+No named person may be depicted. No celebrity likeness. No recognizable face.
+For stories that do not intrinsically require people, use ZERO people, silhouettes,
+crowds or visible human figures.
 
-Choose the most appropriate realistic scene. For a specific person, make that
-person the unmistakable focal point. For sport, show the relevant match. For
-finance, show the specific market or business development. For politics, show
-the relevant figure or official setting. For geopolitics, show the supported location
-and context. For emergencies or disasters, show the relevant scene without graphic
-injury. For a place, make the location the primary subject.
+NO TEXT OR MARKINGS:
+No words, letters, numbers, captions, headlines, logos, watermarks, signs, billboards,
+banners, posters, documents, readable screens, scoreboards, written clothing, jersey
+names, jersey numbers or brand marks.
 
-Do not invent facts, events, people, actions, locations or objects not supported
-by the PRIMARY NEWS EVENT. Avoid generic stock images when a specific scene can
-be inferred. Use realistic perspective, natural lighting, natural anatomy,
-complete visible limbs, realistic hands and fingers, correct body proportions,
-depth of field and one clear focal point. Avoid awkward cropping of important
-body parts.
-
-NO TEXT OR MARKINGS: no words, letters, numbers, captions, headlines, logos,
-watermarks, signs, billboards, banners, posters, documents, readable screens,
-scoreboards, written clothing, jersey names, jersey numbers or brand marks.
-
-No collage, infographic, poster, illustration, cartoon, painting, fantasy or
-obvious AI-art look. This is an AI-generated editorial reconstruction, not a
-claim that this is a real photograph of the exact event. No graphic gore.
+STYLE:
+Photorealistic editorial photography, realistic perspective, natural lighting, realistic
+materials and proportions, one clear focal point, natural depth of field. No collage,
+infographic, poster, illustration, cartoon, painting, fantasy or obvious AI-art look.
+This is an AI-generated editorial reconstruction, not a claim that this is a real photograph
+of the exact event. No graphic gore.
 """.strip()
 
-    # Cloudflare FLUX accepts a maximum of 2048 characters for /prompt.
-    # If an unusually long prompt exceeds the limit, preserve the complete
-    # instruction block and trim only the article-supplied description/context.
     if len(prompt) > 2048:
         fixed = """
 Create ONE photorealistic editorial news photograph in a natural 3:2 composition.
 
-PRIMARY NEWS EVENT:
-{description}
+HEADLINE:
+{title}
 
-SUPPORTING CONTEXT:
+VISUAL SUBJECT LOCK:
+{label}
+
+PRIMARY SUBJECT:
+{subject}
+
+MANDATORY: the image must depict the locked subject above. Do not reinterpret it as
+another category or generic stock imagery. Named people are context only and MUST NOT
+be depicted. Do not generate portraits, likenesses, recognizable faces or celebrity
+recreations.
+
+NEGATIVE SUBJECTS:
+{forbidden}
+
+If the story does not intrinsically require people, use ZERO human figures, silhouettes
+or crowds. Never introduce unrelated people or unrelated activities.
+
+SECONDARY CONTEXT:
+{description}
 {intro}
 
-Make the PRIMARY NEWS EVENT the clear visual subject. Create one specific,
-coherent real-world scene that directly represents what the article reports,
-not merely its broad topic. Use supporting context only to improve the setting.
-Do not combine unrelated events or let secondary details replace the main event.
-
-IDENTITY ACCURACY:
-When a specific real person is named or clearly described in the PRIMARY NEWS EVENT,
-that exact person must be the visual subject. Do not replace the named person with
-a generic person, lookalike, unrelated public figure, or another person from the
-same profession. Preserve supported identity cues such as age range, sex, facial
-structure, hair and overall appearance as closely as possible. If multiple named
-people are present, keep their identities distinct and never merge or swap them.
-Do not invent additional people unless the PRIMARY NEWS EVENT requires them.
-
-Choose the most appropriate realistic scene. For a specific person, make that
-person the unmistakable focal point. For sport, show the relevant match. For
-finance, show the specific market or business development. For politics, show
-the relevant figure or official setting. For geopolitics, show the supported
-location and context. For emergencies or disasters, show the relevant scene
-without graphic injury. For a place, make the location the primary subject.
-
-Do not invent facts, events, people, actions, locations or objects not supported
-by the PRIMARY NEWS EVENT. Avoid generic stock images when a specific scene can
-be inferred. Use realistic perspective, natural lighting, natural anatomy,
-complete visible limbs, realistic hands and fingers, correct body proportions,
-depth of field and one clear focal point. Avoid awkward cropping of important
-body parts.
-
-NO TEXT OR MARKINGS: no words, letters, numbers, captions, headlines, logos,
-watermarks, signs, billboards, banners, posters, documents, readable screens,
-scoreboards, written clothing, jersey names, jersey numbers or brand marks.
-
-No collage, infographic, poster, illustration, cartoon, painting, fantasy or
-obvious AI-art look. This is an AI-generated editorial reconstruction, not a
-claim that this is a real photograph of the exact event. No graphic gore.
+Use secondary context only to clarify the locked subject. Keep one coherent scene.
+No text, letters, numbers, logos, signs, watermarks or readable markings.
+Photorealistic editorial photography, natural lighting, realistic materials, one clear
+focal point, no collage, infographic, illustration, cartoon, painting or fantasy.
+No graphic gore.
 """.strip()
 
-        # Keep the full instruction block and trim only supplied article text.
-        # The normal 350/50 limits are already small; this is a final safety path.
-        overhead = len(fixed.format(description="", intro=""))
+        overhead = len(
+            fixed.format(
+                title="",
+                label="",
+                subject="",
+                forbidden="",
+                description="",
+                intro="",
+            )
+        )
         available = max(0, 2048 - overhead)
 
-        # Preserve the description first; use remaining space for intro.
-        description_limit = min(len(description), available)
-        description_trimmed = description[:description_limit]
-        remaining = max(0, available - len(description_trimmed))
+        title_trimmed = title[:available]
+        remaining = max(0, available - len(title_trimmed))
+
+        label = lock["label"]
+        label_trimmed = label[:remaining]
+        remaining = max(0, remaining - len(label_trimmed))
+
+        subject = lock["subject"]
+        subject_trimmed = subject[:remaining]
+        remaining = max(0, remaining - len(subject_trimmed))
+
+        forbidden = lock["forbidden"]
+        forbidden_trimmed = forbidden[:remaining]
+        remaining = max(0, remaining - len(forbidden_trimmed))
+
+        description_trimmed = description[:remaining]
+        remaining = max(0, remaining - len(description_trimmed))
         intro_trimmed = intro[:remaining]
 
         prompt = fixed.format(
+            title=title_trimmed,
+            label=label_trimmed,
+            subject=subject_trimmed,
+            forbidden=forbidden_trimmed,
             description=description_trimmed,
             intro=intro_trimmed,
         )
 
-        # Absolute final guard. This can only activate in an unforeseen
-        # formatting/encoding edge case and guarantees Cloudflare's limit.
         if len(prompt) > 2048:
             prompt = prompt[:2048]
 
+    print(
+        f"[AI IMAGE] Visual lock: {lock['type']} | "
+        f"subject={lock['label']}"
+    )
+
     return prompt
-
-
-def _http_json(url: str) -> dict:
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": WIKIPEDIA_UA},
-        method="GET",
-    )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def _wikidata_is_human(entity_id: str) -> bool:
-    """Return True only when Wikidata explicitly classifies the entity as human."""
-    data = _http_json(
-        "https://www.wikidata.org/w/api.php?"
-        + urllib.parse.urlencode(
-            {
-                "action": "wbgetentities",
-                "ids": entity_id,
-                "props": "claims",
-                "format": "json",
-            }
-        )
-    )
-    entity = (data.get("entities") or {}).get(entity_id) or {}
-    claims = entity.get("claims") or {}
-    for claim in claims.get("P31", []):
-        mainsnak = claim.get("mainsnak") or {}
-        datavalue = mainsnak.get("datavalue") or {}
-        value = datavalue.get("value") or {}
-        if value.get("id") == "Q5":
-            return True
-    return False
-
-
-def _person_reference_from_slug(slug: str) -> tuple[bytes, str] | None:
-    """
-    Resolve a trend slug to a Wikipedia page that Wikidata explicitly marks
-    as a human, then return its thumbnail bytes and display name.
-
-    This is deliberately conservative: if the slug does not clearly resolve
-    to a human, the normal Cloudflare path is used.
-    """
-    if not PERSON_IMAGE_ENABLED or not any(HF_TOKENS):
-        return None
-
-    slug = _clean(slug, 160).strip("-")
-    if not slug:
-        return None
-
-    cache_path = PERSON_REF_DIR / f"{slug}.jpg"
-    if cache_path.exists() and cache_path.stat().st_size > 0:
-        try:
-            meta_path = cache_path.with_suffix(".json")
-            person_name = slug.replace("-", " ").strip()
-            if meta_path.exists():
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                person_name = str(meta.get("title") or person_name)
-            return cache_path.read_bytes(), person_name
-        except Exception:
-            pass
-
-    # The slug is intentionally the primary signal. This prevents arbitrary
-    # people mentioned deep in an article from hijacking the image subject.
-    search = slug.replace("-", " ")
-    query = urllib.parse.urlencode(
-        {
-            "action": "query",
-            "generator": "search",
-            "gsrsearch": search,
-            "gsrnamespace": "0",
-            "gsrlimit": "5",
-            "prop": "pageimages|pageprops",
-            "piprop": "thumbnail",
-            "pithumbsize": "640",
-            "ppprop": "wikibase_item",
-            "format": "json",
-            "formatversion": "2",
-        }
-    )
-
-    try:
-        data = _http_json(f"{WIKIPEDIA_API}?{query}")
-    except Exception:
-        return None
-
-    pages = (data.get("query") or {}).get("pages") or []
-    if isinstance(pages, dict):
-        pages = list(pages.values())
-
-    for page in pages:
-        entity_id = ((page.get("pageprops") or {}).get("wikibase_item") or "").strip()
-        thumbnail = (page.get("thumbnail") or {}).get("source")
-        title = (page.get("title") or "").strip()
-
-        if not entity_id or not thumbnail or not title:
-            continue
-
-        try:
-            if not _wikidata_is_human(entity_id):
-                continue
-        except Exception:
-            continue
-
-        try:
-            request = urllib.request.Request(
-                thumbnail,
-                headers={"User-Agent": WIKIPEDIA_UA},
-                method="GET",
-            )
-            with urllib.request.urlopen(request, timeout=30) as response:
-                image_bytes = response.read()
-            if not image_bytes:
-                continue
-
-            # Validate and normalize the reference before caching it.
-            with Image.open(io.BytesIO(image_bytes)) as im:
-                im = im.convert("RGB")
-                im.thumbnail((480, 480), Image.Resampling.LANCZOS)
-                buffer = io.BytesIO()
-                im.save(buffer, "JPEG", quality=92)
-                image_bytes = buffer.getvalue()
-
-            cache_path.write_bytes(image_bytes)
-            cache_path.with_suffix(".json").write_text(
-                json.dumps(
-                    {"title": title, "entity_id": entity_id},
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            return image_bytes, title
-        except Exception:
-            continue
-
-    return None
-
-
-def _person_prompt(article: dict, person_name: str) -> str:
-    """Build the person-specific Kontext prompt."""
-    description = _clean(article.get("description"), 500)
-    intro = _clean(
-        article.get("intro")
-        or (article.get("paragraphs") or [""])[0],
-        250,
-    )
-
-    if not description:
-        description = "a current news story involving the referenced person"
-
-    return f"""
-Create ONE photorealistic editorial news photograph using input_image_0 as the
-identity reference for {person_name}.
-
-IDENTITY:
-Keep the exact same person from the reference image. Preserve recognizable facial
-identity, facial structure, eyes, nose, mouth, hair, age and overall appearance.
-Do not replace the person with a generic person, lookalike or another public figure.
-
-PRIMARY NEWS EVENT:
-{description}
-
-SUPPORTING CONTEXT:
-{intro}
-
-Create one specific, coherent real-world editorial scene that directly represents
-the article. The referenced person must be the unmistakable visual focal point.
-Change the setting, pose and composition naturally while preserving identity.
-
-Use realistic skin texture, natural anatomy, realistic hands and fingers, complete
-visible limbs, correct body proportions, natural lighting and professional
-photography. Natural 3:2 composition.
-
-Do not invent unsupported events or actions. No text, captions, logos, watermarks,
-readable signs, billboards, posters, documents or readable screens. No collage,
-infographic, illustration, cartoon or obvious AI-art look.
-""".strip()
-
-
-def _hf_person_request(image_bytes: bytes, prompt: str) -> bytes:
-    if InferenceClient is None:
-        raise RuntimeError(
-            "huggingface_hub is not installed; install it with "
-            "'python -m pip install -U huggingface_hub'."
-        )
-
-    if not any(HF_TOKENS):
-        raise RuntimeError(
-            "No Hugging Face tokens are set. "
-            "Set HF_TOKEN_1, HF_TOKEN_2 and HF_TOKEN_3."
-        )
-
-    last_error = None
-
-    # Same tested failover behavior as the standalone 3-token module:
-    # token 1 -> token 2 -> token 3 only when the current token is exhausted.
-    for token_index, token in enumerate(HF_TOKENS, start=1):
-        if not token:
-            continue
-
-        print(
-            f"[HF PERSON] Trying Hugging Face token "
-            f"{token_index}/{len(HF_TOKENS)}..."
-        )
-
-        client = InferenceClient(
-            provider=HF_PROVIDER,
-            api_key=token,
-            timeout=HF_PERSON_TIMEOUT,
-        )
-
-        try:
-            image = client.image_to_image(
-                image=image_bytes,
-                prompt=prompt,
-                model=HF_PERSON_MODEL,
-            )
-            print(f"[HF PERSON] Token {token_index} succeeded.")
-
-            output = io.BytesIO()
-            image.save(output, format="JPEG", quality=95)
-            return output.getvalue()
-
-        except Exception as exc:
-            last_error = exc
-            error_text = str(exc)
-
-            # Hugging Face returns HTTP 402 when the token's included
-            # Inference Provider credits are depleted. Only then rotate.
-            is_credit_exhausted = (
-                "402" in error_text
-                or "Payment Required" in error_text
-                or "depleted your monthly included credits" in error_text
-                or "monthly included credits" in error_text
-            )
-
-            if is_credit_exhausted:
-                print(
-                    f"[HF PERSON] Token {token_index} exhausted. "
-                    "Rotating to the next token..."
-                )
-                continue
-
-            raise RuntimeError(
-                f"Hugging Face token {token_index} failed: {error_text}"
-            ) from exc
-
-    raise RuntimeError(
-        "All configured Hugging Face tokens are exhausted or unavailable. "
-        f"Last error: {last_error}"
-    )
-
-
-def _try_person_image(article: dict) -> bytes | None:
-    """
-    Attempt the HF identity-preserving route only for a trend whose slug
-    resolves to a verified human. Any lookup/generation failure falls back
-    to Cloudflare so one person-image failure never breaks publication.
-    """
-    if not PERSON_IMAGE_ENABLED or not any(HF_TOKENS):
-        return None
-
-    slug = _clean(article.get("slug"), 120)
-    if not slug:
-        return None
-
-    reference = _person_reference_from_slug(slug)
-    if not reference:
-        return None
-
-    image_bytes, person_name = reference
-    prompt = _person_prompt(article, person_name)
-
-    try:
-        result = _hf_person_request(image_bytes, prompt)
-        print(
-            f"[AI IMAGE] PERSON ROUTE: {person_name} "
-            "via Hugging Face / FLUX.1 Kontext"
-        )
-        return result
-    except Exception as exc:
-        print(
-            f"[AI IMAGE] PERSON ROUTE FAILED ({person_name}); "
-            f"falling back to Cloudflare: {exc}"
-        )
-        return None
 
 
 def _api_request_once(
@@ -596,63 +934,156 @@ def _api_request_once(
 
 
 def _is_quota_exhausted_error(exc: Exception) -> bool:
-    """Return True only for errors that look like account quota/rate exhaustion."""
+    """
+    Return True only for errors that strongly indicate a depleted account
+    allocation, not merely a transient HTTP 429/rate-limit condition.
+
+    This distinction matters because a temporary rate limit must not permanently
+    remove a healthy account from the pool for the rest of the run.
+    """
     message = str(exc).lower()
-    quota_markers = (
-        "account limited",
-        "daily limit",
+
+    # Cloudflare Workers AI daily free allocation / neuron exhaustion.
+    daily_allocation_markers = (
+        "used up your daily free allocation",
+        "daily free allocation",
+        "daily allocation",
         "daily quota",
+        "daily limit",
         "quota exceeded",
-        "rate limit",
-        "rate_limit",
-        "too many requests",
-        "http 429",
-        "http 402",
+        "neurons",
     )
-    return any(marker in message for marker in quota_markers)
+    if any(marker in message for marker in daily_allocation_markers):
+        return True
+
+    # Other explicit exhaustion/payment signals.
+    exhausted_markers = (
+        "account limited",
+        "credits exhausted",
+        "allocation exhausted",
+        "limit exceeded",
+    )
+    return any(marker in message for marker in exhausted_markers)
+
+
+_CF_ACCOUNTS = [
+    (ACCOUNT_ID, API_TOKEN, "Cloudflare account 1"),
+    (ACCOUNT_ID_2, API_TOKEN_2, "Cloudflare account 2"),
+    (ACCOUNT_ID_3, API_TOKEN_3, "Cloudflare account 3"),
+]
+
+# Production must start with all three Cloudflare accounts configured.
+# Previously, incomplete pairs were silently filtered out, causing the process
+# to run with only account 1 and making the fallback appear broken.
+def _validate_cf_accounts() -> None:
+    missing: list[str] = []
+
+    for account_no, (account_id, token, _label) in enumerate(
+        _CF_ACCOUNTS, start=1
+    ):
+        suffix = "" if account_no == 1 else f"_{account_no}"
+
+        if not account_id:
+            missing.append(f"CLOUDFLARE_ACCOUNT_ID{suffix}")
+        if not token:
+            missing.append(f"CLOUDFLARE_API_TOKEN{suffix}")
+
+    if missing:
+        raise RuntimeError(
+            "Cloudflare image rotation requires all 3 accounts. "
+            "Missing environment variables: "
+            + ", ".join(missing)
+        )
+
+    print(
+        "[AI IMAGE] Cloudflare account pool: "
+        "account 1=CONFIGURED, account 2=CONFIGURED, account 3=CONFIGURED"
+    )
+
+
+_CF_NEXT_ACCOUNT = 0
+
+# Accounts that have returned a quota/rate exhaustion error during this
+# process run. Once exhausted, skip them for all subsequent generation
+# requests instead of retrying a known-depleted account.
+_CF_EXHAUSTED_ACCOUNTS: set[int] = set()
+
+
+def _configured_cf_accounts() -> list[tuple[str, str, str]]:
+    # Validation above guarantees that all three production accounts are
+    # complete. Return the full pool in fixed order.
+    return list(_CF_ACCOUNTS)
 
 
 def _api_request(prompt: str) -> bytes:
-    if not ACCOUNT_ID:
-        raise RuntimeError("CLOUDFLARE_ACCOUNT_ID is not set.")
-    if not API_TOKEN:
-        raise RuntimeError("CLOUDFLARE_API_TOKEN is not set.")
+    """
+    Generate an image using the configured Cloudflare accounts.
 
-    # Use account 1 until Cloudflare reports quota/rate exhaustion.
-    try:
-        return _api_request_once(
-            prompt,
-            ACCOUNT_ID,
-            API_TOKEN,
-            "Cloudflare account 1",
+    Accounts that return quota/rate exhaustion are marked exhausted for the
+    current process run and skipped on every subsequent call. This prevents
+    regeneration from repeatedly retrying an account whose daily allocation
+    is already depleted.
+    """
+    global _CF_NEXT_ACCOUNT
+
+    _validate_cf_accounts()
+    accounts = _configured_cf_accounts()
+
+    available = [
+        index for index in range(len(accounts))
+        if index not in _CF_EXHAUSTED_ACCOUNTS
+    ]
+    if not available:
+        raise RuntimeError(
+            "All configured Cloudflare accounts are exhausted for this run."
         )
-    except Exception as first_exc:
-        # Only fail over for quota/rate exhaustion. Authentication,
-        # malformed requests, network errors, etc. should not silently
-        # switch accounts because they indicate a different problem.
-        if not _is_quota_exhausted_error(first_exc):
-            raise
 
-        if not ACCOUNT_ID_2 or not API_TOKEN_2:
-            raise RuntimeError(
-                "Cloudflare account 1 quota/rate limit reached, "
-                "but second account credentials are not configured. "
-                f"Original error: {first_exc}"
-            ) from first_exc
+    start_index = _CF_NEXT_ACCOUNT % len(accounts)
+    last_error = None
+
+    for offset in range(len(accounts)):
+        index = (start_index + offset) % len(accounts)
+
+        if index in _CF_EXHAUSTED_ACCOUNTS:
+            continue
+
+        account_id, token, label = accounts[index]
 
         try:
-            return _api_request_once(
+            print(f"[AI IMAGE] Generating with {label}...")
+            result = _api_request_once(
                 prompt,
-                ACCOUNT_ID_2,
-                API_TOKEN_2,
-                "Cloudflare account 2",
+                account_id,
+                token,
+                label,
             )
-        except Exception as second_exc:
-            raise RuntimeError(
-                "Cloudflare account 1 quota/rate limit reached and "
-                "account 2 also failed. "
-                f"Account 1: {first_exc}; Account 2: {second_exc}"
-            ) from second_exc
+
+            # Next successful generation starts with the other account.
+            _CF_NEXT_ACCOUNT = (index + 1) % len(accounts)
+            return result
+
+        except Exception as exc:
+            last_error = exc
+            print(f"[AI IMAGE] {label} failed: {exc}")
+
+            if _is_quota_exhausted_error(exc):
+                _CF_EXHAUSTED_ACCOUNTS.add(index)
+                print(
+                    f"[AI IMAGE] {label} marked EXHAUSTED for this run; "
+                    "skipping it on subsequent requests."
+                )
+                continue
+
+            # Non-quota errors are not silently masked by account rotation.
+            raise
+
+    raise RuntimeError(
+        "All available Cloudflare accounts failed for image generation. "
+        f"Last error: {last_error}"
+    )
+
+
+
 
 
 def _save_webp(image_bytes: bytes, slug: str) -> str:
@@ -698,6 +1129,8 @@ def _save_webp(image_bytes: bytes, slug: str) -> str:
     return f"{SITE_URL.rstrip('/')}/assets/articles/{target.name}"
 
 
+
+
 def generate_article_image(
     article: dict,
     news: list | None = None,
@@ -722,19 +1155,54 @@ def generate_article_image(
 
     started = time.perf_counter()
 
-    # PERSON ROUTE:
-    # Verified human slugs use Hugging Face + reference image.
-    # Everything else remains on the existing Cloudflare pipeline.
-    image_bytes = _try_person_image(article)
+    # UNIVERSAL TOPIC-ONLY ROUTE:
+    # Named people are context only and are NEVER generated as visual subjects.
+    # Cloudflare is the ONLY image generator. The existing three-account
+    # Cloudflare pool rotates/fails over through _api_request().
+    #
+    # No post-generation AI vision/ is used. A successful
+    # Cloudflare generation is accepted directly. Semantic control is handled
+    # by the headline-first topic-only prompt above.
+    prompt = _build_prompt(article, news=news)
 
-    if image_bytes is not None:
-        public_url = _save_webp(image_bytes, slug)
-    else:
-        prompt = _build_prompt(article, news=news)
-        image_bytes = _api_request(prompt)
-        public_url = _save_webp(image_bytes, slug)
+    image_bytes = None
+    generated_source = ""
+
+    for cf_attempt in range(1, 4):
+        try:
+            print(
+                f"[AI IMAGE] Cloudflare generation attempt "
+                f"{cf_attempt}/3..."
+            )
+            image_bytes = _api_request(prompt)
+            generated_source = "Cloudflare / FLUX.1 Schnell"
+            print(
+                f"[AI IMAGE] Cloudflare generation attempt "
+                f"{cf_attempt}/3 succeeded | slug={slug}"
+            )
+            break
+
+        except Exception as exc:
+            print(
+                f"[AI IMAGE] Cloudflare generation attempt "
+                f"{cf_attempt}/3 failed | slug={slug} | error={exc}"
+            )
+
+    if image_bytes is None:
+        print(
+            f"[AI IMAGE] ALL CLOUDFLARE GENERATION ATTEMPTS FAILED "
+            f"-> no image | slug={slug}"
+        )
+        return None
+
+    public_url = _save_webp(image_bytes, slug)
 
     elapsed = round(time.perf_counter() - started, 2)
+
+    print(
+        f"[AI IMAGE] ACCEPTED | {slug} | source={generated_source} "
+        f"| elapsed={elapsed:.2f}s"
+    )
 
     return {
         "image": public_url,
@@ -742,3 +1210,4 @@ def generate_article_image(
         "ai_generated": True,
         "elapsed": f"{elapsed:.2f}",
     }
+

@@ -1026,5 +1026,9 @@
   "retraite-en-france": {
     "published_at": "2026-09-01 12:36",
     "order": -257
+  },
+  "patrick-bruel": {
+    "published_at": "2026-09-01 21:39",
+    "order": -258
   }
 }
