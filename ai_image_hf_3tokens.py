@@ -67,6 +67,7 @@ HF_TOKENS = [
     os.getenv("HF_TOKEN_1", "").strip(),
     os.getenv("HF_TOKEN_2", "").strip(),
     os.getenv("HF_TOKEN_3", "").strip(),
+    os.getenv("HF_TOKEN_4", "").strip(),
 ]
 # Backward compatibility with the old single-token variable.
 if not any(HF_TOKENS):
@@ -422,7 +423,7 @@ def _hf_person_request(image_bytes: bytes, prompt: str) -> bytes:
     if not any(HF_TOKENS):
         raise RuntimeError(
             "No Hugging Face tokens are set. "
-            "Set HF_TOKEN_1, HF_TOKEN_2 and HF_TOKEN_3."
+            "Set HF_TOKEN_1, HF_TOKEN_2, HF_TOKEN_3 and HF_TOKEN_4."
         )
 
     last_error = None
