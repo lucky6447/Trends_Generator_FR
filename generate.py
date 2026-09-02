@@ -1,4 +1,13 @@
+import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 print("[TrendCurrent PIPELINE] universal-fact-lock-v2.4-evidence-gate")
+
 import re
 import os
 import subprocess
@@ -19,6 +28,7 @@ from html_generator import render_article, save_article
 from processed import load_processed, add_processed
 from index_generator import update_all
 from topic_scorer import rank_trends, score_with_news, select_final_candidates, filter_relevant_news
+import generator_monitor as monitor
 
 REQUIRED_FIELDS = ["title", "description", "h1", "paragraphs"]
 
@@ -365,6 +375,9 @@ SOURCE HEADLINES:
         }
 
 
+SEMANTIC_RESCUE_MIN_CONFIDENCE = 90
+
+
 def _decide_story_sources(news, topic):
     """Single authority for choosing the exact sources used by evidence extraction."""
     items = list(news or [])
@@ -426,6 +439,37 @@ def _decide_story_sources(news, topic):
                 f"(confidence={semantic.get('confidence', 0)}; reason={semantic.get('reason', '')})"
             )
 
+        # IMPORTANT: semantic rescue may recover a lexical false negative, but
+        # it must not be allowed to create a story from a pool with ZERO
+        # deterministic corroboration. A single lexical source is only a topic
+        # match, not evidence that multiple sources describe the same concrete
+        # event. This blocks cases such as:
+        #   lexical 1/4 + semantic DOMINANT_STORY
+        # where the model can incorrectly group separate developments around
+        # the same person, team, tournament, or broad topic.
+        #
+        # We still preserve the useful rescue path when at least two sources
+        # already form a deterministic story cluster. In that case semantic
+        # arbitration can expand/confirm the concrete story despite wording
+        # differences.
+        semantic_rescue_has_foothold = profile.get("dominant", 0) >= 2
+
+        if semantic["status"] in {"ONE_STORY", "DOMINANT_STORY"}:
+            if semantic.get("confidence", 0) < SEMANTIC_RESCUE_MIN_CONFIDENCE:
+                raise Exception(
+                    "Story source decision rejected low-confidence semantic rescue "
+                    f"(confidence={semantic.get('confidence', 0)} < "
+                    f"{SEMANTIC_RESCUE_MIN_CONFIDENCE}; "
+                    f"semantic={semantic['status']})"
+                )
+            if not semantic_rescue_has_foothold:
+                raise Exception(
+                    "Story source decision rejected semantic rescue without "
+                    "deterministic corroboration "
+                    f"(lexical dominant={profile.get('dominant', 0)}/{count}; "
+                    f"semantic={semantic['status']}; confidence={semantic.get('confidence', 0)})"
+                )
+
         if semantic["status"] == "ONE_STORY":
             selected_indices = list(range(count))
             reason = "semantic one story"
@@ -440,7 +484,20 @@ def _decide_story_sources(news, topic):
             minimum_majority = max(3, int(count * 0.50 + 0.999))
             if len(numbers) < minimum_majority:
                 raise Exception("Story source judge returned an insufficient dominant majority")
+
             selected_indices = [n - 1 for n in numbers]
+
+            # The semantic rescue must retain at least one deterministic
+            # corroborating pair from the lexical dominant cluster. This
+            # prevents the model from selecting a majority that is semantically
+            # related only through a broad topic/person/tournament.
+            lexical_cluster = set(profile.get("cluster") or [])
+            if len(lexical_cluster) < 2 or not lexical_cluster.issubset(set(selected_indices)):
+                raise Exception(
+                    "Story source decision rejected semantic dominant rescue "
+                    "without retained deterministic story core"
+                )
+
             reason = "semantic dominant story"
             status = "PASS"
             print(
@@ -463,6 +520,16 @@ def _decide_story_sources(news, topic):
     print(
         f"[TOPIC FILTER] STORY SOURCE DECISION PASS | "
         f"kept={len(selected_indices)}/{count} | reason={reason} | semantic={semantic_status}"
+    )
+    monitor.candidate_event(
+        "story_source_selection",
+        status=status,
+        reason=reason,
+        source_count=count,
+        selected_indices=selected_indices,
+        selected_count=len(selected_indices),
+        semantic_status=semantic_status,
+        profile=profile,
     )
     for idx in selected_indices:
         print(f"[TOPIC FILTER] Evidence source -> {str(items[idx].get('title', '')).strip()}")
@@ -1164,6 +1231,13 @@ reason must be a concise editorial explanation, maximum 35 words.
         f"[STORY QUALITY] {verdict} | confidence={confidence} "
         f"| {reason or 'No reason supplied'}"
     )
+    monitor.candidate_event(
+        "story_quality",
+        verdict=verdict,
+        confidence=confidence,
+        reason=reason,
+        local_flags=local_flags,
+    )
 
     if verdict != "PASS":
         raise Exception(
@@ -1262,6 +1336,14 @@ def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max
                 reference_date=reference_date,
             )
 
+            monitor.candidate_event(
+                "fact_guard",
+                status=guard.get("status"),
+                review_items=guard.get("review_items"),
+                blocking_issues=guard.get("blocking_issues"),
+                guard=guard,
+            )
+
             if guard["status"] != "PASS":
                 print("[FACT GUARD] FLAG - article requires repair.")
                 print(json.dumps(guard, ensure_ascii=False, indent=2))
@@ -1282,6 +1364,15 @@ def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max
                         fact_guard_source,
                         repaired,
                         reference_date=reference_date,
+                    )
+
+                    monitor.candidate_event(
+                        "fact_guard_repair_check",
+                        status=repaired_guard.get("status"),
+                        review_items=repaired_guard.get("review_items"),
+                        blocking_issues=repaired_guard.get("blocking_issues"),
+                        guard=repaired_guard,
+                        repaired_article=repaired,
                     )
 
                     if repaired_guard["status"] != "PASS":
@@ -1375,6 +1466,7 @@ def git_push():
 
 
 def main():
+    monitor.start_run(language=LANGUAGE, model=MODEL, pipeline="universal-fact-lock-v2.4-evidence-gate", max_articles=MAX_ARTICLES_PER_RUN)
     processed = load_processed()
     trends = fetch_trends()
     print(f"[TOPIC FILTER] Raw trends received: {len(trends)}")
@@ -1418,6 +1510,34 @@ def main():
     for trend in candidate_trends:
         keyword = trend["title"]
 
+        # ------------------------------------------------------------
+        # SIMPLE EDITORIAL SKIP: result / live / score
+        # ------------------------------------------------------------
+        keyword_lower = unicodedata.normalize("NFKD", keyword).casefold()
+        keyword_lower = "".join(
+            ch for ch in keyword_lower
+            if not unicodedata.combining(ch)
+        )
+        skip_terms = (
+            # English
+            "result", "live", "score",
+            # German
+            "ergebnis", "spielstand",
+            # Spanish
+            "resultado", "marcador", "puntuacion",
+            # French
+            "resultat", "score",
+            # Italian
+            "risultato", "punteggio",
+            # Portuguese
+            "resultado", "marcador", "placar",
+            # Indonesian
+            "hasil", "skor",
+        )
+        if any(term in keyword_lower for term in skip_terms):
+            print(f"[TrendCurrent] SKIP result/live/score trend: {keyword}")
+            continue
+
         try:
             print(
                 f"\n[TOPIC FILTER] Retrieving sources for candidate: "
@@ -1441,9 +1561,16 @@ def main():
                         seed["content"] = extract_article(seed["link"])
                     except Exception:
                         seed["content"] = ""
-                entity_query = _build_related_story_query(keyword)
+                # IMPORTANT: corroboration must be anchored to the concrete
+                # discovery story, not merely to the trend/topic keyword.
+                # Generic topics such as DFB-Pokal can contain many independent
+                # matches/events. Searching the broad keyword recreates a mixed
+                # source pool and forces Story Concentration to solve a problem
+                # that should have been prevented at retrieval time.
+                seed_anchor = str(seed.get("title", "")).strip() or keyword
+                entity_query = _build_related_story_query(seed_anchor)
                 if not entity_query:
-                    entity_query = keyword.split(" - ")[0].strip()
+                    entity_query = seed_anchor.split(" - ")[0].strip()
 
                 # The discovery category is only a discovery hint. Never append it
                 # to the corroboration query: doing so can misclassify a local
@@ -1551,6 +1678,7 @@ def main():
         if generated >= MAX_ARTICLES_PER_RUN:
             break
         keyword = trend["title"]
+        monitor.start_candidate(keyword, trend=trend)
         news = trend["news"]
         story_selection = trend.get("_story_selection")
 
@@ -1596,6 +1724,16 @@ def main():
                     f"[TOPIC FILTER] EVIDENCE USABILITY PASS | "
                     f"facts={len(evidence_lock.get('facts', []))} | {keyword}"
                 )
+                monitor.candidate_event(
+                    "evidence_locked",
+                    news_count=len(news),
+                    selected_source_indices=(story_selection or {}).get("selected_indices", []),
+                    selected_source_count=(story_selection or {}).get("selected_count"),
+                    evidence_source_chars=len(evidence_source),
+                    evidence_facts=evidence_lock.get("facts", []),
+                    evidence_fact_count=len(evidence_lock.get("facts", [])) if isinstance(evidence_lock.get("facts", []), list) else None,
+                    evidence_lock=evidence_lock,
+                )
             except Exception as evidence_error:
                 # Terminal candidate rejection: this topic has no usable
                 # source-locked evidence. It consumes ZERO article slots and
@@ -1608,6 +1746,7 @@ def main():
                     f"[TOPIC FILTER] REJECT | article_slot=0 | "
                     f"{keyword} | evidence={evidence_error}"
                 )
+                monitor.finish_candidate("REJECT", reason=f"evidence={evidence_error}")
                 continue
 
             article = generate_valid_article(
@@ -1617,6 +1756,18 @@ def main():
                 trend,
                 max_attempts=1,
                 prelocked_evidence=evidence_lock,
+            )
+
+            _paragraph_text = " ".join(str(p) for p in article.get("paragraphs", [])).strip()
+            _locked_facts = evidence_lock.get("facts", []) if isinstance(evidence_lock, dict) else []
+            monitor.candidate_event(
+                "article_generated",
+                article=article,
+                article_word_count=len(_paragraph_text.split()),
+                evidence_fact_count=len(_locked_facts) if isinstance(_locked_facts, list) else None,
+                evidence_facts=_locked_facts,
+                evidence_coverage=None,
+                information_density=None,
             )
 
             # --------------------------------------------------------
@@ -1637,6 +1788,7 @@ def main():
             generated += 1
 
             print(f"OK -> {slug}.html")
+            monitor.finish_candidate("PASS", slug=slug)
 
         except Exception as e:
             # Any candidate that fails after evidence lock is terminal for this
@@ -1649,6 +1801,7 @@ def main():
                 f"[GENERATION] REJECT | article_slot=0 | "
                 f"{keyword} | {e}"
             )
+            monitor.finish_candidate("REJECT", reason=str(e))
 
     try:
         update_all()
@@ -1660,6 +1813,7 @@ def main():
         print("UPDATE ERROR:", e)
 
     print(f"Finished. Generated {generated} article(s).")
+    monitor.end_run(generated=generated, status="FINISHED")
 
     if generated:
         git_push()

@@ -83,6 +83,74 @@ SKIP_PATTERNS_BY_LANG = {
     "id": (" vs ", " v ", " live", " skor", " hasil", "stream", "streaming", "jadwal"),
 }
 
+
+# Concrete sports match / fixture topics are excluded from article generation.
+#
+# Intentionally narrow: ordinary sports news remains eligible. A title must
+# contain BOTH a matchup-style separator and a strong sports signal.
+SPORTS_MATCH_SEPARATORS = (
+    r"\s+vs\.?\s+",
+    r"\s+v\.?\s+",
+    r"\s[-–—]\s",
+)
+
+SPORTS_MATCH_TERMS = (
+    # Strong league / sport signals
+    r"\bmlb\b", r"\bnfl\b", r"\bnba\b", r"\bnhl\b", r"\bmls\b",
+    r"\bbaseball\b", r"\bfootball\b", r"\bbasketball\b", r"\bhockey\b",
+
+    # Explicit fixture language
+    r"\bmatch\b", r"\bmatchup\b", r"\bfixture\b", r"\bgame\b",
+
+    # Competition language
+    r"\bplayoff(?:s)?\b", r"\bsemifinal(?:s)?\b", r"\bquarterfinal(?:s)?\b",
+    r"\bchampionship\b", r"\bfinal(?:s)?\b",
+
+    # Major competition names
+    r"\bpremier league\b", r"\bchampions league\b", r"\beuropa league\b",
+    r"\bla liga\b", r"\bserie a\b", r"\bbundesliga\b",
+
+    # High-confidence team/entity signals for fixture-style titles.
+    # Keep these specific to avoid false positives from generic words such as
+    # "giants", "united", "city", or "rangers".
+    r"\bmariners\b", r"\bred sox\b", r"\byankees\b",
+    r"\bdodgers\b", r"\bcubs\b", r"\bcardinals\b",
+    r"\bpadres\b", r"\bphillies\b", r"\bbraves\b",
+    r"\bastros\b", r"\btwins\b", r"\bguardians\b", r"\btigers\b",
+    r"\broyals\b", r"\bblue jays\b", r"\borioles\b",
+    r"\brays\b", r"\bbrewers\b", r"\bmets\b", r"\bnationals\b",
+    r"\bathletics\b", r"\bangels\b", r"\breds\b",
+    r"\blakers\b", r"\bceltics\b", r"\bwarriors\b",
+    r"\bknicks\b", r"\bnets\b", r"\bbulls\b", r"\bheat\b",
+    r"\bsuns\b", r"\bnuggets\b", r"\b76ers\b", r"\bclippers\b",
+    r"\bchiefs\b", r"\beagles\b", r"\bcowboys\b", r"\bpackers\b",
+    r"\b49ers\b", r"\bseahawks\b", r"\bbills\b", r"\bravens\b",
+    r"\bpatriots\b", r"\bsteelers\b", r"\bjets\b", r"\bdolphins\b",
+    r"\bgiants\b",
+    r"\bbarcelona\b", r"\breal madrid\b", r"\batletico madrid\b",
+    r"\bmanchester united\b", r"\bmanchester city\b",
+    r"\bliverpool\b", r"\barsenal\b", r"\bchelsea\b",
+    r"\btottenham\b", r"\bbayern munich\b", r"\bborussia dortmund\b",
+    r"\bjuventus\b", r"\bac milan\b", r"\binter milan\b",
+)
+
+def _is_sports_match_topic(title: str) -> bool:
+    t = _norm(title)
+
+    # A separator is mandatory, so "Mariners news" and "Red Sox trade"
+    # remain valid candidates.
+    if not any(
+        re.search(pattern, t, re.IGNORECASE)
+        for pattern in SPORTS_MATCH_SEPARATORS
+    ):
+        return False
+
+    # A strong sports signal is also mandatory.
+    return any(
+        re.search(pattern, t, re.IGNORECASE)
+        for pattern in SPORTS_MATCH_TERMS
+    )
+
 NOISE_PATTERNS_BY_LANG = {
     "en": (
         r"\bhoroscope(?:s)?\b", r"\blottery results?\b", r"\bweather forecast\b",
@@ -423,6 +491,8 @@ def _skip_reason(title: str) -> str | None:
     t = _norm(title)
     if _is_routine_weather(title):
         return "routine weather/forecast topic"
+    if _is_sports_match_topic(title):
+        return "concrete sports match/fixture topic"
     patterns = _localized_patterns(SKIP_PATTERNS_BY_LANG)
     for pattern in patterns:
         if pattern.startswith(" ") or pattern.endswith(" "):

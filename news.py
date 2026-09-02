@@ -153,9 +153,33 @@ def _is_usable_source_image(url):
     if not value:
         return False
 
+    # Reject escaped/malformed URLs before they reach the article HTML.
+    if "\\" in value:
+        return False
+
     low = value.casefold()
 
+    # Only real web URLs are allowed.
+    if not low.startswith(("http://", "https://")):
+        return False
+
     if low.startswith(("data:", "javascript:")):
+        return False
+
+    try:
+        parsed = requests.utils.urlparse(value)
+
+        if parsed.scheme not in {"http", "https"}:
+            return False
+
+        if not parsed.hostname:
+            return False
+
+        # Reject obviously malformed host/path structures.
+        if "://" in parsed.path:
+            return False
+
+    except Exception:
         return False
 
     blocked = (
@@ -211,9 +235,14 @@ def extract_source_image(url):
     seen = set()
 
     for candidate in parser.candidates:
+        candidate = str(candidate or "").strip()
+
+        # Normalize common escaped URL forms found in JSON/HTML.
+        candidate = candidate.replace("\\/", "/")
+
         image_url = urljoin(
             final_url or publisher_url,
-            str(candidate).strip(),
+            candidate,
         )
 
         if not image_url or image_url in seen:
