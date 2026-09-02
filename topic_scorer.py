@@ -27,6 +27,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import unicodedata
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Sequence, Set, Tuple
@@ -591,6 +592,91 @@ def rank_trends(trends: Sequence[Dict[str, Any]], processed: Iterable[str], limi
         )
 
     return selected
+
+def _normalize_topic_match_text(text: Any) -> str:
+    text = unicodedata.normalize("NFKD", str(text or ""))
+    text = text.encode("ascii", "ignore").decode("ascii").casefold()
+    text = re.sub(r"[-–—_/]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+GERMAN_STATES = (
+    "baden wuerttemberg", "bayern", "berlin", "brandenburg", "bremen",
+    "hamburg", "hessen", "mecklenburg vorpommern", "niedersachsen",
+    "nordrhein westfalen", "rheinland pfalz", "saarland", "sachsen",
+    "sachsen anhalt", "schleswig holstein", "thueringen",
+)
+
+
+def _topic_state(topic: Any) -> str:
+    text = _normalize_topic_match_text(topic)
+    for state in sorted(GERMAN_STATES, key=len, reverse=True):
+        if re.search(rf"(?<!\w){re.escape(state)}(?!\w)", text):
+            return state
+    return ""
+
+
+def _topic_anchor_tokens(topic: Any) -> Set[str]:
+    text = _normalize_topic_match_text(topic)
+    stop = {
+        "wahl", "wahlprognose", "prognose", "umfrage", "nachrichten", "news",
+        "latest", "today", "update", "bericht", "berlin", "deutschland",
+        "germany", "german", "deutsch", "gala", "live", "ergebnis",
+        "entscheidung", "bombenentscharfung", "entscharfung",
+    }
+    return {
+        token for token in re.findall(r"[a-z0-9]+", text)
+        if len(token) >= 4 and token not in stop
+    }
+
+
+def filter_relevant_news(trend: Dict[str, Any], news: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deterministic topic/news gate; regional identity has priority."""
+    topic = _clean(trend.get("title"))
+    state = _topic_state(topic)
+    anchors = _topic_anchor_tokens(topic)
+    valid_news = [x for x in news if isinstance(x, dict)]
+
+    relevant = []
+    for item in valid_news:
+        haystack = _normalize_topic_match_text(" ".join([
+            str(item.get("title", "")),
+            str(item.get("summary", "")),
+            str(item.get("content", ""))[:4000],
+        ]))
+
+        # If the topic names a German federal state, the state is a hard
+        # geographic identity requirement. This is the exact protection needed
+        # for Sachsen-Anhalt vs Mecklenburg-Vorpommern.
+        if state:
+            if state not in haystack:
+                continue
+            relevant.append(item)
+            continue
+
+        # Multi-word named entities (e.g. Katja Kipping): require all name
+        # tokens, avoiding unrelated stories that happen to share one word.
+        if len(anchors) >= 2:
+            if all(re.search(rf"(?<!\w){re.escape(a)}(?!\w)", haystack) for a in anchors):
+                relevant.append(item)
+            continue
+
+        # Single distinctive entity/topic anchor.
+        if anchors and any(re.search(rf"(?<!\w){re.escape(a)}(?!\w)", haystack) for a in anchors):
+            relevant.append(item)
+            continue
+
+        # Generic topics are intentionally left to Story Concentration.
+        if not anchors:
+            relevant.append(item)
+
+    print(
+        f"[TOPIC FILTER] TOPIC/NEWS RELEVANCE | topic={topic} | "
+        f"anchors={','.join(sorted(anchors)) or '-'} | "
+        f"state={state or '-'} | kept={len(relevant)}/{len(valid_news)}"
+    )
+    return relevant
+
 
 def score_with_news(trend: Dict[str, Any], news: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """

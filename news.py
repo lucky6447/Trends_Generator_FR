@@ -5,7 +5,13 @@ import trafilatura
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urljoin
+from html.parser import HTMLParser
+
+try:
+    from googlenewsdecoder import gnewsdecoder
+except Exception:
+    gnewsdecoder = None
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
@@ -33,6 +39,207 @@ def clean(value):
     value = re.sub(r"<[^>]+>", " ", str(value))
     value = value.replace("&nbsp;", " ").replace("&amp;", "&")
     return " ".join(value.split())
+
+
+_GOOGLE_NEWS_DECODE_CACHE = {}
+_GOOGLE_NEWS_DECODE_LOCK = __import__("threading").Lock()
+
+
+class _SourceImageParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.candidates = []
+        self._in_jsonld = False
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+
+        if tag.lower() == "meta":
+            key = (attrs.get("property") or attrs.get("name") or "").strip().lower()
+            value = (attrs.get("content") or "").strip()
+            if value and key in {
+                "og:image",
+                "og:image:url",
+                "og:image:secure_url",
+                "twitter:image",
+                "twitter:image:src",
+            }:
+                self.candidates.append(value)
+
+        elif tag.lower() == "script":
+            self._in_jsonld = (
+                (attrs.get("type") or "").strip().lower()
+                == "application/ld+json"
+            )
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "script":
+            self._in_jsonld = False
+
+    def handle_data(self, data):
+        if not self._in_jsonld:
+            return
+
+        for pattern in (
+            r'"image"\s*:\s*"([^"]+)"',
+            r'"contentUrl"\s*:\s*"([^"]+)"',
+        ):
+            self.candidates.extend(
+                re.findall(pattern, data, flags=re.IGNORECASE)
+            )
+
+
+def resolve_google_news_url(url):
+    """Return the real publisher URL for a Google News article URL."""
+    url = str(url or "").strip()
+    if not url:
+        return ""
+
+    if "news.google.com" not in url:
+        return url
+
+    with _GOOGLE_NEWS_DECODE_LOCK:
+        if url in _GOOGLE_NEWS_DECODE_CACHE:
+            return _GOOGLE_NEWS_DECODE_CACHE[url]
+
+    if gnewsdecoder is None:
+        return ""
+
+    try:
+        result = gnewsdecoder(url, interval=0.5)
+        decoded = ""
+
+        if isinstance(result, dict):
+            if result.get("status"):
+                decoded = str(result.get("decoded_url") or "").strip()
+        else:
+            if getattr(result, "status", False):
+                decoded = str(
+                    getattr(result, "decoded_url", "") or ""
+                ).strip()
+
+        if decoded and "news.google.com" not in decoded:
+            with _GOOGLE_NEWS_DECODE_LOCK:
+                _GOOGLE_NEWS_DECODE_CACHE[url] = decoded
+            return decoded
+
+    except Exception as exc:
+        print(f"[SOURCE IMAGE] Google News decode failed: {exc}")
+
+    with _GOOGLE_NEWS_DECODE_LOCK:
+        _GOOGLE_NEWS_DECODE_CACHE[url] = ""
+
+    return ""
+
+
+def _fetch_publisher_html(url):
+    try:
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=15,
+            allow_redirects=True,
+        )
+        if response.ok and response.text:
+            return response.text, response.url
+    except Exception:
+        pass
+
+    return "", ""
+
+
+def _is_usable_source_image(url):
+    value = str(url or "").strip()
+    if not value:
+        return False
+
+    low = value.casefold()
+
+    if low.startswith(("data:", "javascript:")):
+        return False
+
+    blocked = (
+        "favicon",
+        "sprite",
+        "placeholder",
+        "default-image",
+        "default_image",
+        "logo",
+        "site-logo",
+        "apple-touch-icon",
+        "avatar",
+        "icon",
+        "1x1",
+        "pixel.gif",
+        "spacer.gif",
+    )
+
+    if any(token in low for token in blocked):
+        return False
+
+    if low.endswith(".svg"):
+        return False
+
+    return True
+
+
+def extract_source_image(url):
+    """
+    Resolve a Google News URL to the publisher page and extract the publisher's
+    declared article image. Only page HTML is fetched; the image itself is never
+    downloaded or stored locally.
+    """
+    publisher_url = resolve_google_news_url(url)
+    if not publisher_url:
+        return {"image": "", "source_url": "", "source": ""}
+
+    html, final_url = _fetch_publisher_html(publisher_url)
+    if not html:
+        return {
+            "image": "",
+            "source_url": final_url or publisher_url,
+            "source": "",
+        }
+
+    parser = _SourceImageParser()
+
+    try:
+        parser.feed(html)
+    except Exception:
+        pass
+
+    seen = set()
+
+    for candidate in parser.candidates:
+        image_url = urljoin(
+            final_url or publisher_url,
+            str(candidate).strip(),
+        )
+
+        if not image_url or image_url in seen:
+            continue
+
+        seen.add(image_url)
+
+        if _is_usable_source_image(image_url):
+            host = re.sub(
+                r"^www\.",
+                "",
+                requests.utils.urlparse(image_url).hostname or "",
+            )
+
+            return {
+                "image": image_url,
+                "source_url": final_url or publisher_url,
+                "source": host,
+            }
+
+    return {
+        "image": "",
+        "source_url": final_url or publisher_url,
+        "source": "",
+    }
+
 
 def extract_article(url):
     try:

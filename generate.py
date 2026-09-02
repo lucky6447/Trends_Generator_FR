@@ -18,7 +18,7 @@ import unicodedata
 from html_generator import render_article, save_article
 from processed import load_processed, add_processed
 from index_generator import update_all
-from topic_scorer import rank_trends, score_with_news, select_final_candidates
+from topic_scorer import rank_trends, score_with_news, select_final_candidates, filter_relevant_news
 
 REQUIRED_FIELDS = ["title", "description", "h1", "paragraphs"]
 
@@ -43,6 +43,40 @@ def slugify(text):
     text = text.lower()
     text = re.sub(r"[^a-z0-9]+", "-", text)
     return text.strip("-")
+
+
+def _build_targeted_news_queries(title):
+    """Build a small deterministic query ladder without changing the topic itself."""
+    text = " ".join(str(title or "").split()).strip()
+    if not text:
+        return []
+    norm = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii").casefold()
+    norm = re.sub(r"[-–—]+", " ", norm)
+    states = (
+        "baden wuerttemberg", "bayern", "berlin", "brandenburg", "bremen", "hamburg",
+        "hessen", "mecklenburg vorpommern", "niedersachsen", "nordrhein westfalen",
+        "rheinland pfalz", "saarland", "sachsen anhalt", "sachsen", "schleswig holstein", "thueringen",
+    )
+    state = next((x for x in states if re.search(rf"(?<!\w){re.escape(x)}(?!\w)", norm)), "")
+    queries=[]
+    if state:
+        state_display = {
+            "baden wuerttemberg": "Baden-Württemberg",
+            "mecklenburg vorpommern": "Mecklenburg-Vorpommern",
+            "nordrhein westfalen": "Nordrhein-Westfalen",
+            "rheinland pfalz": "Rheinland-Pfalz",
+            "sachsen anhalt": "Sachsen-Anhalt",
+            "schleswig holstein": "Schleswig-Holstein",
+            "thueringen": "Thüringen",
+        }.get(state, state.title())
+        queries.extend([
+            f'"{state_display}" Wahl',
+            f'"{state_display}" Landtagswahl',
+            f'"{state_display}" Wahlprognose',
+            f'"{state_display}" Umfrage',
+        ])
+    queries.append(text)
+    return list(dict.fromkeys(queries))
 
 
 def _build_related_story_query(title):
@@ -101,92 +135,365 @@ def _jaccard(a, b):
     return len(a & b) / len(a | b)
 
 
-def _select_evidence_story_sources(news, topic, min_sources=3, max_sources=12):
-    """Deterministically rank and retain the strongest source set before Ollama.
-
-    This changes ONLY the evidence-extractor input. The original ``news`` list
-    remains untouched for Fact Guard and article generation.
-    """
+def _story_pool_profile(news, topic):
+    """Cheap lexical profile used only by the single story-source decision."""
     items = list(news or [])
     if not items:
-        return []
+        return {
+            "status": "REJECT", "reason": "empty source pool", "count": 0,
+            "dominant": 0, "ratio": 0.0, "cohesion": 0.0,
+            "member_cohesion": 0.0, "cluster": [], "components": [],
+        }
 
-    # Always run the deterministic story-selection step.
-    # Even exactly 12 retrieved sources can contain multiple stories
-    # when the topic is ambiguous (for example, "black panther").
-    topic_words = _evidence_words(topic)
     profiles = []
     for idx, item in enumerate(items):
         title = str(item.get("title", "")).strip()
         summary = str(item.get("summary", "")).strip()
-        words = _evidence_words(title + " " + summary)
         title_words = _evidence_words(title)
-        topic_overlap = len(title_words & topic_words)
+        body_words = _evidence_words(summary[:700])
         profiles.append({
             "idx": idx,
-            "words": words,
             "title_words": title_words,
-            "topic_overlap": topic_overlap,
-            "topic_jaccard": _jaccard(title_words, topic_words),
+            "words": title_words | body_words,
         })
 
-    # Anchor on the source whose title is most directly tied to the selected topic.
-    anchor = max(
-        profiles,
-        key=lambda x: (x["topic_overlap"], x["topic_jaccard"], -x["idx"]),
-    )
+    n = len(profiles)
+    if n < 3:
+        return {
+            "status": "PASS", "reason": "small source pool", "count": n,
+            "dominant": n, "ratio": 1.0, "cohesion": 1.0,
+            "member_cohesion": 1.0, "cluster": [p["idx"] for p in profiles],
+            "components": [[p["idx"] for p in profiles]],
+        }
 
-    # Rank all retrieved sources by story similarity, but do not discard sources
-    # solely because their wording differs from the anchor. The old hard lexical
-    # threshold was a major evidence-loss point: useful corroboration, alternate
-    # wording and even contradictory status reports could disappear before extraction.
-    scored = []
-    for prof in profiles:
-        if prof["idx"] == anchor["idx"]:
-            sim = 1.0
-        else:
-            sim = _jaccard(anchor["words"], prof["words"])
-        scored.append((prof["idx"], sim, prof["topic_overlap"], prof["topic_jaccard"]))
+    topic_words = _evidence_words(topic)
+    frequency = {}
+    for p in profiles:
+        for word in p["title_words"]:
+            frequency[word] = frequency.get(word, 0) + 1
 
-    scored.sort(key=lambda x: (-x[1], -x[2], -x[3], x[0]))
+    common_words = {
+        word for word, count in frequency.items()
+        if count >= max(3, int(n * 0.60 + 0.999))
+    }
+    ignored = topic_words | common_words
 
-    # Preserve the strongest sources up to the cap. The evidence extractor is
-    # responsible for keeping one coherent event and rejecting unrelated material.
-    selected_indices = [x[0] for x in scored[:max_sources]]
+    residual = []
+    for p in profiles:
+        core = p["title_words"] - ignored
+        if len(core) < 2:
+            core = p["title_words"] - topic_words
+        if not core:
+            core = p["title_words"]
+        p["core"] = core
+        residual.append(core)
 
-    if len(selected_indices) < min_sources:
-        selected_indices.extend(
-            x[0] for x in scored[len(selected_indices):min_sources]
+    similarities = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            sim_title = _jaccard(residual[i], residual[j])
+            sim_full = _jaccard(
+                profiles[i]["words"] - topic_words,
+                profiles[j]["words"] - topic_words,
+            )
+            similarities[(i, j)] = max(sim_title, sim_full * 0.85)
+
+    edge_threshold = 0.16
+    adjacency = {i: set() for i in range(n)}
+    for (i, j), sim in similarities.items():
+        if sim >= edge_threshold:
+            adjacency[i].add(j)
+            adjacency[j].add(i)
+
+    components = []
+    unseen = set(range(n))
+    while unseen:
+        start_idx = min(unseen)
+        stack = [start_idx]
+        unseen.remove(start_idx)
+        component = []
+        while stack:
+            cur = stack.pop()
+            component.append(cur)
+            for nxt in adjacency[cur]:
+                if nxt in unseen:
+                    unseen.remove(nxt)
+                    stack.append(nxt)
+        components.append(sorted(component))
+    components.sort(key=lambda c: (-len(c), c[0]))
+
+    dominant = components[0]
+    dominant_size = len(dominant)
+    ratio = dominant_size / n
+
+    internal = []
+    for pos, i in enumerate(dominant):
+        for j in dominant[pos + 1:]:
+            internal.append(similarities.get((min(i, j), max(i, j)), 0.0))
+    cohesion = sum(internal) / len(internal) if internal else 1.0
+
+    if dominant_size >= 2:
+        member_strength = []
+        for i in dominant:
+            sims = [
+                similarities.get((min(i, j), max(i, j)), 0.0)
+                for j in dominant if j != i
+            ]
+            member_strength.append(sum(sims) / len(sims) if sims else 0.0)
+        member_cohesion = sum(member_strength) / len(member_strength)
+    else:
+        member_cohesion = 0.0
+
+    if dominant_size >= 4 and ratio >= 0.50 and cohesion >= 0.16 and member_cohesion >= 0.14:
+        status = "PASS"
+        reason = "dominant story cluster"
+    elif dominant_size >= 3 and ratio >= 0.50 and cohesion >= 0.24 and member_cohesion >= 0.20:
+        status = "PASS"
+        reason = "strong dominant story core"
+    else:
+        status = "REJECT"
+        reason = "mixed source pool"
+
+    return {
+        "status": status,
+        "reason": reason,
+        "count": n,
+        "dominant": dominant_size,
+        "ratio": ratio,
+        "cohesion": cohesion,
+        "member_cohesion": member_cohesion,
+        "cluster": dominant,
+        "components": components,
+    }
+
+
+def _semantic_story_concentration_judge(news, topic):
+    """One compact semantic judgment for borderline source pools."""
+    items = list(news or [])
+    lines = []
+    for idx, item in enumerate(items[:12], 1):
+        title = str(item.get("title", "")).strip()
+        summary = re.sub(r"\s+", " ", str(item.get("summary", "")).strip())[:260]
+        if title:
+            lines.append(f"{idx}. TITLE: {title}\n   SUMMARY: {summary}")
+    if not lines:
+        return {"status": "MIXED", "confidence": 0, "reason": "no semantic input", "source_numbers": []}
+
+    prompt = f"""
+You are TrendCurrent's pre-evidence story selector.
+
+Classify the retrieved source pool into exactly one:
+1) ONE_STORY - most sources corroborate one concrete news story/event.
+2) DOMINANT_STORY - a clear majority corroborates one concrete story and the
+   remaining sources are unrelated/outliers.
+3) MIXED - there is no safely isolatable majority story.
+
+TOPIC: {str(topic or '').strip()}
+
+Rules:
+- Same broad topic is NOT the same story.
+- Different wording or languages for the SAME event counts as the same story.
+- DOMINANT_STORY is valid only when there is a real majority that can be isolated safely.
+- Separate local/regional stories, separate people/events, programmes, lists,
+  roundups, or unrelated developments are outliers and must not be selected.
+- Be conservative. Never invent a connection.
+
+Return ONLY JSON:
+{{"verdict":"DOMINANT_STORY","confidence":95,"source_numbers":[1,2,3],"reason":"brief reason"}}
+
+SOURCE HEADLINES:
+{chr(10).join(lines)}
+"""
+
+    try:
+        started = __import__("time").perf_counter()
+        raw = chat(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={
+                "temperature": 0.0,
+                "top_p": 0.85,
+                "top_k": 40,
+                "num_ctx": max(4096, int(os.getenv("OLLAMA_NUM_CTX", "6144"))),
+                "num_predict": 160,
+            },
+            format="json",
         )
+        elapsed = __import__("time").perf_counter() - started
+        content = getattr(getattr(raw, "message", None), "content", "") or ""
+        start_json = content.find("{")
+        end_json = content.rfind("}")
+        if start_json < 0 or end_json <= start_json:
+            raise ValueError("semantic selector returned no JSON object")
+        result = json.loads(content[start_json:end_json + 1])
+        verdict = str(result.get("verdict", "")).strip().upper()
+        confidence = max(0, min(100, int(result.get("confidence", 0))))
+        reason = str(result.get("reason", "")).strip()[:300]
+        raw_numbers = result.get("source_numbers", [])
+        source_numbers = []
+        if isinstance(raw_numbers, list):
+            for value in raw_numbers:
+                try:
+                    number = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= number <= len(items) and number not in source_numbers:
+                    source_numbers.append(number)
+        if verdict not in {"PASS", "ONE_STORY", "DOMINANT_STORY", "MIXED"}:
+            raise ValueError(f"invalid semantic verdict: {verdict}")
 
-    selected_indices = sorted(dict.fromkeys(selected_indices))
-    selected = [items[i] for i in selected_indices]
+        print(
+            f"[TOPIC FILTER] STORY SOURCE JUDGE | {verdict} | "
+            f"confidence={confidence} | elapsed={elapsed:.2f}s | {reason}"
+        )
+        return {
+            "status": verdict,
+            "confidence": confidence,
+            "reason": reason or "semantic story selection judgment",
+            "source_numbers": source_numbers,
+        }
+    except Exception as exc:
+        # This judge is part of the source-safety decision. If it was required
+        # to resolve a borderline/rejected pool, an unavailable result cannot
+        # safely become PASS.
+        print(f"[TOPIC FILTER] STORY SOURCE JUDGE | ERROR | fail-closed | {exc}")
+        return {
+            "status": "ERROR",
+            "confidence": 0,
+            "reason": f"semantic selector unavailable: {exc}",
+            "source_numbers": [],
+        }
+
+
+def _decide_story_sources(news, topic):
+    """Single authority for choosing the exact sources used by evidence extraction."""
+    items = list(news or [])
+    profile = _story_pool_profile(items, topic)
+    count = profile["count"]
 
     print(
-        f"[TOPIC FILTER] Evidence story cluster | anchor={anchor['idx'] + 1} "
-        f"| kept={len(selected)}/{len(items)}"
+        f"[TOPIC FILTER] STORY SOURCE DECISION | lexical={profile['status']} "
+        f"| sources={count} | dominant={profile['dominant']}/{count} "
+        f"| ratio={profile['ratio']:.2f} | cohesion={profile['cohesion']:.2f}"
     )
-    for item in selected:
-        print(f"[TOPIC FILTER] Evidence source -> {str(item.get('title', '')).strip()}")
+    if profile.get("components"):
+        sizes = ", ".join(str(len(c)) for c in profile["components"][:5])
+        print(f"[TOPIC FILTER] Story pool components | sizes={sizes}")
 
-    return selected
+    # A pool with fewer than three sources has no meaningful concentration
+    # signal; use all available sources. Three or more sources must obey the
+    # same deterministic/semantic decision policy as every larger pool.
+    if count < 3:
+        selected_indices = list(range(count))
+        reason = "small source pool"
+        status = "PASS"
+        semantic_status = "SKIPPED"
+    else:
+        # IMPORTANT: a lexical REJECT is not a final story decision.
+        # The lexical clusterer is intentionally conservative and can split
+        # legitimate corroborating headlines when publishers use different
+        # wording. Every 3+ source REJECT therefore gets one semantic
+        # arbitration pass. The semantic judge may still reject the pool.
+        #
+        # This is the critical recovery path for cases such as 1/8 lexical
+        # concentration where the sources can still describe one real event.
+        semantic_needed = (
+            profile["status"] == "REJECT"
+        ) or (
+            profile["status"] == "PASS"
+            and (
+                profile.get("ratio", 0.0) < 0.75
+                or profile.get("cohesion", 0.0) < 0.28
+            )
+        )
+
+        semantic = (
+            _semantic_story_concentration_judge(items, topic)
+            if semantic_needed
+            else {"status": "SKIPPED", "confidence": 100, "reason": "strong deterministic concentration", "source_numbers": []}
+        )
+        semantic_status = semantic["status"]
+
+        if semantic["status"] == "ERROR":
+            raise Exception(
+                "Story source decision rejected because semantic judgment failed "
+                f"(reason={semantic.get('reason', '')})"
+            )
+
+        if semantic["status"] == "MIXED":
+            raise Exception(
+                "Story source decision rejected mixed source pool "
+                f"(confidence={semantic.get('confidence', 0)}; reason={semantic.get('reason', '')})"
+            )
+
+        if semantic["status"] == "ONE_STORY":
+            selected_indices = list(range(count))
+            reason = "semantic one story"
+            status = "PASS"
+            print(
+                f"[TOPIC FILTER] STORY SOURCE DECISION CONFIRM | "
+                f"kept={len(selected_indices)}/{count} | one story"
+            )
+
+        elif semantic["status"] == "DOMINANT_STORY":
+            numbers = semantic.get("source_numbers", [])
+            minimum_majority = max(3, int(count * 0.50 + 0.999))
+            if len(numbers) < minimum_majority:
+                raise Exception("Story source judge returned an insufficient dominant majority")
+            selected_indices = [n - 1 for n in numbers]
+            reason = "semantic dominant story"
+            status = "PASS"
+            print(
+                f"[TOPIC FILTER] STORY SOURCE DECISION PRUNE | "
+                f"kept={len(selected_indices)}/{count} | outliers={count-len(selected_indices)}"
+            )
+        else:
+            # This branch is reachable only for a deterministic PASS with
+            # semantic verification skipped. No semantic decision is overwritten.
+            selected_indices = list(profile.get("cluster") or [])
+            if not selected_indices:
+                raise Exception("Story source decision produced no usable source cluster")
+            reason = profile["reason"]
+            status = "PASS"
+
+    selected_indices = sorted(dict.fromkeys(i for i in selected_indices if 0 <= i < count))
+    if not selected_indices:
+        raise Exception("Story source decision produced an empty evidence source set")
+
+    print(
+        f"[TOPIC FILTER] STORY SOURCE DECISION PASS | "
+        f"kept={len(selected_indices)}/{count} | reason={reason} | semantic={semantic_status}"
+    )
+    for idx in selected_indices:
+        print(f"[TOPIC FILTER] Evidence source -> {str(items[idx].get('title', '')).strip()}")
+
+    return {
+        "status": status,
+        "reason": reason,
+        "count": count,
+        "selected_indices": selected_indices,
+        "selected_count": len(selected_indices),
+        "semantic_status": semantic_status,
+    }
 
 
-def _build_evidence_source(news, topic=None):
-    """Build source-only evidence input from one deterministic story cluster."""
-    selected_news = _select_evidence_story_sources(news, topic)
+def _build_evidence_source(news, story_selection):
+    """Build evidence input from the exact source selection already made upstream."""
+    items = list(news or [])
+    selection = story_selection or {}
+    indices = list(selection.get("selected_indices") or [])
+    selected_news = [items[i] for i in indices if 0 <= i < len(items)]
+    if not selected_news:
+        raise Exception("Evidence source received no sources from story selection")
+
     compact_sources = []
-
     for item in selected_news:
         title = str(item.get("title", "")).strip()
         summary = str(item.get("summary", "")).strip()
         source = str(item.get("source", "")).strip()
         published = str(item.get("published", "")).strip()
         content = str(item.get("content", "")).strip()
-
-        # Preserve usable RSS evidence when publisher extraction is empty/short.
         evidence_text = content if len(content) >= 300 else summary
-
         compact_sources.append({
             "title": title,
             "source": source,
@@ -195,30 +502,27 @@ def _build_evidence_source(news, topic=None):
             "content": evidence_text[:5000],
         })
 
-    return "\n".join(
-        [
-            "SOURCE MATERIAL:",
-            *[
-                "\n".join(
-                    [
-                        f"SOURCE S{i}",
-                        f"ARTICLE {i}",
-                        f"Title: {item['title']}",
-                        f"Source: {item['source']}",
-                        f"Published: {item['published']}",
-                        "",
-                        "Summary:",
-                        item["summary"],
-                        "",
-                        "Full Article:",
-                        item["content"],
-                        "---",
-                    ]
-                )
-                for i, item in enumerate(compact_sources, 1)
-            ],
-        ]
-    )
+    return "\n".join([
+        "SOURCE MATERIAL:",
+        *[
+            "\n".join([
+                f"SOURCE S{i}",
+                f"ARTICLE {i}",
+                f"Title: {item['title']}",
+                f"Source: {item['source']}",
+                f"Published: {item['published']}",
+                "",
+                "Summary:",
+                item["summary"],
+                "",
+                "Full Article:",
+                item["content"],
+                "---",
+            ])
+            for i, item in enumerate(compact_sources, 1)
+        ],
+    ])
+
 
 def _build_fact_guard_source(news):
     """
@@ -497,6 +801,377 @@ def validate_article(article):
             raise Exception("Invalid paragraph")
 
     return True
+
+
+# ============================================================
+# FINAL ARTICLE STORY QUALITY GATE
+# ============================================================
+# This is an editorial gate, not a factuality gate.
+# Fact Guard answers: "Are the claims supported?"
+# Story Quality Gate answers: "Is this ONE coherent news story?"
+#
+# IMPORTANT:
+# - Short but clean articles PASS.
+# - Relevant context around the main event is allowed.
+# - Roundups, mixed stories, generic topic digests and unrelated
+#   second stories are REJECTED.
+# - BORDERLINE is treated as a production rejection. We never spend
+#   downstream resources (including image generation) on an uncertain article.
+# - PASS also requires minimum editorial confidence; a low-confidence PASS
+#   is converted to BORDERLINE.
+#
+# This gate deliberately runs AFTER generate_valid_article() and BEFORE
+# save_article(), so an article cannot become a production success until
+# it passes both factual and editorial validation.
+STORY_QUALITY_THREADS = max(1, int(os.getenv("STORY_QUALITY_THREADS", "16")))
+STORY_QUALITY_CTX = max(4096, int(os.getenv("STORY_QUALITY_CTX", "8192")))
+STORY_QUALITY_BATCH = max(64, int(os.getenv("STORY_QUALITY_BATCH", "256")))
+STORY_QUALITY_TOKENS = max(128, int(os.getenv("STORY_QUALITY_TOKENS", "256")))
+STORY_QUALITY_MIN_PASS_CONFIDENCE = max(
+    0,
+    min(100, int(os.getenv("STORY_QUALITY_MIN_PASS_CONFIDENCE", "70"))),
+)
+
+
+def _story_quality_text(article):
+    paragraphs = article.get("paragraphs", [])
+    if not isinstance(paragraphs, list):
+        return ""
+    return "\n\n".join(
+        str(p).strip() for p in paragraphs if str(p).strip()
+    )
+
+
+def _story_quality_evidence_summary(evidence):
+    """Keep the quality-gate context compact while preserving story identity."""
+    if not isinstance(evidence, dict):
+        return ""
+
+    facts = evidence.get("facts", [])
+    if not isinstance(facts, list):
+        facts = []
+
+    lines = []
+    for idx, fact in enumerate(facts[:12], 1):
+        if isinstance(fact, dict):
+            # Evidence schemas can evolve; keep only useful semantic fields.
+            parts = []
+            for key in ("fact", "claim", "statement", "text", "event", "entity"):
+                value = str(fact.get(key, "")).strip()
+                if value:
+                    parts.append(value)
+            if parts:
+                lines.append(f"FACT {idx}: " + " | ".join(dict.fromkeys(parts)))
+        elif str(fact).strip():
+            lines.append(f"FACT {idx}: {str(fact).strip()}")
+
+    if not lines:
+        return "No structured locked facts were available."
+
+    return "\n".join(lines)
+
+
+def _story_quality_source_titles(trend):
+    titles = []
+    for item in trend.get("news", []) or []:
+        title = str(item.get("title", "")).strip()
+        if title:
+            titles.append(title)
+        if len(titles) >= 8:
+            break
+    return "\n".join(f"- {title}" for title in titles) or "- No source headlines available."
+
+
+def _deterministic_story_quality_flags(article):
+    """
+    Conservative local red flags for obvious roundup/list behavior.
+
+    These are NOT used as automatic rejection rules because normal news
+    language can contain similar words. They are passed to the editorial
+    model as warning signals so the model can make the final decision.
+    """
+    text = _story_quality_text(article).casefold()
+    flags = []
+
+    roundup_patterns = [
+        # English
+        r"\bother (?:major|key|notable|important) (?:news|stories|developments)\b",
+        r"\bother stories\b",
+        r"\bhere are (?:the|some) (?:latest|top|key|major)\b",
+        r"\bmeanwhile\b",
+        r"\bin other news\b",
+        r"\balso in (?:sports|business|technology|entertainment|news)\b",
+        r"\bseveral (?:other|major|key) (?:events|developments|stories)\b",
+        r"\btop \d+\b",
+        r"\b\d+ things to know\b",
+        r"\bwhat you need to know\b",
+
+        # Indonesian
+        r"\bberita (?:lain|terkini|utama)\b",
+        r"\bberita lainnya\b",
+        r"\bsementara itu\b",
+        r"\bdi sisi lain\b",
+        r"\bselain itu\b",
+        r"\bbeberapa (?:berita|peristiwa|perkembangan)\b",
+        r"\bberikut (?:berita|hal|informasi)\b",
+        r"\b\d+ hal yang perlu diketahui\b",
+        r"\bapa yang perlu diketahui\b",
+
+        # Spanish
+        r"\botras (?:noticias|historias|novedades)\b",
+        r"\bmientras tanto\b",
+        r"\bpor otro lado\b",
+        r"\ben otras noticias\b",
+        r"\bvarias (?:noticias|historias|novedades)\b",
+        r"\b\d+ cosas que debes saber\b",
+
+        # French
+        r"\bd'autres (?:actualités|nouvelles|informations)\b",
+        r"\bpendant ce temps\b",
+        r"\bdans d'autres actualités\b",
+        r"\bplusieurs (?:actualités|nouvelles|événements)\b",
+        r"\bà savoir\b",
+
+        # German
+        r"\bweitere (?:nachrichten|meldungen|entwicklungen)\b",
+        r"\bindessen\b",
+        r"\bin anderen nachrichten\b",
+        r"\bmehrere (?:nachrichten|ereignisse|entwicklungen)\b",
+        r"\bwas sie wissen müssen\b",
+
+        # Italian
+        r"\baltre (?:notizie|storie|novità)\b",
+        r"\bnel frattempo\b",
+        r"\bin altre notizie\b",
+        r"\bdiverse (?:notizie|storie|novità)\b",
+        r"\bcose da sapere\b",
+
+        # Portuguese
+        r"\boutros (?:notícias|casos|acontecimentos)\b",
+        r"\benquanto isso\b",
+        r"\bem outras notícias\b",
+        r"\bvárias (?:notícias|histórias|atualizações)\b",
+        r"\bo que você precisa saber\b",
+    ]
+
+    for pattern in roundup_patterns:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            flags.append(pattern)
+
+    # Repeated topic shifts are a useful warning, but not a hard rule.
+    transition_hits = len(re.findall(
+        r"\b(?:"
+        r"meanwhile|separately|in a separate development|elsewhere|on another front|"
+        r"sementara itu|di sisi lain|selain itu|"
+        r"mientras tanto|por otro lado|"
+        r"pendant ce temps|d'un autre côté|"
+        r"indessen|andererseits|"
+        r"nel frattempo|d'altra parte|"
+        r"enquanto isso|por outro lado"
+        r")\b",
+        text,
+        flags=re.IGNORECASE,
+    ))
+    if transition_hits >= 2:
+        flags.append(f"multiple_story_transition_markers:{transition_hits}")
+
+    return flags
+
+
+def story_quality_gate(article, trend):
+    """
+    Final editorial quality decision for the generated article.
+
+    Returns the article only on PASS. REMOVE and BORDERLINE raise an
+    exception, preventing save_article() and therefore preventing any
+    downstream image generation for the rejected candidate.
+    """
+    validate_article(article)
+
+    topic = str(trend.get("title", "")).strip()
+    article_title = str(article.get("title", "")).strip()
+    article_description = str(article.get("description", "")).strip()
+    article_h1 = str(article.get("h1", "")).strip()
+    article_body = _story_quality_text(article)
+    evidence = trend.get("_evidence_lock", {})
+
+    local_flags = _deterministic_story_quality_flags(article)
+    local_flag_text = (
+        "\n".join(f"- {flag}" for flag in local_flags)
+        if local_flags
+        else "- None detected"
+    )
+
+    prompt = f"""
+You are the FINAL EDITORIAL STORY QUALITY GATE for a professional {LANGUAGE} news site.
+
+Your task is NOT to fact-check the article and NOT to improve or rewrite it.
+Fact Guard has already handled factual validation.
+
+Your ONLY job is to determine whether the generated article is ONE clearly
+recognizable, coherent news story suitable for publication as a single article.
+
+MAIN SELECTED TOPIC:
+{topic}
+
+ARTICLE TITLE:
+{article_title}
+
+ARTICLE H1:
+{article_h1}
+
+ARTICLE DESCRIPTION:
+{article_description}
+
+GENERATED ARTICLE BODY:
+{article_body}
+
+LOCKED EVIDENCE / STORY FACTS:
+{_story_quality_evidence_summary(evidence)}
+
+SOURCE HEADLINES FOR CONTEXT ONLY:
+{_story_quality_source_titles(trend)}
+
+DETERMINISTIC WARNING SIGNALS:
+{local_flag_text}
+
+EDITORIAL STANDARD:
+
+PASS when:
+- The article clearly centers on ONE identifiable event, development, person,
+  decision, announcement, incident, match, transfer, release, or other single
+  news story.
+- Every paragraph materially belongs to that same story.
+- Relevant background/context about the same story is allowed.
+- A short article is completely acceptable if it cleanly covers one story.
+- A small amount of closely related context does NOT make it a roundup.
+- A second paragraph can explain consequences, reactions, history or context
+  when those details are directly connected to the same main story.
+
+REMOVE when:
+- It is a roundup or digest of multiple independent news stories.
+- It combines several unrelated people, events, topics, announcements or
+  developments under one article.
+- It is a finance/investment roundup rather than one specific financial story.
+- It is a sports roundup rather than one specific sports story.
+- It is a generic "latest news" / "AI news" / topic roundup containing
+  unrelated developments.
+- It begins with one story but then changes into a different independent story.
+- It contains a list of separate stories disguised as one article.
+- The article's identity is broad enough that there is no single central event
+  or development.
+
+BORDERLINE when:
+- It is genuinely unclear whether the article is one story or multiple stories.
+- The article has a central story but a substantial portion shifts into
+  independent developments that cannot reasonably be treated as context.
+- The editorial decision itself is low-confidence.
+
+IMPORTANT:
+- DO NOT reject an article merely because it is short.
+- DO NOT reject an article merely because it has multiple paragraphs.
+- DO NOT reject relevant consequences, reactions, background or context.
+- DO NOT use article length, source count or number of facts as the decision.
+- Judge STORY IDENTITY and COHERENCE.
+- Do not infer missing facts.
+- Do not reward an article simply because every sentence is individually factual.
+- A factual roundup is still REMOVE.
+- A concise single-story article is PASS.
+
+DECISION PRIORITY:
+1. Is there one unmistakable central story?
+2. Do the paragraphs remain about that story?
+3. Are additional details genuinely related context rather than independent news?
+4. Only then consider whether there is a clear reason for REMOVE/BORDERLINE.
+
+Return ONLY valid JSON:
+{{
+  "verdict": "PASS",
+  "confidence": 0,
+  "reason": ""
+}}
+
+Allowed verdict values: PASS, REMOVE, BORDERLINE.
+confidence must be an integer from 0 to 100.
+reason must be a concise editorial explanation, maximum 35 words.
+"""
+
+    print("[STORY QUALITY] Checking final article...")
+
+    response = chat(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        options={
+            "temperature": 0.0,
+            "top_p": 0.85,
+            "top_k": 40,
+            "num_ctx": STORY_QUALITY_CTX,
+            "num_predict": STORY_QUALITY_TOKENS,
+            "num_batch": STORY_QUALITY_BATCH,
+            "num_thread": STORY_QUALITY_THREADS,
+        },
+        format={
+            "type": "object",
+            "properties": {
+                "verdict": {
+                    "type": "string",
+                    "enum": ["PASS", "REMOVE", "BORDERLINE"],
+                },
+                "confidence": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 100,
+                },
+                "reason": {"type": "string"},
+            },
+            "required": ["verdict", "confidence", "reason"],
+        },
+    )
+
+    raw = response.message.content or ""
+    try:
+        result = json.loads(raw)
+    except Exception as exc:
+        raise Exception(f"Story Quality Gate returned invalid JSON: {exc}") from exc
+
+    if not isinstance(result, dict):
+        raise Exception("Story Quality Gate did not return a JSON object")
+
+    verdict = str(result.get("verdict", "")).strip().upper()
+    try:
+        confidence = int(result.get("confidence", 0))
+    except (TypeError, ValueError):
+        confidence = 0
+    reason = " ".join(str(result.get("reason", "")).split()).strip()
+
+    if verdict not in {"PASS", "REMOVE", "BORDERLINE"}:
+        raise Exception(f"Story Quality Gate returned invalid verdict: {verdict!r}")
+
+    confidence = max(0, min(100, confidence))
+
+    # A PASS with low confidence is not safe enough for production.
+    # Treat it as BORDERLINE so uncertain articles never reach persistence
+    # or any downstream image-generation pipeline.
+    if verdict == "PASS" and confidence < STORY_QUALITY_MIN_PASS_CONFIDENCE:
+        verdict = "BORDERLINE"
+        reason = (
+            f"Low editorial confidence ({confidence} < "
+            f"{STORY_QUALITY_MIN_PASS_CONFIDENCE})"
+            + (f": {reason}" if reason else "")
+        )
+
+    print(
+        f"[STORY QUALITY] {verdict} | confidence={confidence} "
+        f"| {reason or 'No reason supplied'}"
+    )
+
+    if verdict != "PASS":
+        raise Exception(
+            f"Story Quality Gate {verdict.lower()} "
+            f"(confidence={confidence}): {reason or 'article is not one coherent story'}"
+        )
+
+    return article
 
 
 
@@ -806,10 +1481,49 @@ def main():
                 ):
                     news.insert(0, seed)
             else:
-                news = fetch_news(keyword)
+                news = []
+                for search_query in _build_targeted_news_queries(keyword):
+                    print(f"[TOPIC FILTER] Related story search: {search_query}")
+                    found = fetch_news(search_query)
+                    if found:
+                        news.extend(found)
+                    if filter_relevant_news(trend, news):
+                        break
 
             if not news:
                 print(f"[TOPIC FILTER] DROP AFTER NEWS | {keyword} | no usable news result(s)")
+                continue
+
+            # --------------------------------------------------------
+            # TOPIC / NEWS RELEVANCE GATE
+            # --------------------------------------------------------
+            # Do not let corroboration for a different entity/region enter
+            # Story Concentration or source scoring.
+            relevant_news = filter_relevant_news(trend, news)
+            if not relevant_news:
+                print(
+                    f"[TOPIC FILTER] DROP AFTER NEWS | {keyword} | "
+                    f"no topic-relevant news result(s)"
+                )
+                continue
+            news = relevant_news
+
+            # --------------------------------------------------------
+            # STORY SOURCE DECISION
+            # --------------------------------------------------------
+            # This runs before Ollama evidence extraction.
+            # Its only job is to detect a source pool that contains multiple
+            # independent stories under a broad/generic retrieval query.
+            try:
+                story_selection = _decide_story_sources(news, keyword)
+                trend["_story_selection"] = story_selection
+            except Exception as concentration_error:
+                trend["_production_status"] = "REJECT"
+                trend["_production_reject_reason"] = str(concentration_error)
+                print(
+                    f"[TOPIC FILTER] REJECT BEFORE EVIDENCE | article_slot=0 | "
+                    f"{keyword} | {concentration_error}"
+                )
                 continue
 
             trend["news"] = news
@@ -838,6 +1552,7 @@ def main():
             break
         keyword = trend["title"]
         news = trend["news"]
+        story_selection = trend.get("_story_selection")
 
         print(
             f"\n[GENERATION] Selected topic | "
@@ -866,7 +1581,7 @@ def main():
             )
 
             try:
-                evidence_source = _build_evidence_source(news, keyword)
+                evidence_source = _build_evidence_source(news, story_selection)
                 print(
                     f"[TOPIC FILTER] Evidence source prepared | "
                     f"source_chars={len(evidence_source)}"
@@ -904,6 +1619,15 @@ def main():
                 prelocked_evidence=evidence_lock,
             )
 
+            # --------------------------------------------------------
+            # FINAL ARTICLE STORY QUALITY GATE
+            # --------------------------------------------------------
+            # This is intentionally the last gate before persistence.
+            # If the article is a roundup, mixed story, generic topic digest,
+            # or otherwise editorially incoherent, it consumes ZERO production
+            # article slots and NEVER reaches save_article() / image generation.
+            article = story_quality_gate(article, trend)
+
             slug = slugify(keyword)
             article["slug"] = slug
 
@@ -918,6 +1642,7 @@ def main():
             # Any candidate that fails after evidence lock is terminal for this
             # run. Do not retry the same expensive candidate; move immediately
             # to the next ranked topic. The article counter remains unchanged.
+            # This also covers Story Quality Gate REMOVE/BORDERLINE decisions.
             trend["_production_status"] = "REJECT"
             trend["_production_reject_reason"] = str(e)
             print(

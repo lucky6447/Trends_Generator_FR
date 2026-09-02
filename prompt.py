@@ -317,7 +317,10 @@ Before returning the result:
    distinct supported developments belonging to the PRIMARY STORY have been covered.
 10. Check that no paragraph introduces an independent event merely because it shares an
     entity, keyword, publisher, category or topic with MAIN TOPIC.
-11. Check that the headline, H1 and article body all describe the same primary story.
+11. A source-supported fact is NOT eligible for inclusion if it belongs to a separate
+    story. Do not mention a separate story even to say that it is unrelated, separate,
+    not connected, or different from MAIN TOPIC.
+12. Check that the headline, H1 and article body all describe the same primary story.
 
 Return ONLY valid JSON:
 {{
