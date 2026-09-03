@@ -1050,5 +1050,9 @@
   "cond-sur-sarthe": {
     "published_at": "2026-09-03 22:34",
     "order": -266
+  },
+  "xbox-game-pass": {
+    "published_at": "2026-09-04 00:42",
+    "order": -267
   }
 }
