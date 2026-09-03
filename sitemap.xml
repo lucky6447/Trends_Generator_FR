@@ -145,6 +145,12 @@
     <priority>0.6</priority>
   </url>
   <url>
+    <loc>https://fr.trendcurrent.today/trends/cond-sur-sarthe</loc>
+    <lastmod>2026-09-03</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
     <loc>https://fr.trendcurrent.today/trends/the-gentlemen</loc>
     <lastmod>2026-09-03</lastmod>
     <changefreq>monthly</changefreq>

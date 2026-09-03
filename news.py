@@ -20,13 +20,39 @@ MAX_NEWS_AGE_HOURS = 6.0
 def _age_hours(published):
     if not published:
         return None
+    value = str(published).strip()
     try:
-        dt = parsedate_to_datetime(str(published))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 3600.0)
+        dt = parsedate_to_datetime(value)
     except Exception:
-        return None
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 3600.0)
+
+def _published_value(item):
+    for field in ("published", "pubDate", "updated", "date", "dc_date"):
+        value = clean(item.get(field))
+        if value:
+            return value
+    for field in ("published_parsed", "updated_parsed"):
+        value = item.get(field)
+        if value:
+            try:
+                from email.utils import format_datetime
+                dt = datetime(*value[:6], tzinfo=timezone.utc)
+                return format_datetime(dt, usegmt=True)
+            except Exception:
+                pass
+    source = item.get("source")
+    if isinstance(source, dict):
+        for field in ("published", "pubDate", "updated", "date"):
+            value = clean(source.get(field))
+            if value:
+                return value
+    return ""
 
 def _is_fresh_news(published):
     age = _age_hours(published)
@@ -153,33 +179,9 @@ def _is_usable_source_image(url):
     if not value:
         return False
 
-    # Reject escaped/malformed URLs before they reach the article HTML.
-    if "\\" in value:
-        return False
-
     low = value.casefold()
 
-    # Only real web URLs are allowed.
-    if not low.startswith(("http://", "https://")):
-        return False
-
     if low.startswith(("data:", "javascript:")):
-        return False
-
-    try:
-        parsed = requests.utils.urlparse(value)
-
-        if parsed.scheme not in {"http", "https"}:
-            return False
-
-        if not parsed.hostname:
-            return False
-
-        # Reject obviously malformed host/path structures.
-        if "://" in parsed.path:
-            return False
-
-    except Exception:
         return False
 
     blocked = (
@@ -235,14 +237,9 @@ def extract_source_image(url):
     seen = set()
 
     for candidate in parser.candidates:
-        candidate = str(candidate or "").strip()
-
-        # Normalize common escaped URL forms found in JSON/HTML.
-        candidate = candidate.replace("\\/", "/")
-
         image_url = urljoin(
             final_url or publisher_url,
-            candidate,
+            str(candidate).strip(),
         )
 
         if not image_url or image_url in seen:
@@ -299,6 +296,29 @@ def filter_similar_articles(articles, max_results=12):
     return result
 
 
+def _fetch_google_or_bing(url_google, bing_query):
+    try:
+        response = requests.get(url_google, headers=HEADERS, timeout=20)
+        feed = feedparser.parse(response.content)
+        print(f"[NEWS RSS] Google -> HTTP {response.status_code} | bytes={len(response.content)} | entries={len(feed.entries)}")
+        if feed.entries:
+            return feed.entries, "Google"
+    except Exception as exc:
+        print(f"[NEWS RSS] Google error -> {exc}")
+    bing_url = (
+        "https://www.bing.com/news/search?"
+        f"q={quote_plus(bing_query)}&format=rss&setlang=fr-FR&cc=FR"
+    )
+    try:
+        response = requests.get(bing_url, headers=HEADERS, timeout=20)
+        feed = feedparser.parse(response.content)
+        print(f"[NEWS RSS] Google empty -> Bing fallback | HTTP {response.status_code} | bytes={len(response.content)} | entries={len(feed.entries)}")
+        return feed.entries, "Bing"
+    except Exception as exc:
+        print(f"[NEWS RSS] Bing error -> {exc}")
+        return [], "Bing"
+
+
 def fetch_news_multi(queries, per_query_limit=8, max_results=18):
     """Fetch and merge several tightly scoped Google News searches.
 
@@ -328,11 +348,11 @@ def fetch_news_multi(queries, per_query_limit=8, max_results=18):
             f"q={quote_plus(query + ' when:6h')}"
             "&hl=fr-FR&gl=FR&ceid=FR:fr"
         )
-        feed = feedparser.parse(url)
-        for item in feed.entries[:max(1, int(per_query_limit))]:
+        entries, _ = _fetch_google_or_bing(url, query)
+        for item in entries[:max(1, int(per_query_limit))]:
             title = clean(item.get("title"))
             link = clean(item.get("link"))
-            published = clean(item.get("published"))
+            published = _published_value(item)
             if not _is_fresh_news(published):
                 continue
             title_key = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
@@ -371,7 +391,7 @@ def fetch_news_multi(queries, per_query_limit=8, max_results=18):
         contents = list(executor.map(lambda a: extract_article(a["link"]), candidates))
 
     for article, content in zip(candidates, contents):
-        article["content"] = content
+        article["content"] = content or article.get("summary", "")
 
     return filter_similar_articles(candidates, max_results=max_results)
 
@@ -382,12 +402,12 @@ def fetch_news(query, limit=20):
         f"q={quote_plus(query + ' when:6h')}"
         "&hl=fr-FR&gl=FR&ceid=FR:fr"
     )
-    feed = feedparser.parse(url)
-    items = feed.entries[:limit]
+    entries, _ = _fetch_google_or_bing(url, query)
+    items = entries[:limit]
 
     prepared = []
     for item in items:
-        published = clean(item.get("published"))
+        published = _published_value(item)
         if not _is_fresh_news(published):
             continue
         source = ""
@@ -411,7 +431,7 @@ def fetch_news(query, limit=20):
 
     articles = []
     for article, content in zip(prepared, contents):
-        article["content"] = content
+        article["content"] = content or article.get("summary", "")
         articles.append(article)
 
     return filter_similar_articles(articles)
