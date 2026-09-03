@@ -32,6 +32,85 @@ import generator_monitor as monitor
 
 REQUIRED_FIELDS = ["title", "description", "h1", "paragraphs"]
 
+
+def _article_text(article):
+    if not isinstance(article, dict):
+        return ""
+    parts = [
+        article.get("title", ""),
+        article.get("description", ""),
+        article.get("h1", ""),
+    ]
+    paragraphs = article.get("paragraphs", [])
+    if isinstance(paragraphs, list):
+        parts.extend(paragraphs)
+    return " ".join(str(value) for value in parts if value).strip()
+
+
+def validate_language_integrity(article):
+    """Fail closed on obvious language/script leakage or prompt/instruction output."""
+    text = _article_text(article)
+    if not text:
+        raise ValueError("Language integrity check failed: empty article text.")
+
+    # Current TrendCurrent production languages are Latin-script except Bulgarian.
+    # Detecting foreign scripts is deterministic and directly catches the Ceuta-type
+    # Chinese leakage without asking another model to judge its own output.
+    language = str(LANGUAGE or "").strip().casefold()
+    cyrillic_allowed = language in {"bulgarian", "bg", "български"}
+    latin_languages = {
+        "english", "en", "german", "de", "deutsch", "french", "fr", "français",
+        "italian", "it", "italiano", "spanish", "es", "español",
+        "indonesian", "id", "bahasa indonesia",
+    }
+
+    forbidden_scripts = []
+    for ch in text:
+        if not ch.isalpha():
+            continue
+        name = unicodedata.name(ch, "")
+        if "CJK UNIFIED IDEOGRAPH" in name or "HIRAGANA" in name or "KATAKANA" in name or "HANGUL" in name:
+            forbidden_scripts.append("CJK/East Asian")
+        elif "ARABIC" in name:
+            forbidden_scripts.append("Arabic")
+        elif "HEBREW" in name:
+            forbidden_scripts.append("Hebrew")
+        elif "DEVANAGARI" in name:
+            forbidden_scripts.append("Devanagari")
+        elif "THAI" in name:
+            forbidden_scripts.append("Thai")
+        elif "CYRILLIC" in name and language in latin_languages:
+            forbidden_scripts.append("Cyrillic")
+
+    # Obvious generator/instruction leakage is never valid article prose.
+    lower = text.casefold()
+    leakage_markers = (
+        "return only the required json",
+        "locked evidence:",
+        "final entitlement check",
+        "you are a professional",
+        "write a clear trendcurrent news article",
+        "article generator",
+        "do not pad, speculate, manufacture context",
+    )
+    matched = [marker for marker in leakage_markers if marker in lower]
+
+    if forbidden_scripts:
+        scripts = ", ".join(sorted(set(forbidden_scripts)))
+        raise ValueError(f"Language integrity check failed: forbidden script detected ({scripts}).")
+    if matched:
+        raise ValueError("Language integrity check failed: generator/instruction leakage detected.")
+
+    # For known non-Bulgarian production languages, a tiny Latin share is expected
+    # for names/official terms, so this gate intentionally does not require a
+    # particular percentage of Latin letters. It only blocks clearly foreign scripts.
+    if not cyrillic_allowed and language not in latin_languages:
+        # Unknown future language: keep the deterministic leakage markers above,
+        # but do not guess its valid writing system.
+        return True
+
+    return True
+
 # Article length is determined by the amount of usable verified evidence.
 # There is no artificial word-count target or evidence-count-based minimum.
 
@@ -544,6 +623,61 @@ def _decide_story_sources(news, topic):
     }
 
 
+def _rank_full_production_reservoir(trends, processed):
+    """
+    Rank every available raw trend without allowing topic_scorer.py's
+    fixed per-call safety cap to become a production-capacity bottleneck.
+
+    topic_scorer.rank_trends() is intentionally capped at 24 candidates per
+    invocation. That cap is useful for normal callers, but production needs a
+    complete reservoir so a target of 1 article cannot starve when the first
+    batch is rejected downstream.
+
+    We therefore rank the raw trend feed in deterministic chunks, merge the
+    returned viable candidates, deduplicate them, and restore the global
+    pre-score ordering. No quality threshold is changed here.
+    """
+    items = list(trends or [])
+    if not items:
+        return []
+
+    # Keep this aligned with the topic scorer's current hard candidate cap.
+    # If that cap changes later, the chunk size remains safely bounded.
+    chunk_size = 24
+
+    ranked = []
+    seen = set()
+
+    def _key(item):
+        title = " ".join(str(item.get("title", "") or "").split()).strip().casefold()
+        title = unicodedata.normalize("NFKD", title)
+        title = "".join(ch for ch in title if not unicodedata.combining(ch))
+        title = re.sub(r"[^a-z0-9]+", " ", title)
+        return " ".join(title.split())
+
+    for start in range(0, len(items), chunk_size):
+        chunk = items[start:start + chunk_size]
+        batch = rank_trends(
+            chunk,
+            processed,
+            limit=len(chunk),
+        )
+        for item in batch:
+            key = _key(item)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            ranked.append(item)
+
+    ranked.sort(
+        key=lambda item: float(
+            (item.get("_topic") or {}).get("pre_score", 0.0)
+        ),
+        reverse=True,
+    )
+    return ranked
+
+
 def _build_evidence_source(news, story_selection):
     """Build evidence input from the exact source selection already made upstream."""
     items = list(news or [])
@@ -589,6 +723,17 @@ def _build_evidence_source(news, story_selection):
             for i, item in enumerate(compact_sources, 1)
         ],
     ])
+
+
+def _selected_story_news(news, story_selection):
+    """Return exactly the sources selected by Story Source Decision."""
+    items = list(news or [])
+    selection = story_selection or {}
+    indices = list(selection.get("selected_indices") or [])
+    selected = [items[i] for i in indices if 0 <= i < len(items)]
+    if not selected:
+        raise Exception("Fact Guard source received no sources from story selection")
+    return selected
 
 
 def _build_fact_guard_source(news):
@@ -1286,24 +1431,13 @@ def _enrich_evidence_for_generation(evidence, trend):
     # Headlines are discovery metadata and can contain claims that are stronger,
     # newer, or more specific than the source body. The locked evidence facts are
     # the sole factual authority for generation.
-    # Evidence-density article length policy. When the locked evidence contains
-    # only one verified fact, the article must stay naturally concise rather
-    # than expanding a single fact into repetitive 150-200 word coverage.
-    # This is a generation instruction only; it never changes or weakens the
-    # underlying evidence lock or Fact Guard source.
-    facts = enriched.get("facts", [])
-    if isinstance(facts, list) and len(facts) == 1:
-        enriched["article_length_policy"] = (
-            "SINGLE-FACT EVIDENCE: Write a naturally short article. "
-            "Use only the single verified fact available. Do not pad, repeat, "
-            "generalize, speculate, or manufacture context to reach a word count. "
-            "The article may be "
-            "substantially shorter than a typical article. "
-            "Completeness and factual precision take priority over length."
-        )
+    #
+    # Article length is now owned entirely by ollama_client._article_length_policy()
+    # and its deterministic body-word floor. Do not add a second fact-count-specific
+    # override here: a conflicting single-fact instruction previously encouraged
+    # extreme compression even when the density gate required a minimum body size.
 
     return enriched
-
 
 def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max_attempts=1, prelocked_evidence=None):
     last = None
@@ -1328,6 +1462,8 @@ def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max
                 )
             article = enforce_headline_policy(article, trend)
             validate_article(article)
+            validate_language_integrity(article)
+            print("[LANGUAGE GUARD] PASS")
 
             print("[FACT GUARD] Checking generated article...")
             guard = fact_guard_validate(
@@ -1358,6 +1494,8 @@ def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max
                     validate_article(repaired)
                     repaired = enforce_headline_policy(repaired, trend)
                     validate_article(repaired)
+                    validate_language_integrity(repaired)
+                    print("[LANGUAGE GUARD] REPAIRED ARTICLE PASS")
 
                     print("[FACT GUARD REPAIR] Re-checking repaired article...")
                     repaired_guard = fact_guard_validate(
@@ -1389,6 +1527,8 @@ def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max
                             f"({repaired_guard['blocking_issues']} blocking issue(s))"
                         )
 
+                    validate_language_integrity(repaired)
+                    print("[LANGUAGE GUARD] FINAL REPAIRED ARTICLE PASS")
                     print("[FACT GUARD REPAIR] PASS - repaired article accepted.")
 
                     if repaired_guard.get("review_items", 0):
@@ -1414,6 +1554,8 @@ def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max
             else:
                 print("[FACT GUARD] PASS")
 
+            validate_language_integrity(article)
+            print("[LANGUAGE GUARD] FINAL ARTICLE PASS")
             return article
 
         except Exception as e:
@@ -1490,19 +1632,35 @@ def main():
     # correctness AFTER a topic has been selected; it does not decide which
     # topics deserve production capacity.
     # ============================================================
-    # Keep a wider cheap candidate pool than the final article capacity.
-    # This allows the evidence-usability gate to reject a top-ranked topic
-    # and fall through to the next-ranked candidate instead of ending the
-    # production run with an unused article slot.
-    candidate_pool_size = max(
-        MAX_ARTICLES_PER_RUN * 4,
-        MAX_ARTICLES_PER_RUN + 3,
-    )
-
-    candidate_trends = rank_trends(
+    # PRODUCTION RESERVOIR
+    # ============================================================
+    # Never let the article target determine how many raw trends are allowed
+    # into the candidate stage. A target of 1 article must NOT mean "try only
+    # 4 topics". That creates candidate starvation: a handful of news/source
+    # rejects can terminate the run even when additional viable raw trends
+    # exist.
+    #
+    # The ranking layer is cheap (no news fetch / no Ollama), so the production
+    # reservoir should include every available raw trend, subject only to the
+    # ranker's own deterministic viability rules and its configured safety cap.
+    # Downstream quality gates remain unchanged.
+    #
+    # This is deliberately demand-independent:
+    #   raw trends -> full viable reservoir -> source retrieval -> evidence
+    #   -> generation -> editorial gates -> stop only when TARGET is reached
+    #
+    # IMPORTANT: Do NOT reduce this back to MAX_ARTICLES_PER_RUN * 4 (or any
+    # other target-relative multiplier). That was the recurring production
+    # bottleneck observed in UK runs.
+    candidate_trends = _rank_full_production_reservoir(
         trends,
         processed,
-        limit=candidate_pool_size,
+    )
+
+    print(
+        f"[TOPIC FILTER] PRODUCTION RESERVOIR | "
+        f"raw={len(trends)} | ranked_candidates={len(candidate_trends)} | "
+        f"target={MAX_ARTICLES_PER_RUN}"
     )
 
     source_scored_candidates = []
@@ -1689,11 +1847,12 @@ def main():
 
         try:
             generation_prompt = build_prompt(trend)
-            fact_guard_source = _build_fact_guard_source(news)
+            selected_news = _selected_story_news(news, story_selection)
+            fact_guard_source = _build_fact_guard_source(selected_news)
 
             print(
                 f"[FACT GUARD] Source prepared | "
-                f"news_items={len(news)} | "
+                f"news_items={len(selected_news)} | "
                 f"source_chars={len(fact_guard_source)}"
             )
 
@@ -1782,7 +1941,7 @@ def main():
             slug = slugify(keyword)
             article["slug"] = slug
 
-            save_article(slug, render_article(article, news=news))
+            save_article(slug, render_article(article, news=selected_news))
 
             new_keywords.append(keyword)
             generated += 1
