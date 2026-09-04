@@ -27,7 +27,7 @@ import unicodedata
 from html_generator import render_article, save_article
 from processed import load_processed, add_processed
 from index_generator import update_all
-from topic_scorer import rank_trends, score_with_news, select_final_candidates, filter_relevant_news
+from topic_scorer import rank_trends, score_with_news, select_final_candidates, filter_relevant_news, TOPIC_TIER_C
 import generator_monitor as monitor
 
 REQUIRED_FIELDS = ["title", "description", "h1", "paragraphs"]
@@ -682,28 +682,29 @@ def _decide_story_sources(news, topic):
 
 def _rank_full_production_reservoir(trends, processed):
     """
-    Rank every available raw trend without allowing topic_scorer.py's
-    fixed per-call safety cap to become a production-capacity bottleneck.
+    Rank the full production reservoir while admitting only strong production
+    candidates (pre_score >= TOPIC_TIER_C).
 
-    topic_scorer.rank_trends() is intentionally capped at 24 candidates per
-    invocation. That cap is useful for normal callers, but production needs a
-    complete reservoir so a target of 1 article cannot starve when the first
-    batch is rejected downstream.
+    topic_scorer.rank_trends() retains its backward-compatible fallback behavior
+    for other callers, but production must never admit 67-69.9 or <67 fallback
+    topics. Weak fallback topics are therefore discarded before any expensive
+    news retrieval.
 
-    We therefore rank the raw trend feed in deterministic chunks, merge the
-    returned viable candidates, deduplicate them, and restore the global
-    pre-score ordering. No quality threshold is changed here.
+    Production still ranks the raw trend feed in deterministic chunks so a
+    target of 1 article cannot starve when earlier strong candidates are rejected
+    downstream. All eligible >=70 candidates are merged, deduplicated, and
+    globally sorted by pre_score.
     """
     items = list(trends or [])
     if not items:
         return []
 
     # Keep this aligned with the topic scorer's current hard candidate cap.
-    # If that cap changes later, the chunk size remains safely bounded.
     chunk_size = 24
 
     ranked = []
     seen = set()
+    weak_dropped = 0
 
     def _key(item):
         title = " ".join(str(item.get("title", "") or "").split()).strip().casefold()
@@ -719,10 +720,26 @@ def _rank_full_production_reservoir(trends, processed):
             processed,
             limit=len(chunk),
         )
+
         for item in batch:
+            pre_score = float(
+                (item.get("_topic") or {}).get("pre_score", 0.0)
+            )
+
+            # Production rule: fallback topics are NOT production candidates.
+            if pre_score < TOPIC_TIER_C:
+                weak_dropped += 1
+                print(
+                    f"[TOPIC FILTER] DROP PRODUCTION FALLBACK | "
+                    f"pre={pre_score:.1f} < {TOPIC_TIER_C:.1f} | "
+                    f"{item.get('title', '')}"
+                )
+                continue
+
             key = _key(item)
             if not key or key in seen:
                 continue
+
             seen.add(key)
             ranked.append(item)
 
@@ -732,8 +749,15 @@ def _rank_full_production_reservoir(trends, processed):
         ),
         reverse=True,
     )
-    return ranked
 
+    print(
+        f"[TOPIC FILTER] PRODUCTION STRICT GATE | "
+        f"ranked_70plus={len(ranked)} | "
+        f"dropped_fallback={weak_dropped} | "
+        f"threshold={TOPIC_TIER_C:.1f}"
+    )
+
+    return ranked
 
 def _build_evidence_source(news, story_selection):
     """Build evidence input from the exact source selection already made upstream."""
