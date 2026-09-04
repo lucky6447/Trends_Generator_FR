@@ -113,6 +113,15 @@ def validate_language_integrity(article):
 
 # Article length is determined by the amount of usable verified evidence.
 # There is no artificial word-count target or evidence-count-based minimum.
+#
+# Evidence sufficiency is a separate production-capacity gate: if the locked
+# evidence contains only 0-2 facts, the candidate is rejected before article
+# generation. This avoids spending the expensive generation/audit pipeline on
+# articles that cannot carry enough verified information to be meaningful.
+EVIDENCE_MIN_FACTS_FOR_GENERATION = max(
+    1,
+    int(os.getenv("EVIDENCE_MIN_FACTS_FOR_GENERATION", "3")),
+)
 
 SKIP_PATTERNS = [
     " vs ",
@@ -1874,6 +1883,69 @@ def main():
                     f"source_chars={len(evidence_source)}"
                 )
                 evidence_lock = extract_evidence(evidence_source)
+
+                # --------------------------------------------------------
+                # EVIDENCE SUFFICIENCY GATE
+                # --------------------------------------------------------
+                # Evidence extraction itself is required to know whether the
+                # story is sufficiently supported. Once extraction returns,
+                # however, there is no value in invoking article generation,
+                # factual audit, headline repair, Fact Guard, or Story Quality
+                # for a candidate with only 0-2 locked facts.
+                #
+                # This is intentionally a fact-count gate, not a word-count
+                # floor and not a generation retry. A short article can still
+                # PASS when the evidence is rich enough; candidates with
+                # insufficient evidence are simply not generated.
+                locked_facts = (
+                    evidence_lock.get("facts", [])
+                    if isinstance(evidence_lock, dict)
+                    else []
+                )
+                evidence_fact_count = (
+                    len(locked_facts)
+                    if isinstance(locked_facts, list)
+                    else 0
+                )
+
+                if evidence_fact_count < EVIDENCE_MIN_FACTS_FOR_GENERATION:
+                    trend["_production_status"] = "REJECT"
+                    trend["_production_reject_reason"] = (
+                        f"insufficient evidence facts "
+                        f"({evidence_fact_count} < "
+                        f"{EVIDENCE_MIN_FACTS_FOR_GENERATION})"
+                    )
+
+                    print(
+                        f"[TOPIC FILTER] EVIDENCE SUFFICIENCY REJECT | "
+                        f"facts={evidence_fact_count} | "
+                        f"minimum={EVIDENCE_MIN_FACTS_FOR_GENERATION} | "
+                        f"{keyword} | "
+                        f"reason=insufficient evidence for meaningful article"
+                    )
+
+                    monitor.candidate_event(
+                        "evidence_sufficiency",
+                        status="REJECT",
+                        reason="insufficient evidence for meaningful article",
+                        news_count=len(news),
+                        selected_source_indices=(story_selection or {}).get("selected_indices", []),
+                        selected_source_count=(story_selection or {}).get("selected_count"),
+                        evidence_source_chars=len(evidence_source),
+                        evidence_fact_count=evidence_fact_count,
+                        evidence_facts=locked_facts,
+                        minimum_facts=EVIDENCE_MIN_FACTS_FOR_GENERATION,
+                    )
+                    monitor.finish_candidate(
+                        "REJECT",
+                        reason=(
+                            f"insufficient evidence facts "
+                            f"({evidence_fact_count} < "
+                            f"{EVIDENCE_MIN_FACTS_FOR_GENERATION})"
+                        ),
+                    )
+                    continue
+
                 evidence_lock = _enrich_evidence_for_generation(
                     evidence_lock,
                     trend,
@@ -1881,7 +1953,7 @@ def main():
                 trend["_evidence_lock"] = evidence_lock
                 print(
                     f"[TOPIC FILTER] EVIDENCE USABILITY PASS | "
-                    f"facts={len(evidence_lock.get('facts', []))} | {keyword}"
+                    f"facts={evidence_fact_count} | {keyword}"
                 )
                 monitor.candidate_event(
                     "evidence_locked",
@@ -1889,8 +1961,8 @@ def main():
                     selected_source_indices=(story_selection or {}).get("selected_indices", []),
                     selected_source_count=(story_selection or {}).get("selected_count"),
                     evidence_source_chars=len(evidence_source),
-                    evidence_facts=evidence_lock.get("facts", []),
-                    evidence_fact_count=len(evidence_lock.get("facts", [])) if isinstance(evidence_lock.get("facts", []), list) else None,
+                    evidence_facts=locked_facts,
+                    evidence_fact_count=evidence_fact_count,
                     evidence_lock=evidence_lock,
                 )
             except Exception as evidence_error:

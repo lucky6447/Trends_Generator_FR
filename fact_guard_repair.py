@@ -1,12 +1,13 @@
 import json
 import os
+import re
 from typing import Any, Dict
 
 from ollama import chat
 from config import MODEL
 
 
-FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.6.1-entity-attribution-aliases"
+FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.6.2-platform-repair-re-import"
 
 NUM_THREADS = max(1, int(os.getenv("FACT_GUARD_NUM_THREADS", "16")))
 NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
@@ -189,6 +190,7 @@ def _supported_repair(issue: Dict[str, Any]) -> bool:
         "scope_inflation",
         "unsupported_quote",
         "wrong_fact",
+        "wrong_platform",
         "causal_claim",
         "event_status_mismatch",
         "event_date_mismatch",
@@ -282,6 +284,13 @@ def repair(
                 "a different amount.\n"
                 "- If the correction cannot be established directly, DELETE the "
                 "smallest amount-bearing claim instead."
+            )
+        elif issue_type == "wrong_platform":
+            rules = (
+                "- DELETE-ONLY: remove the unsupported platform attribution "
+                "unless the issue/source excerpt directly establishes a safe correction.\n"
+                "- Never substitute a platform from outside knowledge.\n"
+                "- Preserve surrounding source-supported reporting where possible."
             )
         elif issue_type in {
             "unsupported_claim",

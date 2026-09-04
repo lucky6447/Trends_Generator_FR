@@ -1,5 +1,5 @@
 """
-TrendCurrent Topic Priority Filter v1.0
+TrendCurrent Topic Priority Filter v1.2
 
 Purpose:
     Select the small number of trends that deserve expensive news retrieval
@@ -45,6 +45,13 @@ TOPIC_CANDIDATE_MULTIPLIER = max(
 TOPIC_MAX_CANDIDATES = max(
     8, int(os.getenv("TOPIC_MAX_CANDIDATES", "24"))
 )
+
+# Expensive news retrieval cap used only when the >=70 tiers cannot fill the
+# normal candidate pool. This limits wasted retrieval/semantic-judge work on
+# borderline/lower-score topics while preserving all strong >=70 candidates.
+TOPIC_NEWS_RETRIEVAL_FALLBACK_CAP = max(
+    1, int(os.getenv("TOPIC_NEWS_RETRIEVAL_FALLBACK_CAP", "4"))
+)
 TOPIC_MIN_PRE_SCORE = float(os.getenv("TOPIC_MIN_PRE_SCORE", "42"))
 TOPIC_MIN_FINAL_SCORE = float(os.getenv("TOPIC_MIN_FINAL_SCORE", "55"))
 
@@ -53,6 +60,16 @@ TOPIC_MIN_FINAL_SCORE = float(os.getenv("TOPIC_MIN_FINAL_SCORE", "55"))
 TOPIC_TIER_A = float(os.getenv("TOPIC_TIER_A", "80"))
 TOPIC_TIER_B = float(os.getenv("TOPIC_TIER_B", "75"))
 TOPIC_TIER_C = float(os.getenv("TOPIC_TIER_C", "70"))
+
+# Borderline topics (67-69.9 by default) are admitted only as fallback
+# when the >=70 tiers cannot fill the candidate capacity. They never displace
+# a >=70 topic and do not alter the Topic Score formula.
+TOPIC_BORDERLINE_MIN = float(os.getenv("TOPIC_BORDERLINE_MIN", "67"))
+if not (0 <= TOPIC_BORDERLINE_MIN < TOPIC_TIER_C):
+    raise ValueError(
+        f"TOPIC_BORDERLINE_MIN must be >= 0 and < TOPIC_TIER_C ({TOPIC_TIER_C}), "
+        f"got {TOPIC_BORDERLINE_MIN}"
+    )
 
 # Production GEO priority is now market-aware. An explicit environment
 # override still wins, preserving the existing deployment control.
@@ -622,31 +639,72 @@ def rank_trends(trends: Sequence[Dict[str, Any]], processed: Iterable[str], limi
     )
 
     # Quality-prioritized candidate pool:
-    #   80+      = highest priority
-    #   75-79.9  = strong
-    #   70-74.9  = acceptable
-    #   <70      = fallback only
+    #   80+       = highest priority
+    #   75-79.9   = strong
+    #   70-74.9   = acceptable
+    #   67-69.9   = borderline fallback only
+    #   <67       = lower fallback only
     #
-    # Strong topics must get the expensive retrieval capacity first. However,
-    # a weak trend batch must not result in zero production: fallback topics
-    # are admitted only when the higher tiers cannot fill the candidate pool.
+    # >=70 topics always receive priority. Borderline topics are considered
+    # ONLY when the >=70 tiers cannot fill the candidate capacity. This is
+    # deliberately a fallback relaxation: it does not change the score
+    # formula, the 6h freshness logic, or the final 55-point gate.
     tier_a = [x for x in scored if x["_topic"]["pre_score"] >= TOPIC_TIER_A]
     tier_b = [x for x in scored if TOPIC_TIER_B <= x["_topic"]["pre_score"] < TOPIC_TIER_A]
     tier_c = [x for x in scored if TOPIC_TIER_C <= x["_topic"]["pre_score"] < TOPIC_TIER_B]
-    tier_d = [x for x in scored if x["_topic"]["pre_score"] < TOPIC_TIER_C]
+    tier_borderline = [
+        x for x in scored
+        if TOPIC_BORDERLINE_MIN <= x["_topic"]["pre_score"] < TOPIC_TIER_C
+    ]
+    tier_e = [x for x in scored if x["_topic"]["pre_score"] < TOPIC_BORDERLINE_MIN]
 
     prioritized = tier_a + tier_b + tier_c
     selected = prioritized[:pool_size]
 
-    if len(selected) < min(pool_size, limit):
-        fallback_needed = min(pool_size, limit) - len(selected)
-        selected.extend(tier_d[:fallback_needed])
+    # First fill any remaining capacity with 67-69.9 borderline topics.
+    # Only after those are exhausted may the older <67 fallback be used.
+    fallback_target = min(pool_size, limit)
+    borderline_start = len(selected)
+
+    if len(selected) < fallback_target:
+        fallback_needed = fallback_target - len(selected)
+        selected.extend(tier_borderline[:fallback_needed])
+
+    borderline_used = len(selected) - borderline_start
+
+    if len(selected) < fallback_target:
+        lower_fallback_needed = fallback_target - len(selected)
+        selected.extend(tier_e[:lower_fallback_needed])
 
     print(
         f"[TOPIC FILTER] QUALITY GATE | "
         f"80+={len(tier_a)} | 75-79.9={len(tier_b)} | "
-        f"70-74.9={len(tier_c)} | <70 fallback={len(tier_d)} | "
-        f"selected={len(selected)}"
+        f"70-74.9={len(tier_c)} | "
+        f"67-69.9 borderline={len(tier_borderline)} | "
+        f"borderline_used={borderline_used} | "
+        f"<67 fallback={len(tier_e)} | selected={len(selected)}"
+    )
+
+    # Expensive retrieval optimization:
+    # If the >=70 tiers cannot fill the normal candidate pool, do not send a
+    # large borderline/lower-score reservoir into news retrieval at once.
+    # Preserve rank order and all >=70 candidates; cap only the weaker tail.
+    strong_count = len(prioritized)
+    retrieval_cap_applied = (
+        strong_count <= TOPIC_NEWS_RETRIEVAL_FALLBACK_CAP
+        and strong_count < pool_size
+        and len(selected) > TOPIC_NEWS_RETRIEVAL_FALLBACK_CAP
+    )
+    candidates_deferred = 0
+    if retrieval_cap_applied:
+        candidates_deferred = len(selected) - TOPIC_NEWS_RETRIEVAL_FALLBACK_CAP
+        selected = selected[:TOPIC_NEWS_RETRIEVAL_FALLBACK_CAP]
+
+    print(
+        f"[TOPIC FILTER] RETRIEVAL CAP | "
+        f"strong_70plus={strong_count} | cap={TOPIC_NEWS_RETRIEVAL_FALLBACK_CAP} | "
+        f"applied={retrieval_cap_applied} | deferred={candidates_deferred} | "
+        f"news_candidates={len(selected)}"
     )
 
     print(
