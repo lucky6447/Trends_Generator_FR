@@ -27,7 +27,7 @@ import unicodedata
 from html_generator import render_article, save_article
 from processed import load_processed, add_processed
 from index_generator import update_all
-from topic_scorer import rank_trends, score_with_news, select_final_candidates, filter_relevant_news, TOPIC_TIER_C
+from topic_scorer import rank_trends, score_with_news, select_final_candidates, filter_relevant_news, _is_sports_match_topic
 import generator_monitor as monitor
 
 REQUIRED_FIELDS = ["title", "description", "h1", "paragraphs"]
@@ -135,6 +135,50 @@ SKIP_PATTERNS = [
     " stream",
     " streaming",
 ]
+
+# Sports exclusion: this generator is not a sports-news publisher.
+# Match/fixture filtering alone is insufficient because athlete, tournament,
+# league and motorsport trends can still enter the production reservoir.
+SPORTS_TOPIC_TERMS = (
+    "tennis", "football", "soccer", "basketball", "baseball", "hockey",
+    "golf", "cricket", "rugby", "boxing", "ufc", "mma", "wrestling",
+    "motogp", "nascar", "formula 1", "formula one", "f1", "grand prix",
+    "premier league", "champions league", "europa league", "bundesliga",
+    "la liga", "ligue 1", "serie a", "mlb", "nfl", "nba", "nhl",
+    "fifa", "uefa", "atp", "wta", "us open", "wimbledon", "olympics",
+    "olympic", "world cup", "tournament", "championship", "playoff",
+    "matchday", "fixture", "kickoff", "kick-off", "marathon", "cycling",
+    "cyclist", "swimming", "gymnastics", "volleyball", "weightlifting",
+    "track and field", "athletics", "esports",
+)
+SPORTS_SOURCE_TERMS = (
+    "espn", "sky sports", "sports illustrated", "sportskeeda", "sporting news",
+    "the athletic", "bbc sport", "cbssports", "yahoo sports", "eurosport",
+    "formula1.com", "formula1", "motorsport", "tennis.com", "atptour",
+    "wtatennis", "mlb.com", "nfl.com", "nba.com", "nhl.com", "fifa.com",
+    "uefa.com", "golf.com", "golf monthly", "cricbuzz",
+)
+
+def _is_sports_topic(title, news=None):
+    """Return True when the candidate is clearly sports-related."""
+    text = " ".join(str(title or "").split()).casefold()
+    if any(term in f" {text} " for term in SPORTS_TOPIC_TERMS):
+        return True
+
+    for item in news or ():
+        if not isinstance(item, dict):
+            continue
+        haystack = " ".join(
+            str(item.get(key, "") or "")
+            for key in ("title", "source", "url", "link", "summary")
+        ).casefold()
+        if any(term in haystack for term in SPORTS_SOURCE_TERMS):
+            return True
+        if any(term in haystack for term in SPORTS_TOPIC_TERMS):
+            return True
+
+    return False
+
 
 
 def slugify(text):
@@ -682,29 +726,29 @@ def _decide_story_sources(news, topic):
 
 def _rank_full_production_reservoir(trends, processed):
     """
-    Rank the full production reservoir while admitting only strong production
-    candidates (pre_score >= TOPIC_TIER_C).
+    Rank the full production reservoir without using pre_score as an admission gate.
 
-    topic_scorer.rank_trends() retains its backward-compatible fallback behavior
-    for other callers, but production must never admit 67-69.9 or <67 fallback
-    topics. Weak fallback topics are therefore discarded before any expensive
-    news retrieval.
+    pre_score is a prioritization signal only. A fresh, editorially eligible topic
+    must be allowed to reach news retrieval regardless of whether its score is 70,
+    60, 50, or lower. Downstream story/evidence/factual/editorial gates decide
+    whether the topic can become a production article.
 
-    Production still ranks the raw trend feed in deterministic chunks so a
-    target of 1 article cannot starve when earlier strong candidates are rejected
-    downstream. All eligible >=70 candidates are merged, deduplicated, and
-    globally sorted by pre_score.
+    Production ranks the raw trend feed in deterministic chunks so a target of 1
+    article cannot starve when earlier candidates are rejected downstream. Every
+    deterministic-eligible candidate is retained; pre_score is used only for
+    global processing order.
     """
     items = list(trends or [])
     if not items:
         return []
 
-    # Keep this aligned with the topic scorer's current hard candidate cap.
+    # Process the raw feed in bounded cheap-ranking chunks, but return every
+    # deterministic-eligible topic. The scorer's production mode has no score
+    # admission gate and no retrieval cap.
     chunk_size = 24
 
     ranked = []
     seen = set()
-    weak_dropped = 0
 
     def _key(item):
         title = " ".join(str(item.get("title", "") or "").split()).strip().casefold()
@@ -722,20 +766,6 @@ def _rank_full_production_reservoir(trends, processed):
         )
 
         for item in batch:
-            pre_score = float(
-                (item.get("_topic") or {}).get("pre_score", 0.0)
-            )
-
-            # Production rule: fallback topics are NOT production candidates.
-            if pre_score < TOPIC_TIER_C:
-                weak_dropped += 1
-                print(
-                    f"[TOPIC FILTER] DROP PRODUCTION FALLBACK | "
-                    f"pre={pre_score:.1f} < {TOPIC_TIER_C:.1f} | "
-                    f"{item.get('title', '')}"
-                )
-                continue
-
             key = _key(item)
             if not key or key in seen:
                 continue
@@ -751,10 +781,9 @@ def _rank_full_production_reservoir(trends, processed):
     )
 
     print(
-        f"[TOPIC FILTER] PRODUCTION STRICT GATE | "
-        f"ranked_70plus={len(ranked)} | "
-        f"dropped_fallback={weak_dropped} | "
-        f"threshold={TOPIC_TIER_C:.1f}"
+        f"[TOPIC FILTER] PRODUCTION RESERVOIR RANKED | "
+        f"raw={len(items)} | eligible={len(ranked)} | "
+        f"score_gate=DISABLED | score_used=PRIORITY_ONLY"
     )
 
     return ranked
@@ -1771,32 +1800,11 @@ def main():
     for trend in candidate_trends:
         keyword = trend["title"]
 
-        # ------------------------------------------------------------
-        # SIMPLE EDITORIAL SKIP: result / live / score
-        # ------------------------------------------------------------
-        keyword_lower = unicodedata.normalize("NFKD", keyword).casefold()
-        keyword_lower = "".join(
-            ch for ch in keyword_lower
-            if not unicodedata.combining(ch)
-        )
-        skip_terms = (
-            # English
-            "result", "live", "score",
-            # German
-            "ergebnis", "spielstand",
-            # Spanish
-            "resultado", "marcador", "puntuacion",
-            # French
-            "resultat", "score",
-            # Italian
-            "risultato", "punteggio",
-            # Portuguese
-            "resultado", "marcador", "placar",
-            # Indonesian
-            "hasil", "skor",
-        )
-        if any(term in keyword_lower for term in skip_terms):
-            print(f"[TrendCurrent] SKIP result/live/score trend: {keyword}")
+        # Cheap title-level sports exclusion. Explicit sports topics are
+        # removed before news retrieval; athlete/person names are checked again
+        # after corroborating news arrives.
+        if _is_sports_topic(keyword):
+            print(f"[TrendCurrent] SKIP sports topic: {keyword}")
             continue
 
         try:
@@ -1882,6 +1890,12 @@ def main():
                 print(f"[TOPIC FILTER] DROP AFTER NEWS | {keyword} | no usable news result(s)")
                 continue
 
+            # Second sports check catches athlete/person trends whose names do
+            # not contain an explicit sport term (for example Gasly or Bublik).
+            if _is_sports_topic(keyword, news):
+                print(f"[TrendCurrent] SKIP sports topic after news: {keyword}")
+                continue
+
             # --------------------------------------------------------
             # TOPIC / NEWS RELEVANCE GATE
             # --------------------------------------------------------
@@ -1945,6 +1959,7 @@ def main():
     evidence_candidate_pool = select_final_candidates(
         source_scored_candidates,
         limit=len(source_scored_candidates),
+        min_score=None,
     )
 
     for trend in evidence_candidate_pool:

@@ -46,30 +46,9 @@ TOPIC_MAX_CANDIDATES = max(
     8, int(os.getenv("TOPIC_MAX_CANDIDATES", "24"))
 )
 
-# Expensive news retrieval cap used only when the >=70 tiers cannot fill the
-# normal candidate pool. This limits wasted retrieval/semantic-judge work on
-# borderline/lower-score topics while preserving all strong >=70 candidates.
-TOPIC_NEWS_RETRIEVAL_FALLBACK_CAP = max(
-    1, int(os.getenv("TOPIC_NEWS_RETRIEVAL_FALLBACK_CAP", "4"))
-)
-TOPIC_MIN_PRE_SCORE = float(os.getenv("TOPIC_MIN_PRE_SCORE", "42"))
-TOPIC_MIN_FINAL_SCORE = float(os.getenv("TOPIC_MIN_FINAL_SCORE", "55"))
-
-# Production candidate quality tiers. These do not change the Topic Score
-# formula; they control priority before expensive news retrieval.
-TOPIC_TIER_A = float(os.getenv("TOPIC_TIER_A", "80"))
-TOPIC_TIER_B = float(os.getenv("TOPIC_TIER_B", "75"))
-TOPIC_TIER_C = float(os.getenv("TOPIC_TIER_C", "70"))
-
-# Borderline topics (67-69.9 by default) are admitted only as fallback
-# when the >=70 tiers cannot fill the candidate capacity. They never displace
-# a >=70 topic and do not alter the Topic Score formula.
-TOPIC_BORDERLINE_MIN = float(os.getenv("TOPIC_BORDERLINE_MIN", "67"))
-if not (0 <= TOPIC_BORDERLINE_MIN < TOPIC_TIER_C):
-    raise ValueError(
-        f"TOPIC_BORDERLINE_MIN must be >= 0 and < TOPIC_TIER_C ({TOPIC_TIER_C}), "
-        f"got {TOPIC_BORDERLINE_MIN}"
-    )
+# Production topic selection is score-neutral: pre_score is ranking priority only.
+# Deterministic editorial exclusions and downstream evidence/factual/editorial
+# gates are the actual admission controls.
 
 # Production GEO priority is now market-aware. An explicit environment
 # override still wins, preserving the existing deployment control.
@@ -149,6 +128,11 @@ SPORTS_MATCH_TERMS = (
     r"\bliverpool\b", r"\barsenal\b", r"\bchelsea\b",
     r"\btottenham\b", r"\bbayern munich\b", r"\bborussia dortmund\b",
     r"\bjuventus\b", r"\bac milan\b", r"\binter milan\b",
+    # Additional production-relevant European / international teams.
+    r"\bgalatasaray\b", r"\bbasaksehir\b", r"\bbasakşehir\b",
+    r"\bauxerre\b", r"\blyon\b", r"\bvilzing\b",
+    r"\b1860 munich\b", r"\b1860 münchen\b", r"\bistanbul bb\b",
+    r"\babha\b", r"\bal[- ]ettifaq\b",
 )
 
 def _is_sports_match_topic(title: str) -> bool:
@@ -619,92 +603,24 @@ def rank_trends(trends: Sequence[Dict[str, Any]], processed: Iterable[str], limi
             continue
 
         data = _pre_score(trend)
-        if data["pre_score"] < TOPIC_MIN_PRE_SCORE:
-            print(
-                f"[TOPIC FILTER] DROP | {title} | "
-                f"pre={data['pre_score']:.1f} < {TOPIC_MIN_PRE_SCORE:.1f}"
-            )
-            continue
 
+        # pre_score is PRIORITY ONLY. There is no numeric admission threshold.
+        # Deterministic editorial exclusions above remain the actual topic
+        # eligibility gate; evidence/factual/editorial gates decide production.
         item = dict(trend)
         item["_topic"] = data
         scored.append(item)
 
     scored.sort(key=lambda x: x["_topic"]["pre_score"], reverse=True)
 
-    pool_size = min(
-        len(scored),
-        max(limit * TOPIC_CANDIDATE_MULTIPLIER, 8),
-        TOPIC_MAX_CANDIDATES,
-    )
-
-    # Quality-prioritized candidate pool:
-    #   80+       = highest priority
-    #   75-79.9   = strong
-    #   70-74.9   = acceptable
-    #   67-69.9   = borderline fallback only
-    #   <67       = lower fallback only
-    #
-    # >=70 topics always receive priority. Borderline topics are considered
-    # ONLY when the >=70 tiers cannot fill the candidate capacity. This is
-    # deliberately a fallback relaxation: it does not change the score
-    # formula, the 6h freshness logic, or the final 55-point gate.
-    tier_a = [x for x in scored if x["_topic"]["pre_score"] >= TOPIC_TIER_A]
-    tier_b = [x for x in scored if TOPIC_TIER_B <= x["_topic"]["pre_score"] < TOPIC_TIER_A]
-    tier_c = [x for x in scored if TOPIC_TIER_C <= x["_topic"]["pre_score"] < TOPIC_TIER_B]
-    tier_borderline = [
-        x for x in scored
-        if TOPIC_BORDERLINE_MIN <= x["_topic"]["pre_score"] < TOPIC_TIER_C
-    ]
-    tier_e = [x for x in scored if x["_topic"]["pre_score"] < TOPIC_BORDERLINE_MIN]
-
-    prioritized = tier_a + tier_b + tier_c
-    selected = prioritized[:pool_size]
-
-    # First fill any remaining capacity with 67-69.9 borderline topics.
-    # Only after those are exhausted may the older <67 fallback be used.
-    fallback_target = min(pool_size, limit)
-    borderline_start = len(selected)
-
-    if len(selected) < fallback_target:
-        fallback_needed = fallback_target - len(selected)
-        selected.extend(tier_borderline[:fallback_needed])
-
-    borderline_used = len(selected) - borderline_start
-
-    if len(selected) < fallback_target:
-        lower_fallback_needed = fallback_target - len(selected)
-        selected.extend(tier_e[:lower_fallback_needed])
+    # pre_score is used only to order otherwise eligible topics. The caller
+    # controls capacity through `limit`; there is no score-based admission gate,
+    # tier gate, fallback gate, or hidden retrieval cap here.
+    selected = scored[:max(0, limit)]
 
     print(
-        f"[TOPIC FILTER] QUALITY GATE | "
-        f"80+={len(tier_a)} | 75-79.9={len(tier_b)} | "
-        f"70-74.9={len(tier_c)} | "
-        f"67-69.9 borderline={len(tier_borderline)} | "
-        f"borderline_used={borderline_used} | "
-        f"<67 fallback={len(tier_e)} | selected={len(selected)}"
-    )
-
-    # Expensive retrieval optimization:
-    # If the >=70 tiers cannot fill the normal candidate pool, do not send a
-    # large borderline/lower-score reservoir into news retrieval at once.
-    # Preserve rank order and all >=70 candidates; cap only the weaker tail.
-    strong_count = len(prioritized)
-    retrieval_cap_applied = (
-        strong_count <= TOPIC_NEWS_RETRIEVAL_FALLBACK_CAP
-        and strong_count < pool_size
-        and len(selected) > TOPIC_NEWS_RETRIEVAL_FALLBACK_CAP
-    )
-    candidates_deferred = 0
-    if retrieval_cap_applied:
-        candidates_deferred = len(selected) - TOPIC_NEWS_RETRIEVAL_FALLBACK_CAP
-        selected = selected[:TOPIC_NEWS_RETRIEVAL_FALLBACK_CAP]
-
-    print(
-        f"[TOPIC FILTER] RETRIEVAL CAP | "
-        f"strong_70plus={strong_count} | cap={TOPIC_NEWS_RETRIEVAL_FALLBACK_CAP} | "
-        f"applied={retrieval_cap_applied} | deferred={candidates_deferred} | "
-        f"news_candidates={len(selected)}"
+        f"[TOPIC FILTER] QUALITY GATE | deterministic_eligible={len(scored)} "
+        f"| score_gate=DISABLED | score_used=PRIORITY_ONLY"
     )
 
     print(
@@ -900,22 +816,11 @@ def select_final_candidates(
     limit: int,
     min_score: float | None = None,
 ) -> List[Dict[str, Any]]:
-    # Backward-compatible optional gate override. Existing callers that do not
-    # pass min_score keep the universal TOPIC_MIN_FINAL_SCORE behavior.
-    effective_min_score = (
-        TOPIC_MIN_FINAL_SCORE if min_score is None else float(min_score)
-    )
-
-    viable = []
-    for item in candidates:
-        d = item.get("_topic_final") or {}
-        if d.get("final_score", 0) < effective_min_score:
-            print(
-                f"[TOPIC FILTER] DROP AFTER NEWS | {item.get('title')} | "
-                f"final={d.get('final_score', 0):.1f} < {effective_min_score:.1f}"
-            )
-            continue
-        viable.append(item)
+    # final_score is PRIORITY ONLY. No numeric score blocks a candidate after
+    # news retrieval. Evidence, Fact Guard and Story Quality are the substantive
+    # production gates. `min_score` is retained in the signature for compatibility
+    # but is intentionally ignored.
+    viable = list(candidates)
 
     viable.sort(
         key=lambda x: (
