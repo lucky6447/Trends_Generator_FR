@@ -365,6 +365,11 @@ def _story_pool_profile(news, topic):
     }
 
 
+class StorySourceUnavailable(Exception):
+    """Semantic Story Source Judge could not complete after bounded retry."""
+    pass
+
+
 def _semantic_story_concentration_judge(news, topic):
     """One compact semantic judgment for borderline source pools."""
     items = list(news or [])
@@ -381,17 +386,22 @@ def _semantic_story_concentration_judge(news, topic):
 You are TrendCurrent's pre-evidence story selector.
 
 Classify the retrieved source pool into exactly one:
-1) ONE_STORY - most sources corroborate one concrete news story/event.
-2) DOMINANT_STORY - a clear majority corroborates one concrete story and the
-   remaining sources are unrelated/outliers.
-3) MIXED - there is no safely isolatable majority story.
+1) ONE_STORY - the source pool broadly corroborates one concrete news story/event.
+2) DOMINANT_STORY - a clearly identifiable, strongly corroborated story cluster
+   can be isolated from a noisy pool, while the remaining sources are unrelated
+   outliers. The isolated cluster does NOT have to be 50% or more of the pool.
+3) MIXED - no single concrete story can be isolated safely.
 
 TOPIC: {str(topic or '').strip()}
 
 Rules:
 - Same broad topic is NOT the same story.
 - Different wording or languages for the SAME event counts as the same story.
-- DOMINANT_STORY is valid only when there is a real majority that can be isolated safely.
+- DOMINANT_STORY does NOT require a numerical majority of the full source pool.
+- A smaller cluster may qualify when at least 2 sources clearly describe the
+  same concrete event/development and the cluster can be isolated safely.
+- Do not select a smaller cluster merely because the sources share a person,
+  team, tournament, programme, region, or broad topic.
 - Separate local/regional stories, separate people/events, programmes, lists,
   roundups, or unrelated developments are outliers and must not be selected.
 - Be conservative. Never invent a connection.
@@ -403,64 +413,82 @@ SOURCE HEADLINES:
 {chr(10).join(lines)}
 """
 
-    try:
-        started = __import__("time").perf_counter()
-        raw = chat(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={
-                "temperature": 0.0,
-                "top_p": 0.85,
-                "top_k": 40,
-                "num_ctx": max(4096, int(os.getenv("OLLAMA_NUM_CTX", "6144"))),
-                "num_predict": 160,
-            },
-            format="json",
-        )
-        elapsed = __import__("time").perf_counter() - started
-        content = getattr(getattr(raw, "message", None), "content", "") or ""
-        start_json = content.find("{")
-        end_json = content.rfind("}")
-        if start_json < 0 or end_json <= start_json:
-            raise ValueError("semantic selector returned no JSON object")
-        result = json.loads(content[start_json:end_json + 1])
-        verdict = str(result.get("verdict", "")).strip().upper()
-        confidence = max(0, min(100, int(result.get("confidence", 0))))
-        reason = str(result.get("reason", "")).strip()[:300]
-        raw_numbers = result.get("source_numbers", [])
-        source_numbers = []
-        if isinstance(raw_numbers, list):
-            for value in raw_numbers:
-                try:
-                    number = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if 1 <= number <= len(items) and number not in source_numbers:
-                    source_numbers.append(number)
-        if verdict not in {"PASS", "ONE_STORY", "DOMINANT_STORY", "MIXED"}:
-            raise ValueError(f"invalid semantic verdict: {verdict}")
+    # Bounded infrastructure recovery ONLY for the semantic judge.
+    # This is not an article/evidence/generation retry.
+    # Attempt 1 is normal; attempt 2 is allowed only when the first attempt
+    # fails before producing a valid semantic verdict.
+    max_attempts = 2
+    last_error = None
 
-        print(
-            f"[TOPIC FILTER] STORY SOURCE JUDGE | {verdict} | "
-            f"confidence={confidence} | elapsed={elapsed:.2f}s | {reason}"
-        )
-        return {
-            "status": verdict,
-            "confidence": confidence,
-            "reason": reason or "semantic story selection judgment",
-            "source_numbers": source_numbers,
-        }
-    except Exception as exc:
-        # This judge is part of the source-safety decision. If it was required
-        # to resolve a borderline/rejected pool, an unavailable result cannot
-        # safely become PASS.
-        print(f"[TOPIC FILTER] STORY SOURCE JUDGE | ERROR | fail-closed | {exc}")
-        return {
-            "status": "ERROR",
-            "confidence": 0,
-            "reason": f"semantic selector unavailable: {exc}",
-            "source_numbers": [],
-        }
+    for attempt in range(1, max_attempts + 1):
+        try:
+            started = __import__("time").perf_counter()
+            raw = chat(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                options={
+                    "temperature": 0.0,
+                    "top_p": 0.85,
+                    "top_k": 40,
+                    "num_ctx": max(4096, int(os.getenv("OLLAMA_NUM_CTX", "6144"))),
+                    "num_predict": 160,
+                },
+                format="json",
+            )
+            elapsed = __import__("time").perf_counter() - started
+            content = getattr(getattr(raw, "message", None), "content", "") or ""
+            start_json = content.find("{")
+            end_json = content.rfind("}")
+            if start_json < 0 or end_json <= start_json:
+                raise ValueError("semantic selector returned no JSON object")
+            result = json.loads(content[start_json:end_json + 1])
+            verdict = str(result.get("verdict", "")).strip().upper()
+            confidence = max(0, min(100, int(result.get("confidence", 0))))
+            reason = str(result.get("reason", "")).strip()[:300]
+            raw_numbers = result.get("source_numbers", [])
+            source_numbers = []
+            if isinstance(raw_numbers, list):
+                for value in raw_numbers:
+                    try:
+                        number = int(value)
+                    except (TypeError, ValueError):
+                        continue
+                    if 1 <= number <= len(items) and number not in source_numbers:
+                        source_numbers.append(number)
+            if verdict not in {"PASS", "ONE_STORY", "DOMINANT_STORY", "MIXED"}:
+                raise ValueError(f"invalid semantic verdict: {verdict}")
+
+            print(
+                f"[TOPIC FILTER] STORY SOURCE JUDGE | {verdict} | "
+                f"confidence={confidence} | attempt={attempt}/{max_attempts} | "
+                f"elapsed={elapsed:.2f}s | {reason}"
+            )
+            return {
+                "status": verdict,
+                "confidence": confidence,
+                "reason": reason or "semantic story selection judgment",
+                "source_numbers": source_numbers,
+            }
+
+        except Exception as exc:
+            last_error = exc
+            if attempt < max_attempts:
+                print(
+                    f"[TOPIC FILTER] STORY SOURCE JUDGE | RETRY | "
+                    f"attempt={attempt}/{max_attempts} | {exc}"
+                )
+                continue
+
+            print(
+                f"[TOPIC FILTER] STORY SOURCE JUDGE | UNAVAILABLE | "
+                f"attempts={max_attempts} | {exc}"
+            )
+            return {
+                "status": "UNAVAILABLE",
+                "confidence": 0,
+                "reason": f"semantic selector unavailable after {max_attempts} attempts: {last_error}",
+                "source_numbers": [],
+            }
 
 
 SEMANTIC_RESCUE_MIN_CONFIDENCE = 90
@@ -515,9 +543,10 @@ def _decide_story_sources(news, topic):
         )
         semantic_status = semantic["status"]
 
-        if semantic["status"] == "ERROR":
-            raise Exception(
-                "Story source decision rejected because semantic judgment failed "
+        if semantic["status"] == "UNAVAILABLE":
+            raise StorySourceUnavailable(
+                "Story source decision unavailable because semantic judgment "
+                f"could not complete after bounded retry "
                 f"(reason={semantic.get('reason', '')})"
             )
 
@@ -569,21 +598,40 @@ def _decide_story_sources(news, topic):
 
         elif semantic["status"] == "DOMINANT_STORY":
             numbers = semantic.get("source_numbers", [])
-            minimum_majority = max(3, int(count * 0.50 + 0.999))
-            if len(numbers) < minimum_majority:
-                raise Exception("Story source judge returned an insufficient dominant majority")
+            # A semantic DOMINANT_STORY may be a smaller, strongly corroborated
+            # cluster inside a noisy retrieval pool. Do not require it to be
+            # 50% of the entire pool: unrelated/outlier sources must not be
+            # allowed to make a valid concrete story fail.
+            #
+            # Safety remains provided by:
+            #   - semantic confidence >= SEMANTIC_RESCUE_MIN_CONFIDENCE
+            #   - deterministic corroboration (at least 2 sources)
+            #   - the semantic selection must retain a deterministic corroborating pair
+            #   - at least 2 semantically selected sources
+            if len(numbers) < 2:
+                raise Exception("Story source judge returned too few dominant-story sources")
 
             selected_indices = [n - 1 for n in numbers]
 
             # The semantic rescue must retain at least one deterministic
-            # corroborating pair from the lexical dominant cluster. This
-            # prevents the model from selecting a majority that is semantically
-            # related only through a broad topic/person/tournament.
+            # corroborating pair from the lexical dominant cluster. We do NOT
+            # require the entire lexical cluster to be selected: the lexical
+            # cluster can contain extra/outlier sources that the semantic judge
+            # correctly excludes. This prevents false rejection of a real story
+            # when semantic selection is narrower than lexical clustering.
             lexical_cluster = set(profile.get("cluster") or [])
-            if len(lexical_cluster) < 2 or not lexical_cluster.issubset(set(selected_indices)):
+            selected_set = set(selected_indices)
+            if len(lexical_cluster) < 2:
                 raise Exception(
                     "Story source decision rejected semantic dominant rescue "
-                    "without retained deterministic story core"
+                    "without deterministic story core"
+                )
+
+            retained_core = lexical_cluster & selected_set
+            if len(retained_core) < 2:
+                raise Exception(
+                    "Story source decision rejected semantic dominant rescue "
+                    "without retained deterministic corroborating pair"
                 )
 
             reason = "semantic dominant story"
@@ -1263,11 +1311,16 @@ PASS when:
   decision, announcement, incident, match, transfer, release, or other single
   news story.
 - Every paragraph materially belongs to that same story.
-- Relevant background/context about the same story is allowed.
-- A short article is completely acceptable if it cleanly covers one story.
+- Each paragraph should add meaningful verified information, such as a new fact,
+  consequence, reaction, development, timing detail, or necessary context.
+- Relevant background/context about the same story is allowed when it adds useful
+  information rather than merely restating the main event.
+- A short article is completely acceptable if its paragraphs contain distinct,
+  useful information and it cleanly covers one story.
 - A small amount of closely related context does NOT make it a roundup.
 - A second paragraph can explain consequences, reactions, history or context
-  when those details are directly connected to the same main story.
+  when those details are directly connected to the same main story and add new
+  information.
 
 REMOVE when:
 - It is a roundup or digest of multiple independent news stories.
@@ -1281,29 +1334,46 @@ REMOVE when:
 - It contains a list of separate stories disguised as one article.
 - The article's identity is broad enough that there is no single central event
   or development.
+- Multiple paragraphs substantially repeat the same factual information without
+  adding meaningful new information. This is a quality failure even when every
+  sentence is factually supported and the article concerns only one story.
+- The body repeatedly rephrases the same event, outcome, injury, decision, or
+  consequence instead of progressing through distinct verified facts.
 
 BORDERLINE when:
 - It is genuinely unclear whether the article is one story or multiple stories.
 - The article has a central story but a substantial portion shifts into
   independent developments that cannot reasonably be treated as context.
+- One or more paragraphs may be unnecessarily repetitive, but the repetition is
+  limited enough that a confident REMOVE decision is not justified.
 - The editorial decision itself is low-confidence.
 
 IMPORTANT:
 - DO NOT reject an article merely because it is short.
 - DO NOT reject an article merely because it has multiple paragraphs.
-- DO NOT reject relevant consequences, reactions, background or context.
-- DO NOT use article length, source count or number of facts as the decision.
-- Judge STORY IDENTITY and COHERENCE.
-- Do not infer missing facts.
-- Do not reward an article simply because every sentence is individually factual.
+- DO NOT reject relevant consequences, reactions, background or context when they
+  add meaningful new information.
+- DO NOT use article length, source count or raw number of facts as the decision.
+- Judge both STORY IDENTITY/COHERENCE and INFORMATION DENSITY.
+- For information density, compare paragraphs against each other and against the
+  locked facts: ask whether each paragraph contributes something materially new.
+- A sentence can be individually factual yet still be editorially redundant if it
+  only restates a fact already communicated without adding useful information.
+- Do not infer missing facts or demand details that are absent from the evidence.
+- Do not demand that every available fact be used. A concise article may omit facts
+  when they are unnecessary, but the facts it does use should not be needlessly
+  repeated.
 - A factual roundup is still REMOVE.
-- A concise single-story article is PASS.
+- A concise single-story article with distinct useful information is PASS.
 
 DECISION PRIORITY:
 1. Is there one unmistakable central story?
 2. Do the paragraphs remain about that story?
-3. Are additional details genuinely related context rather than independent news?
-4. Only then consider whether there is a clear reason for REMOVE/BORDERLINE.
+3. Does each paragraph materially advance the article with new verified information
+   or necessary context?
+4. Is any repetition substantial enough to make the article feel padded or
+   materially less informative?
+5. Only then consider whether there is a clear reason for REMOVE/BORDERLINE.
 
 Return ONLY valid JSON:
 {{
@@ -1811,7 +1881,19 @@ def main():
             try:
                 story_selection = _decide_story_sources(news, keyword)
                 trend["_story_selection"] = story_selection
+            except StorySourceUnavailable as concentration_unavailable:
+                # Infrastructure availability is NOT a content-quality rejection.
+                # The candidate is skipped safely, but the operational state remains
+                # explicitly UNAVAILABLE so monitoring can distinguish it from MIXED.
+                trend["_production_status"] = "UNAVAILABLE"
+                trend["_production_unavailable_reason"] = str(concentration_unavailable)
+                print(
+                    f"[TOPIC FILTER] UNAVAILABLE BEFORE EVIDENCE | article_slot=0 | "
+                    f"{keyword} | {concentration_unavailable}"
+                )
+                continue
             except Exception as concentration_error:
+                # Genuine Story Source decisions such as MIXED remain content rejects.
                 trend["_production_status"] = "REJECT"
                 trend["_production_reject_reason"] = str(concentration_error)
                 print(

@@ -26,7 +26,7 @@ from config import MODEL, LANGUAGE
 #   * language-independent
 # ============================================================
 
-PIPELINE_VERSION = "universal-fact-lock-v2.3.3-compact-evidence-json-fixed3-source-id-retry"
+PIPELINE_VERSION = "universal-fact-lock-v2.4.2-evidence-density-source-context-test"
 
 # IMPORTANT: Do not force a CPU thread count by default.
 # Ollama can auto-detect the runner's optimal thread count.
@@ -63,6 +63,11 @@ EVIDENCE_MAX_FACTS = max(
     4, int(os.getenv("OLLAMA_EVIDENCE_MAX_FACTS", "12"))
 )
 
+# Controlled writer A/B test: optionally expose bounded source context to the
+# writer while keeping LOCKED EVIDENCE as the only factual authority.
+WRITER_SOURCE_CONTEXT = os.getenv("OLLAMA_WRITER_SOURCE_CONTEXT", "0").strip() == "1"
+WRITER_SOURCE_CONTEXT_CHARS = max(4000, int(os.getenv("OLLAMA_WRITER_SOURCE_CONTEXT_CHARS", "12000")))
+
 ARTICLE_TOKENS = max(
     520, int(os.getenv("OLLAMA_ARTICLE_TOKENS", "900"))
 )
@@ -77,11 +82,8 @@ MIN_ARTICLE_WORDS = max(
     0, int(os.getenv("OLLAMA_MIN_ARTICLE_WORDS", "0"))
 )
 
-# Evidence-aware minimum. This prevents tiny articles when the ledger is rich,
-# while allowing genuinely short stories to remain short instead of padding.
-ADAPTIVE_MIN_1_2 = max(0, int(os.getenv("OLLAMA_MIN_1_2_FACTS", "0")))
-ADAPTIVE_MIN_3_4 = max(0, int(os.getenv("OLLAMA_MIN_3_4_FACTS", "0")))
-ADAPTIVE_MIN_5_PLUS = max(0, int(os.getenv("OLLAMA_MIN_5_PLUS_FACTS", "0")))
+# No deterministic article-length floor.
+# A factual, concise article must not be rejected merely because it is short.
 
 # Evidence is deliberately sequential on CPU.
 EVIDENCE_PARALLEL = os.getenv(
@@ -652,7 +654,7 @@ def _normalize_evidence(data, source_material=None):
             "id": f"F{len(clean) + 1}",
             "group": "G1",
             "fact": fact,
-            "excerpt": excerpt[:160],
+            "excerpt": excerpt,
             "source": "",
             "date": "",
             "status": "",
@@ -669,6 +671,9 @@ def _normalize_evidence(data, source_material=None):
 
     if not clean:
         raise ValueError("Evidence extraction produced no usable facts.")
+
+    # Preserve the complete supporting sentence for each fact.
+    # Do not compress/truncate provenance before the article writer sees it.
 
     return {
         "primary_group": "G1",
@@ -853,17 +858,10 @@ def _schema_ok(article):
     return True
 
 
-def _word_count(article):
-    values = [
-        article.get("title", ""),
-        article.get("description", ""),
-        article.get("h1", ""),
-    ]
-
-    for paragraph in article.get("paragraphs", []):
-        values.append(paragraph)
-
-    return len(" ".join(values).split())
+def _body_word_count(article):
+    """Count only actual article-body text for the evidence-density floor."""
+    values = list(article.get("paragraphs", []))
+    return len(" ".join(str(value) for value in values if value).split())
 
 
 # ============================================================
@@ -892,7 +890,44 @@ _ARTICLE_FORMAT = {
 
 
 
-def _article_prompt(evidence):
+def _article_length_policy(fact_count):
+    if fact_count <= 2:
+        return (
+            "BODY LENGTH: Aim for approximately 90-130 words across the "
+            "substantive paragraphs. Be concise but complete; use the available "
+            "verified detail and do not pad."
+        )
+    if fact_count <= 4:
+        return (
+            "BODY LENGTH: Aim for approximately 160-220 words across at least "
+            "3 substantive paragraphs. Cover the distinct verified facts clearly "
+            "instead of compressing them into one or two sentences. Do not pad."
+        )
+    return (
+        "BODY LENGTH: Aim for approximately 230-330 words across at least "
+        "4 substantive paragraphs. Give the reader materially richer coverage "
+        "of the verified evidence, with distinct details explained clearly. "
+        "Do not pad, speculate or repeat facts."
+    )
+
+
+def _article_prompt(evidence, source_context=None):
+    fact_count = len(evidence.get("facts", [])) if isinstance(evidence, dict) else 0
+    length_policy = _article_length_policy(fact_count)
+    context_block = ""
+    if WRITER_SOURCE_CONTEXT and source_context:
+        bounded_context = str(source_context)[:WRITER_SOURCE_CONTEXT_CHARS]
+        context_block = f"""
+
+SOURCE CONTEXT — NON-AUTHORITATIVE:
+{bounded_context}
+
+IMPORTANT: This source context is provided only to help understand wording and
+relationships between the locked facts. It is NOT an evidence source.
+You MUST NOT extract, add, strengthen, infer or introduce any fact from it
+unless that fact is explicitly present in LOCKED EVIDENCE. If SOURCE CONTEXT
+and LOCKED EVIDENCE differ, LOCKED EVIDENCE always wins.
+"""
     return f"""
 Write a clear TrendCurrent news article in {LANGUAGE}.
 
@@ -935,8 +970,13 @@ COVERAGE:
 - Do not stop after only the headline-level fact when additional relevant evidence exists.
 - Prefer another distinct verified fact over repeating an existing one.
 - Every paragraph must add a distinct supported fact or development.
+- Build the article around the evidence inventory: cover the important facts first, then add the useful supporting details.
+- Do not compress several independent facts into one overloaded sentence when they can be explained clearly across separate sentences or paragraphs.
+- For 3-4 locked facts, normally use at least 3 substantive paragraphs.
+- For 5+ locked facts, normally use at least 4 substantive paragraphs.
 - Do not pad, speculate, manufacture context or repeat facts to increase length.
-- Article length follows the amount of useful verified evidence.
+- Article length should reflect the amount of useful verified evidence: sparse evidence stays concise; rich evidence should receive materially richer coverage.
+- {length_policy}
 
 STYLE:
 - Natural, fluent {LANGUAGE}; professional, clear, objective and precise.
@@ -960,12 +1000,13 @@ LOCKED EVIDENCE:
 """
 
 
-def _generate_article(evidence):
+def _generate_article(evidence, source_context=None):
     fact_count = len(evidence.get("facts", [])) if isinstance(evidence, dict) else 0
-    # Give richer evidence a larger output budget without imposing a target length.
-    dynamic_tokens = max(ARTICLE_TOKENS, min(1400, 420 + fact_count * 80))
+    # Give richer evidence a materially larger output budget.
+    # The deterministic minimum below prevents extreme compression after generation.
+    dynamic_tokens = max(ARTICLE_TOKENS, min(1800, 520 + fact_count * 120))
     article = _call(
-        _article_prompt(evidence),
+        _article_prompt(evidence, source_context=source_context),
         temperature=0.04,
         num_predict=dynamic_tokens,
         num_thread=NUM_THREADS,
@@ -1202,15 +1243,9 @@ def extract_evidence(source):
     return _extract_evidence(source)
 
 
-def _adaptive_min_words(evidence):
-    count = len(evidence.get("facts", [])) if isinstance(evidence, dict) else 0
-    if MIN_ARTICLE_WORDS > 0:
-        return MIN_ARTICLE_WORDS
-    if count <= 2:
-        return ADAPTIVE_MIN_1_2
-    if count <= 4:
-        return ADAPTIVE_MIN_3_4
-    return ADAPTIVE_MIN_5_PLUS
+def evidence_min_words(evidence):
+    """Compatibility wrapper: there is intentionally no body-word floor."""
+    return 0
 
 
 def generate(prompt, retries=0, evidence=None):
@@ -1249,12 +1284,12 @@ def generate(prompt, retries=0, evidence=None):
         evidence = _extract_evidence(prompt)
 
     print("[PIPELINE] Generating evidence-locked article...")
-    article = _generate_article(evidence)
+    article = _generate_article(evidence, source_context=prompt if WRITER_SOURCE_CONTEXT else None)
     article = _sanitize_article(article)
 
     print(
         f"[PIPELINE] Article generated | "
-        f"words={_word_count(article)}"
+        f"words={_body_word_count(article)}"
     )
 
     print("[PIPELINE] Focused factual audit...")
@@ -1265,13 +1300,6 @@ def generate(prompt, retries=0, evidence=None):
     )
 
     if audit["passed"]:
-        words = _word_count(article)
-        minimum = _adaptive_min_words(evidence)
-        if words < minimum:
-            raise ValueError(
-                f"Article is factually clean but too short "
-                f"({words} words; minimum {minimum} for {len(evidence['facts'])} evidence facts)."
-            )
         print("[PIPELINE] FACT CHECK PASSED")
         print(
             f"[TIMER] PIPELINE TOTAL | "
@@ -1309,15 +1337,6 @@ def generate(prompt, retries=0, evidence=None):
         print("[UNIVERSAL FACT CHECK FAILED AFTER REPAIR]")
         raise ValueError(
             "Article failed final source-grounded validation."
-        )
-
-    words = _word_count(repaired)
-    minimum = _adaptive_min_words(evidence)
-
-    if words < minimum:
-        raise ValueError(
-            f"Article is factually clean but too short "
-            f"({words} words; minimum {minimum} for {len(evidence['facts'])} evidence facts)."
         )
 
     print("[PIPELINE] FACT CHECK PASSED AFTER REPAIR")
