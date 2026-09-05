@@ -157,6 +157,12 @@
     <priority>0.6</priority>
   </url>
   <url>
+    <loc>https://fr.trendcurrent.today/trends/jakob-ingebrigtsen</loc>
+    <lastmod>2026-09-05</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
     <loc>https://fr.trendcurrent.today/trends/drone</loc>
     <lastmod>2026-09-05</lastmod>
     <changefreq>monthly</changefreq>
