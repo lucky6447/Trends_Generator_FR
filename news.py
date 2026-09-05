@@ -15,7 +15,7 @@ except Exception:
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-MAX_NEWS_AGE_HOURS = 6.0
+MAX_NEWS_AGE_HOURS = 24.0
 
 def _age_hours(published):
     if not published:
@@ -108,7 +108,6 @@ class _SourceImageParser(HTMLParser):
 
         for pattern in (
             r'"image"\s*:\s*"([^"]+)"',
-            r'"contentUrl"\s*:\s*"([^"]+)"',
         ):
             self.candidates.extend(
                 re.findall(pattern, data, flags=re.IGNORECASE)
@@ -175,7 +174,7 @@ def _fetch_publisher_html(url):
 
 
 def _is_usable_source_image(url):
-    value = str(url or "").strip()
+    value = str(url or "").strip().replace("\\/\\/", "//").replace("\\/", "/").strip()
     if not value:
         return False
 
@@ -203,7 +202,12 @@ def _is_usable_source_image(url):
     if any(token in low for token in blocked):
         return False
 
-    if low.endswith(".svg"):
+    path = low.split("?", 1)[0].split("#", 1)[0]
+    if path.endswith((".svg", ".mp4", ".m4v", ".webm", ".mov", ".m3u8", ".mpd",
+                      ".avi", ".mkv", ".flv", ".wmv", ".mp3", ".m4a", ".wav", ".ogg")):
+        return False
+
+    if not (low.startswith("http://") or low.startswith("https://")):
         return False
 
     return True
@@ -296,35 +300,67 @@ def filter_similar_articles(articles, max_results=12):
     return result
 
 
-def _fetch_google_or_bing(url_google, bing_query):
+def _parse_news_rss(url):
+    """Fetch an RSS URL explicitly so empty/error responses are observable."""
     try:
-        response = requests.get(url_google, headers=HEADERS, timeout=20)
+        response = requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
         feed = feedparser.parse(response.content)
-        print(f"[NEWS RSS] Google -> HTTP {response.status_code} | bytes={len(response.content)} | entries={len(feed.entries)}")
-        if feed.entries:
-            return feed.entries, "Google"
+        return response, feed
     except Exception as exc:
-        print(f"[NEWS RSS] Google error -> {exc}")
-    bing_url = (
-        "https://www.bing.com/news/search?"
-        f"q={quote_plus(bing_query)}&format=rss&setlang=fr-FR&cc=FR"
-    )
-    try:
-        response = requests.get(bing_url, headers=HEADERS, timeout=20)
-        feed = feedparser.parse(response.content)
-        print(f"[NEWS RSS] Google empty -> Bing fallback | HTTP {response.status_code} | bytes={len(response.content)} | entries={len(feed.entries)}")
-        return feed.entries, "Bing"
-    except Exception as exc:
-        print(f"[NEWS RSS] Bing error -> {exc}")
-        return [], "Bing"
+        print(f"[NEWS RSS] request failed: {exc}")
+        return None, feedparser.FeedParserDict(entries=[])
+
+
+def _fetch_topic_feed(query):
+    """Google News topic search first; Bing News RSS is a fallback only."""
+    google_url = ("https://news.google.com/rss/search?"
+                  f"q={quote_plus(query + ' when:24h')}&hl=fr-FR&gl=FR&ceid=FR:fr")
+    response, feed = _parse_news_rss(google_url)
+    entries = list(getattr(feed, "entries", []) or [])
+    if response is not None:
+        print(f"[NEWS RSS] Google -> HTTP {response.status_code} | bytes={len(response.content)} | entries={len(entries)}")
+    if entries:
+        return feed
+
+    bing_url = ("https://www.bing.com/news/search?"
+                f"q={quote_plus(query)}&format=rss&setlang=fr-FR&cc=FR")
+    response, feed = _parse_news_rss(bing_url)
+    entries = list(getattr(feed, "entries", []) or [])
+    print(f"[NEWS RSS] Google empty -> Bing fallback | HTTP {response.status_code if response is not None else 'ERR'} | bytes={len(response.content) if response is not None else 0} | entries={len(entries)}")
+    return feed
+
+
+def _entry_source(item):
+    source = ""
+    source_href = ""
+    if hasattr(item, "source"):
+        source = clean(item.source.get("title"))
+        source_href = clean(item.source.get("href"))
+    if not source:
+        source = clean(item.get("source"))
+    return source, source_href
+
+
+def _prepare_entry(item):
+    title = clean(item.get("title"))
+    link = clean(item.get("link"))
+    published = _published_value(item)
+    if not _is_fresh_news(published):
+        return None
+    source, source_href = _entry_source(item)
+    summary = clean(item.get("summary") or item.get("description"))
+    return {
+        "title": title,
+        "summary": summary,
+        "source": source,
+        "source_href": source_href,
+        "link": link,
+        "published": published,
+    }
 
 
 def fetch_news_multi(queries, per_query_limit=8, max_results=18):
-    """Fetch and merge several tightly scoped Google News searches.
-
-    RSS entries are deduplicated before article extraction so query expansion
-    increases source coverage without multiplying page downloads for duplicates.
-    """
+    """Fetch and merge several tightly scoped Google News searches."""
     clean_queries = []
     seen_queries = set()
     for query in queries or []:
@@ -334,51 +370,26 @@ def fetch_news_multi(queries, per_query_limit=8, max_results=18):
             continue
         seen_queries.add(key)
         clean_queries.append(q)
-
     if not clean_queries:
         return []
 
     candidates = []
     seen_links = set()
     seen_titles = set()
-
     for query in clean_queries:
-        url = (
-            "https://news.google.com/rss/search?"
-            f"q={quote_plus(query + ' when:6h')}"
-            "&hl=fr-FR&gl=FR&ceid=FR:fr"
-        )
-        entries, _ = _fetch_google_or_bing(url, query)
-        for item in entries[:max(1, int(per_query_limit))]:
-            title = clean(item.get("title"))
-            link = clean(item.get("link"))
-            published = _published_value(item)
-            if not _is_fresh_news(published):
+        feed = _fetch_topic_feed(query)
+        for item in feed.entries[:max(1, int(per_query_limit))]:
+            article = _prepare_entry(item)
+            if not article:
                 continue
-            title_key = re.sub(r"[^a-z0-9]+", " ", title.lower()).strip()
-            link_key = link.casefold()
+            title_key = re.sub(r"[^a-z0-9]+", " ", article["title"].lower()).strip()
+            link_key = article["link"].casefold()
             if not title_key or title_key in seen_titles or (link_key and link_key in seen_links):
                 continue
             seen_titles.add(title_key)
             if link_key:
                 seen_links.add(link_key)
-
-            source = ""
-            if hasattr(item, "source"):
-                source = clean(item.source.get("title"))
-            source_href = ""
-            if hasattr(item, "source"):
-                source_href = clean(item.source.get("href"))
-
-            candidates.append({
-                "title": title,
-                "summary": clean(item.get("summary")),
-                "source": source,
-                "source_href": source_href,
-                "link": link,
-                "published": published,
-            })
-
+            candidates.append(article)
             if len(candidates) >= max(1, int(max_results)):
                 break
         if len(candidates) >= max(1, int(max_results)):
@@ -386,52 +397,24 @@ def fetch_news_multi(queries, per_query_limit=8, max_results=18):
 
     if not candidates:
         return []
-
     with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as executor:
         contents = list(executor.map(lambda a: extract_article(a["link"]), candidates))
-
     for article, content in zip(candidates, contents):
         article["content"] = content or article.get("summary", "")
-
     return filter_similar_articles(candidates, max_results=max_results)
 
 
 def fetch_news(query, limit=20):
-    url = (
-        "https://news.google.com/rss/search?"
-        f"q={quote_plus(query + ' when:6h')}"
-        "&hl=fr-FR&gl=FR&ceid=FR:fr"
-    )
-    entries, _ = _fetch_google_or_bing(url, query)
-    items = entries[:limit]
-
+    feed = _fetch_topic_feed(query)
     prepared = []
-    for item in items:
-        published = _published_value(item)
-        if not _is_fresh_news(published):
-            continue
-        source = ""
-        if hasattr(item, "source"):
-            source = clean(item.source.get("title"))
-        source_href = ""
-        if hasattr(item, "source"):
-            source_href = clean(item.source.get("href"))
-
-        prepared.append({
-            "title": clean(item.get("title")),
-            "summary": clean(item.get("summary")),
-            "source": source,
-            "source_href": source_href,
-            "link": clean(item.get("link")),
-            "published": published,
-        })
-
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(prepared)))) as executor:
+    for item in feed.entries[:limit]:
+        article = _prepare_entry(item)
+        if article:
+            prepared.append(article)
+    if not prepared:
+        return []
+    with ThreadPoolExecutor(max_workers=min(8, len(prepared))) as executor:
         contents = list(executor.map(lambda a: extract_article(a["link"]), prepared))
-
-    articles = []
     for article, content in zip(prepared, contents):
         article["content"] = content or article.get("summary", "")
-        articles.append(article)
-
-    return filter_similar_articles(articles)
+    return filter_similar_articles(prepared)

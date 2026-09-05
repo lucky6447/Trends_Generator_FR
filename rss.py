@@ -4,8 +4,8 @@ from email.utils import parsedate_to_datetime
 
 from config import RSS_URL
 
-# Production hard freshness gate: only trends <= 6 hours old are eligible.
-MAX_TREND_AGE_HOURS = 12.0
+# Production hard freshness gate: only trends <= 24 hours old are eligible.
+MAX_TREND_AGE_HOURS = 24.0
 
 
 SKIP_KEYWORDS = {

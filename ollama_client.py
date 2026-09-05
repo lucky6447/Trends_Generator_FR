@@ -1668,39 +1668,76 @@ _REPAIR_FORMAT = _ARTICLE_FORMAT
 
 
 def _repair(article, evidence, audit):
+    """
+    Conservative delete-first repair.
+
+    This repair is intentionally local:
+      - preserve already-supported article material;
+      - target only omitted locked facts and reported factual errors;
+      - never invent or use outside knowledge;
+      - do not rewrite the article merely to make it richer;
+      - return one complete article JSON object for the existing final audit.
+
+    v1.6.3: preserve-repair + explicit missing-fact targeting.
+    """
     fact_count = len(evidence.get("facts", [])) if isinstance(evidence, dict) else 0
-    # Repair must have enough headroom to rebuild a rich evidence-backed article.
-    # This is a generation ceiling only; it is NOT a minimum word target.
     dynamic_tokens = max(
         REPAIR_TOKENS,
-        min(2600, 800 + fact_count * 220),
+        min(2200, 760 + fact_count * 160),
     )
 
     return _call(
         f"""
-REPAIR THE ARTICLE FOR COMPLETE EVIDENCE COVERAGE.
+REPAIR THE ARTICLE CONSERVATIVELY FOR SOURCE-GROUNDED VALIDATION.
 
-Use ONLY the LOCKED EVIDENCE. The AUDIT identifies factual problems and/or locked facts
-that the article failed to cover.
+This is ONE targeted repair pass. Preserve the existing article wherever it is
+already supported by LOCKED EVIDENCE. Do NOT rewrite the article from scratch.
 
-Rules:
-- Produce a complete, publication-ready article, not a tiny patch.
-- Preserve supported material that remains useful.
-- Integrate EVERY non-duplicate locked fact identified by the audit as omitted.
-- Each added fact must be explicit and faithful to the LOCKED EVIDENCE.
-- Organize the facts into a coherent progression around ONE concrete story.
-- Give distinct facts enough sentence-level treatment to remain informative.
-- HARD STRUCTURE: for 3-6 locked facts, return at least the same number of substantive paragraphs as locked facts.
-- Do not compress multiple omitted facts into one summary paragraph.
-- For 3-4 locked facts, use at least 3-4 substantive paragraphs.
-- For 5-6 locked facts, normally use 4-6 substantive paragraphs when supported.
-- For 7+ locked facts, use enough substantive paragraphs to expose the useful evidence.
-- Do not add generic background, filler, speculation or outside knowledge.
-- Delete unsupported material rather than inventing a replacement.
-- Correct dates, numbers, roles, status or certainty only from LOCKED EVIDENCE.
-- Do not create quotes or attribution.
-- Keep the article in {LANGUAGE}.
-- Return only the article JSON.
+PRIMARY OBJECTIVE:
+- Fix the specific factual/coverage problems identified by the AUDIT.
+- If the audit reports omitted locked facts, explicitly add ONLY those omitted facts.
+- Keep all already-covered, supported facts and useful wording unless a change is
+  required to fix an audit error.
+- Do not add generic background, filler, speculation, interpretation, or outside facts.
+- Do not increase length merely because more words are possible.
+
+MISSING-FACT RULE:
+- Treat every HIGH "Locked fact F..." omission reported by the AUDIT as a required
+  repair target.
+- Each omitted fact must receive explicit sentence-level treatment in the repaired
+  article.
+- Do not assume that a related sentence already covers an omitted fact.
+- Do not replace several distinct omitted facts with one vague summary.
+- If an omitted fact can be added to an existing paragraph without changing its
+  meaning, make the smallest useful addition.
+- If necessary, add one local paragraph containing the omitted fact(s), while
+  preserving the surrounding article.
+- Never remove an already-covered fact merely to make room for an omitted fact.
+
+DELETE-FIRST RULE:
+- For unsupported, contradictory, or otherwise invalid material identified by the
+  AUDIT, delete or minimally correct only the affected wording.
+- Do not rewrite unaffected paragraphs.
+- Do not introduce a replacement claim unless it is explicitly supported by LOCKED
+  EVIDENCE.
+- Preserve entity, attribution, date, status, number and certainty exactly.
+
+STRUCTURE:
+- The final article must satisfy the existing evidence-driven paragraph structure.
+- For 3-6 locked facts, use at least the same number of substantive paragraphs as
+  locked facts.
+- Paragraph count is a structural requirement, not a word-count target.
+- Do not pad paragraphs or repeat facts to satisfy structure.
+
+FINAL SELF-CHECK:
+Before returning JSON, silently verify:
+1. Every locked fact ID is either already explicitly covered or is explicitly added
+   when the AUDIT identified it as missing.
+2. No supported fact was accidentally removed during repair.
+3. No new unsupported fact was introduced.
+4. Dates, numbers, roles, entities, status and certainty remain faithful to LOCKED EVIDENCE.
+5. The result is one coherent article about the same concrete story.
+6. Return ONLY the required article JSON object.
 
 AUDIT:
 {_compact(audit)}
@@ -1859,7 +1896,7 @@ def generate(prompt, retries=0, evidence=None):
         )
         return article
 
-    print("[PIPELINE] Delete-first factual repair...")
+    print("[PIPELINE] Delete-first factual repair v1.6.3-preserve-repair...")
     repair_started = time.perf_counter()
 
     repaired = _repair(

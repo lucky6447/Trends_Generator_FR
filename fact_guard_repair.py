@@ -7,7 +7,7 @@ from ollama import chat
 from config import MODEL
 
 
-FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.6.2-platform-repair-re-import"
+FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.6.3-preserve-repair"
 
 NUM_THREADS = max(1, int(os.getenv("FACT_GUARD_NUM_THREADS", "16")))
 NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
@@ -235,6 +235,13 @@ def repair(
       the current date, reference date, publication date, trend date, feed
       date, or any inferred date.
     - Preserve every other supported claim and preserve uncertainty/status.
+    - Do NOT rewrite, condense, reorder, paraphrase, or regenerate unaffected
+      paragraphs merely to improve style, flow, completeness, or length.
+    - For every paragraph/sentence not directly affected by a reported issue,
+      preserve its factual content and wording as closely as possible.
+    - Make the smallest possible edit needed to resolve each reported issue.
+    - A repair is not an opportunity to improve style, completeness, flow,
+      length, or evidence coverage.
     - The caller MUST run Fact Guard again after this function returns.
     """
     if not isinstance(article, dict):
@@ -304,6 +311,8 @@ def repair(
                 "- DELETE-ONLY: remove the unsupported, exaggerated, misattributed, "
                 "or contradicted claim, using the smallest sentence/phrase that "
                 "can be removed safely.\n"
+                "- Do not rewrite surrounding sentences or paragraphs when the "
+                "offending claim can be removed locally.\n"
                 "- Do not soften it into another unsupported assertion.\n"
                 "- Do not replace it with outside knowledge, an inferred fact, a "
                 "different quote, a guessed number, or a broader/narrower claim.\n"
@@ -369,7 +378,10 @@ SOURCE MATERIAL is the ONLY factual authority.
 
 GLOBAL SAFETY RULES:
 - Fix ONLY the listed issue.
-- Preserve all other supported article content.
+- Preserve all other supported article content exactly where possible.
+- Do NOT rewrite unaffected paragraphs or sentences.
+- Do NOT reorder paragraphs or consolidate/split paragraphs unless strictly
+  required to resolve the listed issue.
 - Do NOT regenerate the article from scratch.
 - Do NOT add any new fact, context, motive, date, number, quote, event,
   entity, role, or status.

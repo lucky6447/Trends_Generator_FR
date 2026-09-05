@@ -28,7 +28,7 @@ import unicodedata
 from html_generator import render_article, save_article
 from processed import load_processed, add_processed
 from index_generator import update_all
-from topic_scorer import rank_trends, score_with_news, select_final_candidates, filter_relevant_news, _is_sports_match_topic
+from topic_scorer import filter_relevant_news, _is_sports_match_topic, _skip_reason, _norm, _clean
 import generator_monitor as monitor
 
 REQUIRED_FIELDS = ["title", "description", "h1", "paragraphs"]
@@ -751,286 +751,139 @@ def _deduplicate_syndicated_sources(news):
     }
 
 
-def _decide_story_sources(news, topic):
-    """Single authority for choosing the exact sources used by evidence extraction."""
+def _discover_concrete_story_candidates(news, topic):
+    """Identify concrete stories inside a topic without topic-level rejection.
+
+    Lexical clustering is used as the deterministic baseline. When the pool is
+    ambiguous, the existing semantic story judge is used to isolate a concrete
+    story cluster. MIXED never means "reject topic": the remaining sources are
+    still split/evaluated as independent candidates.
+    """
     original_items = list(news or [])
+    if not original_items:
+        return []
+
     independence = _deduplicate_syndicated_sources(original_items)
-    items = list(independence["items"])
-    profile = _story_pool_profile(items, topic)
-    count = profile["count"]
-
-    print(
-        f"[TOPIC FILTER] SOURCE INDEPENDENCE | "
-        f"input={len(original_items)} | independent={count} | "
-        f"duplicates_removed={len(independence.get('duplicate_indices', []))}"
-    )
-
-    print(
-        f"[TOPIC FILTER] STORY SOURCE DECISION | lexical={profile['status']} "
-        f"| sources={count} | dominant={profile['dominant']}/{count} "
-        f"| ratio={profile['ratio']:.2f} | cohesion={profile['cohesion']:.2f}"
-    )
-    if profile.get("components"):
-        sizes = ", ".join(str(len(c)) for c in profile["components"][:5])
-        print(f"[TOPIC FILTER] Story pool components | sizes={sizes}")
-
-    # A pool with fewer than three sources has no meaningful concentration
-    # signal; use all available sources. Three or more sources must obey the
-    # same deterministic/semantic decision policy as every larger pool.
-    if count < 3:
-        selected_indices = list(range(count))
-        reason = "small source pool"
-        status = "PASS"
-        semantic_status = "SKIPPED"
-    else:
-        # IMPORTANT: a lexical REJECT is not a final story decision.
-        # The lexical clusterer is intentionally conservative and can split
-        # legitimate corroborating headlines when publishers use different
-        # wording. Every 3+ source REJECT therefore gets one semantic
-        # arbitration pass. The semantic judge may still reject the pool.
-        #
-        # This is the critical recovery path for cases such as 1/8 lexical
-        # concentration where the sources can still describe one real event.
-        semantic_needed = (
-            profile["status"] == "REJECT"
-        ) or (
-            profile["status"] == "PASS"
-            and (
-                profile.get("ratio", 0.0) < 0.75
-                or profile.get("cohesion", 0.0) < 0.28
-            )
-        )
-
-        semantic = (
-            _semantic_story_concentration_judge(items, topic)
-            if semantic_needed
-            else {"status": "SKIPPED", "confidence": 100, "reason": "strong deterministic concentration", "source_numbers": []}
-        )
-        semantic_status = semantic["status"]
-
-        if semantic["status"] == "UNAVAILABLE":
-            raise StorySourceUnavailable(
-                "Story source decision unavailable because semantic judgment "
-                f"could not complete after bounded retry "
-                f"(reason={semantic.get('reason', '')})"
-            )
-
-        if semantic["status"] == "MIXED":
-            raise Exception(
-                "Story source decision rejected mixed source pool "
-                f"(confidence={semantic.get('confidence', 0)}; reason={semantic.get('reason', '')})"
-            )
-
-        # IMPORTANT: semantic rescue may recover a lexical false negative, but
-        # it must not be allowed to create a story from a pool with ZERO
-        # deterministic corroboration. A single lexical source is only a topic
-        # match, not evidence that multiple sources describe the same concrete
-        # event. This blocks cases such as:
-        #   lexical 1/4 + semantic DOMINANT_STORY
-        # where the model can incorrectly group separate developments around
-        # the same person, team, tournament, or broad topic.
-        #
-        # We still preserve the useful rescue path when at least two sources
-        # already form a deterministic story cluster. In that case semantic
-        # arbitration can expand/confirm the concrete story despite wording
-        # differences.
-        semantic_rescue_has_foothold = profile.get("dominant", 0) >= 2
-
-        if semantic["status"] in {"ONE_STORY", "DOMINANT_STORY"}:
-            if semantic.get("confidence", 0) < SEMANTIC_RESCUE_MIN_CONFIDENCE:
-                raise Exception(
-                    "Story source decision rejected low-confidence semantic rescue "
-                    f"(confidence={semantic.get('confidence', 0)} < "
-                    f"{SEMANTIC_RESCUE_MIN_CONFIDENCE}; "
-                    f"semantic={semantic['status']})"
-                )
-            if not semantic_rescue_has_foothold:
-                raise Exception(
-                    "Story source decision rejected semantic rescue without "
-                    "deterministic corroboration "
-                    f"(lexical dominant={profile.get('dominant', 0)}/{count}; "
-                    f"semantic={semantic['status']}; confidence={semantic.get('confidence', 0)})"
-                )
-
-        if semantic["status"] == "ONE_STORY":
-            selected_indices = list(range(count))
-            reason = "semantic one story"
-            status = "PASS"
-            print(
-                f"[TOPIC FILTER] STORY SOURCE DECISION CONFIRM | "
-                f"kept={len(selected_indices)}/{count} | one story"
-            )
-
-        elif semantic["status"] == "DOMINANT_STORY":
-            numbers = semantic.get("source_numbers", [])
-            # A semantic DOMINANT_STORY may be a smaller, strongly corroborated
-            # cluster inside a noisy retrieval pool. Do not require it to be
-            # 50% of the entire pool: unrelated/outlier sources must not be
-            # allowed to make a valid concrete story fail.
-            #
-            # Safety remains provided by:
-            #   - semantic confidence >= SEMANTIC_RESCUE_MIN_CONFIDENCE
-            #   - deterministic corroboration (at least 2 sources)
-            #   - the semantic selection must retain a deterministic corroborating pair
-            #   - at least 2 semantically selected sources
-            if len(numbers) < 2:
-                raise Exception("Story source judge returned too few dominant-story sources")
-
-            selected_indices = [n - 1 for n in numbers]
-
-            # The semantic rescue must retain at least one deterministic
-            # corroborating pair from the lexical dominant cluster. We do NOT
-            # require the entire lexical cluster to be selected: the lexical
-            # cluster can contain extra/outlier sources that the semantic judge
-            # correctly excludes. This prevents false rejection of a real story
-            # when semantic selection is narrower than lexical clustering.
-            lexical_cluster = set(profile.get("cluster") or [])
-            selected_set = set(selected_indices)
-            if len(lexical_cluster) < 2:
-                raise Exception(
-                    "Story source decision rejected semantic dominant rescue "
-                    "without deterministic story core"
-                )
-
-            retained_core = lexical_cluster & selected_set
-            if len(retained_core) < 2:
-                raise Exception(
-                    "Story source decision rejected semantic dominant rescue "
-                    "without retained deterministic corroborating pair"
-                )
-
-            reason = "semantic dominant story"
-            status = "PASS"
-            print(
-                f"[TOPIC FILTER] STORY SOURCE DECISION PRUNE | "
-                f"kept={len(selected_indices)}/{count} | outliers={count-len(selected_indices)}"
-            )
-        else:
-            # This branch is reachable only for a deterministic PASS with
-            # semantic verification skipped. No semantic decision is overwritten.
-            selected_indices = list(profile.get("cluster") or [])
-            if not selected_indices:
-                raise Exception("Story source decision produced no usable source cluster")
-            reason = profile["reason"]
-            status = "PASS"
-
-    selected_indices = sorted(dict.fromkeys(i for i in selected_indices if 0 <= i < count))
-    if not selected_indices:
-        raise Exception("Story source decision produced an empty evidence source set")
-
-    # The internal story/independence calculations use the filtered independent
-    # pool, but callers still hold the original `news` list. Map indices back to
-    # that original list before returning, so evidence extraction receives the
-    # exact intended publisher records and no duplicate can silently re-enter.
-    selected_original_indices = [
-        independence["kept_indices"][i]
-        for i in selected_indices
-        if 0 <= i < len(independence.get("kept_indices", []))
-    ]
-    selected_original_indices = sorted(dict.fromkeys(selected_original_indices))
-    if not selected_original_indices:
-        raise Exception("Story source decision produced no original source indices")
-
-    print(
-        f"[TOPIC FILTER] STORY SOURCE DECISION PASS | "
-        f"kept={len(selected_indices)}/{count} independent | "
-        f"original_kept={len(selected_original_indices)}/{len(original_items)} | "
-        f"reason={reason} | semantic={semantic_status}"
-    )
-    monitor.candidate_event(
-        "story_source_selection",
-        status=status,
-        reason=reason,
-        source_count=len(original_items),
-        selected_indices=selected_original_indices,
-        selected_count=len(selected_original_indices),
-        semantic_status=semantic_status,
-        profile=profile,
-        original_source_count=len(original_items),
-        independent_source_count=count,
-        duplicates_removed=len(independence.get("duplicate_indices", [])),
-        independence_families=independence.get("families", []),
-    )
-    for idx in selected_original_indices:
-        print(f"[TOPIC FILTER] Evidence source -> {str(original_items[idx].get('title', '')).strip()}")
-
-    return {
-        "status": status,
-        "reason": reason,
-        "count": len(original_items),
-        "selected_indices": selected_original_indices,
-        "selected_count": len(selected_original_indices),
-        "semantic_status": semantic_status,
-        "original_source_count": len(original_items),
-        "independent_source_count": count,
-        "duplicates_removed": len(independence.get("duplicate_indices", [])),
-        "independence_families": independence.get("families", []),
-    }
-
-
-def _rank_full_production_reservoir(trends, processed):
-    """
-    Rank the full production reservoir without using pre_score as an admission gate.
-
-    pre_score is a prioritization signal only. A fresh, editorially eligible topic
-    must be allowed to reach news retrieval regardless of whether its score is 70,
-    60, 50, or lower. Downstream story/evidence/factual/editorial gates decide
-    whether the topic can become a production article.
-
-    Production ranks the raw trend feed in deterministic chunks so a target of 1
-    article cannot starve when earlier candidates are rejected downstream. Every
-    deterministic-eligible candidate is retained; pre_score is used only for
-    global processing order.
-    """
-    items = list(trends or [])
+    items = list(independence.get("items") or [])
     if not items:
         return []
 
-    # Process the raw feed in bounded cheap-ranking chunks, but return every
-    # deterministic-eligible topic. The scorer's production mode has no score
-    # admission gate and no retrieval cap.
-    chunk_size = 24
-
-    ranked = []
+    kept_original = list(independence.get("kept_indices", []))
+    remaining = list(range(len(items)))
+    candidates = []
     seen = set()
 
-    def _key(item):
-        title = " ".join(str(item.get("title", "") or "").split()).strip().casefold()
-        title = unicodedata.normalize("NFKD", title)
-        title = "".join(ch for ch in title if not unicodedata.combining(ch))
-        title = re.sub(r"[^a-z0-9]+", " ", title)
-        return " ".join(title.split())
+    def add_candidate(selected, semantic_status="NOT_REQUIRED"):
+        selected = sorted(dict.fromkeys(i for i in selected if 0 <= i < len(items)))
+        if not selected:
+            return
+        original_indices = sorted(dict.fromkeys(
+            kept_original[i] for i in selected
+            if 0 <= i < len(kept_original)
+        ))
+        if not original_indices or tuple(original_indices) in seen:
+            return
+        seen.add(tuple(original_indices))
+        candidates.append({
+            "status": "PASS",
+            "reason": "concrete story cluster",
+            "count": len(original_items),
+            "selected_indices": original_indices,
+            "selected_count": len(original_indices),
+            "semantic_status": semantic_status,
+            "original_source_count": len(original_items),
+            "independent_source_count": len(items),
+            "duplicates_removed": len(independence.get("duplicate_indices", [])),
+            "independence_families": independence.get("families", []),
+            "component_index": len(candidates),
+        })
 
-    for start in range(0, len(items), chunk_size):
-        chunk = items[start:start + chunk_size]
-        batch = rank_trends(
-            chunk,
-            processed,
-            limit=len(chunk),
-        )
+    # Very small pools do not justify an additional semantic call.
+    if len(items) < 3:
+        add_candidate(remaining)
+    else:
+        # First pass: semantic identification of a concrete story. This is a
+        # splitter, never a topic-level gate.
+        try:
+            judge = _semantic_story_concentration_judge(
+                [items[i] for i in remaining], topic
+            )
+            status = str(judge.get("status", "MIXED")).upper()
+            nums = judge.get("source_numbers") or []
+            selected = [remaining[n - 1] for n in nums if 1 <= n <= len(remaining)]
+            confidence = int(judge.get("confidence", 0) or 0)
 
-        for item in batch:
-            key = _key(item)
-            if not key or key in seen:
-                continue
+            if status in {"ONE_STORY", "PASS"} and confidence >= 70:
+                add_candidate(remaining, status)
+                remaining = []
+            elif status == "DOMINANT_STORY" and confidence >= 70 and len(selected) >= 2:
+                add_candidate(selected, status)
+                remaining = [i for i in remaining if i not in set(selected)]
+        except Exception as exc:
+            # Semantic discovery is auxiliary; deterministic fallback remains.
+            print(f"[STORY DISCOVERY] semantic splitter unavailable | {exc}")
 
-            seen.add(key)
-            ranked.append(item)
-
-    ranked.sort(
-        key=lambda item: float(
-            (item.get("_topic") or {}).get("pre_score", 0.0)
-        ),
-        reverse=True,
-    )
+    # Split whatever remains deterministically. This is intentionally applied
+    # after semantic extraction so separate stories survive a mixed topic pool.
+    if remaining:
+        residual = [items[i] for i in remaining]
+        profile = _story_pool_profile(residual, topic)
+        components = list(profile.get("components") or [])
+        if len(residual) < 3:
+            components = [list(range(len(residual)))]
+        for component in components:
+            selected = [remaining[i] for i in component if 0 <= i < len(remaining)]
+            add_candidate(selected, "MIXED_RESIDUAL")
 
     print(
-        f"[TOPIC FILTER] PRODUCTION RESERVOIR RANKED | "
-        f"raw={len(items)} | eligible={len(ranked)} | "
-        f"score_gate=DISABLED | score_used=PRIORITY_ONLY"
+        f"[STORY DISCOVERY] topic={topic} | sources={len(original_items)} | "
+        f"independent={len(items)} | story_candidates={len(candidates)}"
     )
+    for idx, candidate in enumerate(candidates, 1):
+        print(
+            f"[STORY DISCOVERY] candidate={idx}/{len(candidates)} | "
+            f"sources={candidate['selected_count']} | "
+            f"semantic={candidate['semantic_status']} | topic={topic}"
+        )
 
-    return ranked
+    return candidates
+
+
+def _deterministic_production_reservoir(trends, processed):
+    """Return every deterministic-eligible trend without ranking or scoring."""
+    processed_norm = {_norm(x) for x in processed}
+    seen_titles = set()
+    eligible = []
+
+    for trend in trends or []:
+        if not isinstance(trend, dict):
+            continue
+
+        title = _clean(trend.get("title"))
+        if not title:
+            continue
+
+        norm_title = _norm(title)
+        if norm_title in processed_norm or norm_title in seen_titles:
+            continue
+        seen_titles.add(norm_title)
+
+        reason = _skip_reason(title)
+        if reason:
+            print(f"[TOPIC FILTER] DROP | {title} | {reason}")
+            continue
+
+        item = dict(trend)
+        item["title"] = title
+        eligible.append(item)
+
+    print(
+        f"[TOPIC FILTER] PRODUCTION RESERVOIR | "
+        f"raw={len(list(trends or []))} | deterministic_eligible={len(eligible)} | "
+        f"selection=scoring_disabled"
+    )
+    return eligible
+
 
 def _build_evidence_source(news, story_selection):
     """Build evidence input from the exact source selection already made upstream."""
@@ -1601,113 +1454,70 @@ def main():
     new_keywords = []
 
     # ============================================================
-    # TOPIC PRIORITY FILTER
+    # DISCOVERY -> CONCRETE STORIES
     # ============================================================
-    # IMPORTANT: article generation must NEVER run directly over the raw
-    # trend feed. We first rank the entire trend set, then retrieve news only
-    # for the small candidate pool, then generate only the final winners.
-    #
-    # This is deliberately outside Fact Guard. Fact Guard protects factual
-    # correctness AFTER a topic has been selected; it does not decide which
-    # topics deserve production capacity.
-    # ============================================================
-    # PRODUCTION RESERVOIR
-    # ============================================================
-    # Never let the article target determine how many raw trends are allowed
-    # into the candidate stage. A target of 1 article must NOT mean "try only
-    # 4 topics". That creates candidate starvation: a handful of news/source
-    # rejects can terminate the run even when additional viable raw trends
-    # exist.
-    #
-    # The ranking layer is cheap (no news fetch / no Ollama), so the production
-    # reservoir should include every available raw trend, subject only to the
-    # ranker's own deterministic viability rules and its configured safety cap.
-    # Downstream quality gates remain unchanged.
-    #
-    # This is deliberately demand-independent:
-    #   raw trends -> full viable reservoir -> source retrieval -> evidence
-    #   -> generation -> editorial gates -> stop only when TARGET is reached
-    #
-    # IMPORTANT: Do NOT reduce this back to MAX_ARTICLES_PER_RUN * 4 (or any
-    # other target-relative multiplier). That was the recurring production
-    # bottleneck observed in UK runs.
-    candidate_trends = _rank_full_production_reservoir(
+    # Trends are discovery signals only. They do not represent the production
+    # article candidate by themselves. There is no score/ranking admission
+    # path and no target-relative reservoir. Every deterministic-eligible trend
+    # can be explored until a real story passes the unchanged quality gates.
+    candidate_trends = _deterministic_production_reservoir(
         trends,
         processed,
     )
 
     print(
-        f"[TOPIC FILTER] PRODUCTION RESERVOIR | "
-        f"raw={len(trends)} | ranked_candidates={len(candidate_trends)} | "
-        f"target={MAX_ARTICLES_PER_RUN}"
+        f"[STORY DISCOVERY] seeds={len(candidate_trends)} | "
+        f"article_target={MAX_ARTICLES_PER_RUN}"
     )
 
-    source_scored_candidates = []
-
     for trend in candidate_trends:
+        if generated >= MAX_ARTICLES_PER_RUN:
+            break
+
         keyword = trend["title"]
 
-        # Cheap title-level sports exclusion. Explicit sports topics are
-        # removed before news retrieval; athlete/person names are checked again
-        # after corroborating news arrives.
         if _is_sports_topic(keyword):
             print(f"[TrendCurrent] SKIP sports topic: {keyword}")
             continue
 
         try:
             print(
-                f"\n[TOPIC FILTER] Retrieving sources for candidate: "
+                f"\n[STORY DISCOVERY] Retrieving sources for discovery seed: "
                 f"{keyword}"
             )
-            # Discovery candidates already come from fresh Google News RSS.
-            # Re-query using the category discovery query rather than the full
-            # publisher headline; the latter is often too specific and can
-            # return zero results. The discovered item is retained as seed
-            # evidence so the exact fresh story is not lost.
+
             discovery_query = trend.get("discovery_query")
             seed = None
             if discovery_query:
-                # The discovery headline is already a fresh story. Use it as
-                # seed evidence and make a second, entity-focused search for
-                # corroboration. Never discard the seed just because Google
-                # News cannot find the publisher headline again.
                 seed = dict(trend)
                 if not seed.get("content") and seed.get("link"):
                     try:
                         seed["content"] = extract_article(seed["link"])
                     except Exception:
                         seed["content"] = ""
-                # IMPORTANT: corroboration must be anchored to the concrete
-                # discovery story, not merely to the trend/topic keyword.
-                # Generic topics such as DFB-Pokal can contain many independent
-                # matches/events. Searching the broad keyword recreates a mixed
-                # source pool and forces Story Concentration to solve a problem
-                # that should have been prevented at retrieval time.
+
                 seed_anchor = str(seed.get("title", "")).strip() or keyword
                 entity_query = _build_related_story_query(seed_anchor)
                 if not entity_query:
                     entity_query = seed_anchor.split(" - ")[0].strip()
 
-                # The discovery category is only a discovery hint. Never append it
-                # to the corroboration query: doing so can misclassify a local
-                # Indonesian artist as K-pop simply because the same headline was
-                # returned by a K-pop discovery query. Entity/event terms are safer.
-                search_query = entity_query
+                print(f"[TOPIC FILTER] Related story search: {entity_query}")
+                news = fetch_news(entity_query)
 
-                print(f"[TOPIC FILTER] Related story search: {search_query}")
-                news = fetch_news(search_query)
-                # If the seed page extracted very little text, borrow the RSS
-                # summary/content from the closest matching search result. This
-                # prevents a short publisher extraction from becoming the only
-                # evidence source when Google News already has the same story.
                 seed_title_norm = _normalise_headline(seed.get("title", ""))
                 if len(str(seed.get("content", "")).strip()) < 900 and news:
                     best = None
                     best_overlap = 0
-                    seed_words = {w for w in re.findall(r"[a-z0-9]+", seed_title_norm.casefold()) if len(w) >= 4}
+                    seed_words = {
+                        w for w in re.findall(r"[a-z0-9]+", seed_title_norm.casefold())
+                        if len(w) >= 4
+                    }
                     for candidate in news:
                         cand_norm = _normalise_headline(candidate.get("title", ""))
-                        cand_words = {w for w in re.findall(r"[a-z0-9]+", cand_norm.casefold()) if len(w) >= 4}
+                        cand_words = {
+                            w for w in re.findall(r"[a-z0-9]+", cand_norm.casefold())
+                            if len(w) >= 4
+                        }
                         overlap = len(seed_words & cand_words)
                         if overlap > best_overlap:
                             best_overlap = overlap
@@ -1719,7 +1529,8 @@ def main():
                             seed["summary"] = best.get("summary")
 
                 if seed.get("title") and not any(
-                    str(x.get("title", "")).strip().casefold() == str(seed.get("title", "")).strip().casefold()
+                    str(x.get("title", "")).strip().casefold() ==
+                    str(seed.get("title", "")).strip().casefold()
                     for x in news
                 ):
                     news.insert(0, seed)
@@ -1734,14 +1545,12 @@ def main():
                         break
 
             if not news:
-                print(f"[TOPIC FILTER] DROP AFTER NEWS | {keyword} | no usable news result(s)")
+                print(
+                    f"[TOPIC FILTER] DROP AFTER NEWS | {keyword} | "
+                    f"no usable news result(s)"
+                )
                 continue
 
-            # --------------------------------------------------------
-            # TOPIC / NEWS RELEVANCE GATE
-            # --------------------------------------------------------
-            # Do not let corroboration for a different entity/region enter
-            # Story Concentration or source scoring.
             relevant_news = filter_relevant_news(trend, news)
             if not relevant_news:
                 print(
@@ -1751,296 +1560,216 @@ def main():
                 continue
             news = relevant_news
 
-            # Sports classification runs ONLY on topic-relevant news.
-            # An unrelated sports result in the raw retrieval pool can never
-            # veto a legitimate non-sports candidate.
             if _is_sports_topic(keyword, news):
                 print(f"[TrendCurrent] SKIP sports topic after relevance: {keyword}")
                 continue
 
-            # --------------------------------------------------------
-            # STORY SOURCE DECISION
-            # --------------------------------------------------------
-            # This runs before Ollama evidence extraction.
-            # Its only job is to detect a source pool that contains multiple
-            # independent stories under a broad/generic retrieval query.
-            try:
-                story_selection = _decide_story_sources(news, keyword)
+            story_candidates = _discover_concrete_story_candidates(news, keyword)
+            if not story_candidates:
+                print(
+                    f"[STORY DISCOVERY] REJECT | {keyword} | "
+                    f"no concrete story candidate"
+                )
+                continue
+
+            # Each concrete story is evaluated immediately through the existing
+            # evidence/substantive/generation/Fact Guard pipeline. A failed
+            # story never rejects the remaining stories from this topic.
+            for story_number, story_selection in enumerate(story_candidates, 1):
+                if generated >= MAX_ARTICLES_PER_RUN:
+                    break
+
                 trend["_story_selection"] = story_selection
-            except StorySourceUnavailable as concentration_unavailable:
-                # Infrastructure availability is NOT a content-quality rejection.
-                # The candidate is skipped safely, but the operational state remains
-                # explicitly UNAVAILABLE so monitoring can distinguish it from MIXED.
-                trend["_production_status"] = "UNAVAILABLE"
-                trend["_production_unavailable_reason"] = str(concentration_unavailable)
+                trend["news"] = news
+                trend["_story_number"] = story_number
+                trend["_story_candidate_count"] = len(story_candidates)
+
+                monitor.start_candidate(
+                    keyword,
+                    trend=trend,
+                )
+
                 print(
-                    f"[TOPIC FILTER] UNAVAILABLE BEFORE EVIDENCE | article_slot=0 | "
-                    f"{keyword} | {concentration_unavailable}"
-                )
-                continue
-            except Exception as concentration_error:
-                # Genuine Story Source decisions such as MIXED remain content rejects.
-                trend["_production_status"] = "REJECT"
-                trend["_production_reject_reason"] = str(concentration_error)
-                print(
-                    f"[TOPIC FILTER] REJECT BEFORE EVIDENCE | article_slot=0 | "
-                    f"{keyword} | {concentration_error}"
-                )
-                continue
-
-            # Story Source Decision returns indices mapped back to the original
-            # news list, so the exact independent source selection flows unchanged
-            # into scoring, evidence extraction and Fact Guard.
-            trend["news"] = news
-            topic_final = score_with_news(trend, news)
-            trend["_topic_final"] = topic_final
-            source_scored_candidates.append(trend)
-
-            print(
-                f"[TOPIC FILTER] SOURCE SCORE | "
-                f"{topic_final['final_score']:.1f} | {keyword}"
-            )
-
-        except Exception as e:
-            print(f"[TOPIC FILTER] ERROR: {keyword}: {e}")
-
-    # Evidence usability is part of production candidate selection.
-    # Keep the full source-scored ranking available so a top topic that has
-    # unusable evidence does not consume the article slot.
-    evidence_candidate_pool = select_final_candidates(
-        source_scored_candidates,
-        limit=len(source_scored_candidates),
-        min_score=None,
-    )
-
-    for trend in evidence_candidate_pool:
-        if generated >= MAX_ARTICLES_PER_RUN:
-            break
-        keyword = trend["title"]
-        monitor.start_candidate(keyword, trend=trend)
-        news = trend["news"]
-        story_selection = trend.get("_story_selection")
-
-        print(
-            f"\n[GENERATION] Selected topic | "
-            f"score={trend['_topic_final']['final_score']:.1f} | {keyword}"
-        )
-
-        try:
-            generation_prompt = build_prompt(trend)
-            selected_news = _selected_story_news(news, story_selection)
-            fact_guard_source = _build_fact_guard_source(selected_news)
-
-            print(
-                f"[FACT GUARD] Source prepared | "
-                f"news_items={len(selected_news)} | "
-                f"source_chars={len(fact_guard_source)}"
-            )
-
-            # --------------------------------------------------------
-            # EVIDENCE USABILITY GATE
-            # --------------------------------------------------------
-            # Use the exact same source-grounded extractor as the universal
-            # fact-lock pipeline. If this candidate cannot produce at least
-            # one provenance-verified fact, skip it and try the next-ranked
-            # candidate instead of consuming the article slot.
-            print(
-                f"[TOPIC FILTER] EVIDENCE USABILITY CHECK | {keyword}"
-            )
-
-            try:
-                evidence_source = _build_evidence_source(news, story_selection)
-                print(
-                    f"[TOPIC FILTER] Evidence source prepared | "
-                    f"source_chars={len(evidence_source)}"
-                )
-                evidence_lock = extract_evidence(evidence_source)
-
-                # --------------------------------------------------------
-                # EVIDENCE SUFFICIENCY GATE
-                # --------------------------------------------------------
-                # Evidence extraction itself is required to know whether the
-                # story is sufficiently supported. Once extraction returns,
-                # however, there is no value in invoking article generation,
-                # factual audit, headline repair, or Fact Guard
-                # for a candidate with only 0-2 locked facts.
-                #
-                # This is intentionally a fact-count gate, not a word-count
-                # floor and not a generation retry. A short article can still
-                # PASS when the evidence is rich enough; candidates with
-                # insufficient evidence are simply not generated.
-                locked_facts = (
-                    evidence_lock.get("facts", [])
-                    if isinstance(evidence_lock, dict)
-                    else []
-                )
-                evidence_fact_count = (
-                    len(locked_facts)
-                    if isinstance(locked_facts, list)
-                    else 0
+                    f"\n[GENERATION] Concrete story candidate "
+                    f"{story_number}/{len(story_candidates)} | {keyword}"
                 )
 
-                if evidence_fact_count < EVIDENCE_MIN_FACTS_FOR_GENERATION:
-                    trend["_production_status"] = "REJECT"
-                    trend["_production_reject_reason"] = (
-                        f"insufficient evidence facts "
-                        f"({evidence_fact_count} < "
-                        f"{EVIDENCE_MIN_FACTS_FOR_GENERATION})"
+                try:
+                    generation_prompt = build_prompt(trend)
+                    selected_news = _selected_story_news(news, story_selection)
+                    fact_guard_source = _build_fact_guard_source(selected_news)
+
+                    print(
+                        f"[FACT GUARD] Source prepared | "
+                        f"news_items={len(selected_news)} | "
+                        f"source_chars={len(fact_guard_source)}"
                     )
 
                     print(
-                        f"[TOPIC FILTER] EVIDENCE SUFFICIENCY REJECT | "
-                        f"facts={evidence_fact_count} | "
-                        f"minimum={EVIDENCE_MIN_FACTS_FOR_GENERATION} | "
-                        f"{keyword} | "
-                        f"reason=insufficient evidence for meaningful article"
+                        f"[TOPIC FILTER] EVIDENCE USABILITY CHECK | {keyword} | "
+                        f"story={story_number}/{len(story_candidates)}"
                     )
 
-                    monitor.candidate_event(
-                        "evidence_sufficiency",
-                        status="REJECT",
-                        reason="insufficient evidence for meaningful article",
-                        news_count=len(news),
-                        selected_source_indices=(story_selection or {}).get("selected_indices", []),
-                        selected_source_count=(story_selection or {}).get("selected_count"),
-                        evidence_source_chars=len(evidence_source),
-                        evidence_fact_count=evidence_fact_count,
-                        evidence_facts=locked_facts,
-                        minimum_facts=EVIDENCE_MIN_FACTS_FOR_GENERATION,
+                    evidence_source = _build_evidence_source(news, story_selection)
+                    print(
+                        f"[TOPIC FILTER] Evidence source prepared | "
+                        f"source_chars={len(evidence_source)}"
                     )
-                    monitor.finish_candidate(
-                        "REJECT",
-                        reason=(
+                    evidence_lock = extract_evidence(evidence_source)
+
+                    locked_facts = (
+                        evidence_lock.get("facts", [])
+                        if isinstance(evidence_lock, dict)
+                        else []
+                    )
+                    evidence_fact_count = (
+                        len(locked_facts)
+                        if isinstance(locked_facts, list)
+                        else 0
+                    )
+
+                    if evidence_fact_count < EVIDENCE_MIN_FACTS_FOR_GENERATION:
+                        trend["_production_status"] = "REJECT"
+                        trend["_production_reject_reason"] = (
                             f"insufficient evidence facts "
                             f"({evidence_fact_count} < "
                             f"{EVIDENCE_MIN_FACTS_FOR_GENERATION})"
-                        ),
-                    )
-                    continue
+                        )
+                        print(
+                            f"[TOPIC FILTER] EVIDENCE SUFFICIENCY REJECT | "
+                            f"facts={evidence_fact_count} | "
+                            f"minimum={EVIDENCE_MIN_FACTS_FOR_GENERATION} | "
+                            f"{keyword} | story={story_number} | "
+                            f"reason=insufficient evidence for meaningful article"
+                        )
+                        monitor.candidate_event(
+                            "evidence_sufficiency",
+                            status="REJECT",
+                            reason="insufficient evidence for meaningful article",
+                            news_count=len(news),
+                            selected_source_indices=story_selection.get("selected_indices", []),
+                            selected_source_count=story_selection.get("selected_count"),
+                            evidence_source_chars=len(evidence_source),
+                            evidence_fact_count=evidence_fact_count,
+                            evidence_facts=locked_facts,
+                            minimum_facts=EVIDENCE_MIN_FACTS_FOR_GENERATION,
+                        )
+                        monitor.finish_candidate(
+                            "REJECT",
+                            reason=trend["_production_reject_reason"],
+                        )
+                        continue
 
-                # --------------------------------------------------------
-                # SUBSTANTIVE STORY VALUE GATE
-                # --------------------------------------------------------
-                # Evidence sufficiency answers "Do we have enough facts?"
-                # This separate gate answers "Do those facts describe a
-                # concrete, useful news development worth publishing?"
-                # It runs BEFORE article generation so technically valid but
-                # substantively empty candidates never consume the expensive
-                # writer/audit/repair pipeline.
-                print(
-                    f"[TOPIC FILTER] SUBSTANTIVE STORY VALUE CHECK | {keyword}"
-                )
-                try:
-                    substantive_story_value_gate(evidence_lock)
-                except Exception as substantive_error:
-                    trend["_production_status"] = "REJECT"
-                    trend["_production_reject_reason"] = str(substantive_error)
+                    print(
+                        f"[TOPIC FILTER] SUBSTANTIVE STORY VALUE CHECK | "
+                        f"{keyword} | story={story_number}"
+                    )
+                    try:
+                        substantive_story_value_gate(evidence_lock)
+                    except Exception as substantive_error:
+                        trend["_production_status"] = "REJECT"
+                        trend["_production_reject_reason"] = str(substantive_error)
+                        monitor.candidate_event(
+                            "substantive_story_value",
+                            status="REJECT",
+                            reason=str(substantive_error),
+                            news_count=len(news),
+                            selected_source_indices=story_selection.get("selected_indices", []),
+                            selected_source_count=story_selection.get("selected_count"),
+                            evidence_source_chars=len(evidence_source),
+                            evidence_facts=locked_facts,
+                            evidence_fact_count=evidence_fact_count,
+                        )
+                        monitor.finish_candidate(
+                            "REJECT",
+                            reason=f"substantive_value={substantive_error}",
+                        )
+                        continue
+
                     monitor.candidate_event(
                         "substantive_story_value",
-                        status="REJECT",
-                        reason=str(substantive_error),
+                        status="PASS",
                         news_count=len(news),
-                        selected_source_indices=(story_selection or {}).get("selected_indices", []),
-                        selected_source_count=(story_selection or {}).get("selected_count"),
+                        selected_source_indices=story_selection.get("selected_indices", []),
+                        selected_source_count=story_selection.get("selected_count"),
                         evidence_source_chars=len(evidence_source),
                         evidence_facts=locked_facts,
                         evidence_fact_count=evidence_fact_count,
                     )
-                    monitor.finish_candidate(
-                        "REJECT",
-                        reason=f"substantive_value={substantive_error}",
+
+                    evidence_lock = _enrich_evidence_for_generation(
+                        evidence_lock,
+                        trend,
                     )
+                    trend["_evidence_lock"] = evidence_lock
+                    print(
+                        f"[TOPIC FILTER] EVIDENCE USABILITY PASS | "
+                        f"facts={evidence_fact_count} | {keyword} | story={story_number}"
+                    )
+                    monitor.candidate_event(
+                        "evidence_locked",
+                        news_count=len(news),
+                        selected_source_indices=story_selection.get("selected_indices", []),
+                        selected_source_count=story_selection.get("selected_count"),
+                        evidence_source_chars=len(evidence_source),
+                        evidence_facts=locked_facts,
+                        evidence_fact_count=evidence_fact_count,
+                        evidence_lock=evidence_lock,
+                    )
+
+                    article = generate_valid_article(
+                        generation_prompt,
+                        fact_guard_source,
+                        reference_date,
+                        trend,
+                        max_attempts=1,
+                        prelocked_evidence=evidence_lock,
+                    )
+
+                    _paragraph_text = " ".join(
+                        str(p) for p in article.get("paragraphs", [])
+                    ).strip()
+                    _locked_facts = (
+                        evidence_lock.get("facts", [])
+                        if isinstance(evidence_lock, dict)
+                        else []
+                    )
+                    monitor.candidate_event(
+                        "article_generated",
+                        article=article,
+                        article_word_count=len(_paragraph_text.split()),
+                        evidence_fact_count=(
+                            len(_locked_facts)
+                            if isinstance(_locked_facts, list)
+                            else None
+                        ),
+                        evidence_facts=_locked_facts,
+                        evidence_coverage=None,
+                        information_density=None,
+                    )
+
+                    slug = slugify(keyword)
+                    article["slug"] = slug
+                    save_article(slug, render_article(article, news=selected_news))
+
+                    new_keywords.append(keyword)
+                    generated += 1
+
+                    print(f"OK -> {slug}.html")
+                    monitor.finish_candidate("PASS", slug=slug)
+
+                except Exception as e:
+                    trend["_production_status"] = "REJECT"
+                    trend["_production_reject_reason"] = str(e)
+                    print(
+                        f"[GENERATION] REJECT | article_slot=0 | "
+                        f"{keyword} | story={story_number} | {e}"
+                    )
+                    monitor.finish_candidate("REJECT", reason=str(e))
                     continue
 
-                monitor.candidate_event(
-                    "substantive_story_value",
-                    status="PASS",
-                    news_count=len(news),
-                    selected_source_indices=(story_selection or {}).get("selected_indices", []),
-                    selected_source_count=(story_selection or {}).get("selected_count"),
-                    evidence_source_chars=len(evidence_source),
-                    evidence_facts=locked_facts,
-                    evidence_fact_count=evidence_fact_count,
-                )
-
-                evidence_lock = _enrich_evidence_for_generation(
-                    evidence_lock,
-                    trend,
-                )
-                trend["_evidence_lock"] = evidence_lock
-                print(
-                    f"[TOPIC FILTER] EVIDENCE USABILITY PASS | "
-                    f"facts={evidence_fact_count} | {keyword}"
-                )
-                monitor.candidate_event(
-                    "evidence_locked",
-                    news_count=len(news),
-                    selected_source_indices=(story_selection or {}).get("selected_indices", []),
-                    selected_source_count=(story_selection or {}).get("selected_count"),
-                    evidence_source_chars=len(evidence_source),
-                    evidence_facts=locked_facts,
-                    evidence_fact_count=evidence_fact_count,
-                    evidence_lock=evidence_lock,
-                )
-            except Exception as evidence_error:
-                # Terminal candidate rejection: this topic has no usable
-                # source-locked evidence. It consumes ZERO article slots and
-                # the pipeline immediately falls through to the next ranked
-                # candidate. Never retry an already-rejected evidence
-                # candidate or add another repair layer here.
-                trend["_production_status"] = "REJECT"
-                trend["_production_reject_reason"] = str(evidence_error)
-                print(
-                    f"[TOPIC FILTER] REJECT | article_slot=0 | "
-                    f"{keyword} | evidence={evidence_error}"
-                )
-                monitor.finish_candidate("REJECT", reason=f"evidence={evidence_error}")
-                continue
-
-            article = generate_valid_article(
-                generation_prompt,
-                fact_guard_source,
-                reference_date,
-                trend,
-                max_attempts=1,
-                prelocked_evidence=evidence_lock,
-            )
-
-            _paragraph_text = " ".join(str(p) for p in article.get("paragraphs", [])).strip()
-            _locked_facts = evidence_lock.get("facts", []) if isinstance(evidence_lock, dict) else []
-            monitor.candidate_event(
-                "article_generated",
-                article=article,
-                article_word_count=len(_paragraph_text.split()),
-                evidence_fact_count=len(_locked_facts) if isinstance(_locked_facts, list) else None,
-                evidence_facts=_locked_facts,
-                evidence_coverage=None,
-                information_density=None,
-            )
-
-            slug = slugify(keyword)
-            article["slug"] = slug
-
-            save_article(slug, render_article(article, news=selected_news))
-
-            new_keywords.append(keyword)
-            generated += 1
-
-            print(f"OK -> {slug}.html")
-            monitor.finish_candidate("PASS", slug=slug)
-
         except Exception as e:
-            # Any candidate that fails after evidence lock is terminal for this
-            # run. Do not retry the same expensive candidate; move immediately
-            # to the next ranked topic. The article counter remains unchanged.
-            # This also covers any terminal downstream validation failure.
-            trend["_production_status"] = "REJECT"
-            trend["_production_reject_reason"] = str(e)
-            print(
-                f"[GENERATION] REJECT | article_slot=0 | "
-                f"{keyword} | {e}"
-            )
-            monitor.finish_candidate("REJECT", reason=str(e))
+            print(f"[TOPIC FILTER] ERROR: {keyword}: {e}")
 
     try:
         update_all()
