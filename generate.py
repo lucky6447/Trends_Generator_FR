@@ -17,7 +17,7 @@ from config import MAX_ARTICLES_PER_RUN, LANGUAGE
 from rss import fetch_trends
 from news import fetch_news, extract_article
 from prompt import build_prompt
-from ollama_client import generate, extract_evidence
+from ollama_client import generate, extract_evidence, validate_article_structure
 from ollama import chat
 from config import MODEL
 from fact_guard import validate as fact_guard_validate
@@ -159,25 +159,69 @@ SPORTS_SOURCE_TERMS = (
     "uefa.com", "golf.com", "golf monthly", "cricbuzz",
 )
 
+def _sports_term_in_text(text):
+    """Match sports vocabulary as whole words/phrases, not arbitrary substrings."""
+    text = " ".join(str(text or "").split()).casefold()
+    if not text:
+        return False
+    return any(
+        re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", text)
+        for term in SPORTS_TOPIC_TERMS
+    )
+
+
+def _sports_source_in_item(item):
+    """Match a known sports publisher/domain only in source/link fields."""
+    if not isinstance(item, dict):
+        return False
+    source_text = " ".join(
+        str(item.get(key, "") or "")
+        for key in ("source", "url", "link")
+    ).casefold()
+    return any(
+        re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", source_text)
+        for term in SPORTS_SOURCE_TERMS
+    )
+
+
 def _is_sports_topic(title, news=None):
-    """Return True when the candidate is clearly sports-related."""
-    text = " ".join(str(title or "").split()).casefold()
-    if any(term in f" {text} " for term in SPORTS_TOPIC_TERMS):
+    """
+    Return True only for a strong sports signal.
+
+    The title itself is authoritative for explicit sports topics. When news is
+    supplied, it must already be topic-relevant; a single unrelated sports
+    result must never veto a legitimate non-sports topic.
+    """
+    if _sports_term_in_text(title):
         return True
 
-    for item in news or ():
-        if not isinstance(item, dict):
-            continue
-        haystack = " ".join(
-            str(item.get(key, "") or "")
-            for key in ("title", "source", "url", "link", "summary")
-        ).casefold()
-        if any(term in haystack for term in SPORTS_SOURCE_TERMS):
-            return True
-        if any(term in haystack for term in SPORTS_TOPIC_TERMS):
-            return True
+    items = [item for item in (news or ()) if isinstance(item, dict)]
+    if not items:
+        return False
 
-    return False
+    sports_signals = 0
+    strong_source_signals = 0
+
+    for item in items:
+        title_sports = _sports_term_in_text(item.get("title", ""))
+        summary_sports = _sports_term_in_text(item.get("summary", ""))
+        source_sports = _sports_source_in_item(item)
+
+        if source_sports:
+            strong_source_signals += 1
+        if title_sports:
+            sports_signals += 2
+        elif summary_sports:
+            sports_signals += 1
+
+    if len(items) == 1:
+        return strong_source_signals >= 1 or sports_signals >= 2
+
+    return (
+        strong_source_signals >= 2
+        or sports_signals >= 3
+        or (strong_source_signals >= 1 and sports_signals >= 2)
+    )
 
 
 
@@ -1582,6 +1626,7 @@ def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max
             )
             article = generate(prompt, evidence=generation_evidence)
             validate_article(article)
+            validate_article_structure(article, generation_evidence, label="Initial generated article")
 
             locked_facts = generation_evidence.get("facts", [])
             paragraph_text = " ".join(
@@ -1624,8 +1669,10 @@ def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max
                         guard,
                     )
                     validate_article(repaired)
+                    validate_article_structure(repaired, generation_evidence, label="Fact Guard repaired article")
                     repaired = enforce_headline_policy(repaired, trend)
                     validate_article(repaired)
+                    validate_article_structure(repaired, generation_evidence, label="Fact Guard repaired article final")
                     validate_language_integrity(repaired)
                     print("[LANGUAGE GUARD] REPAIRED ARTICLE PASS")
 
@@ -1890,12 +1937,6 @@ def main():
                 print(f"[TOPIC FILTER] DROP AFTER NEWS | {keyword} | no usable news result(s)")
                 continue
 
-            # Second sports check catches athlete/person trends whose names do
-            # not contain an explicit sport term (for example Gasly or Bublik).
-            if _is_sports_topic(keyword, news):
-                print(f"[TrendCurrent] SKIP sports topic after news: {keyword}")
-                continue
-
             # --------------------------------------------------------
             # TOPIC / NEWS RELEVANCE GATE
             # --------------------------------------------------------
@@ -1909,6 +1950,13 @@ def main():
                 )
                 continue
             news = relevant_news
+
+            # Sports classification runs ONLY on topic-relevant news.
+            # An unrelated sports result in the raw retrieval pool can never
+            # veto a legitimate non-sports candidate.
+            if _is_sports_topic(keyword, news):
+                print(f"[TrendCurrent] SKIP sports topic after relevance: {keyword}")
+                continue
 
             # --------------------------------------------------------
             # STORY SOURCE DECISION

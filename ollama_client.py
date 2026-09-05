@@ -26,7 +26,7 @@ from config import MODEL, LANGUAGE
 #   * language-independent
 # ============================================================
 
-PIPELINE_VERSION = "universal-fact-lock-v2.4.2-evidence-density-source-context-test"
+PIPELINE_VERSION = "universal-fact-lock-v2.5.1-evidence-coverage-hardened"
 
 # IMPORTANT: Do not force a CPU thread count by default.
 # Ollama can auto-detect the runner's optimal thread count.
@@ -69,13 +69,13 @@ WRITER_SOURCE_CONTEXT = os.getenv("OLLAMA_WRITER_SOURCE_CONTEXT", "0").strip() =
 WRITER_SOURCE_CONTEXT_CHARS = max(4000, int(os.getenv("OLLAMA_WRITER_SOURCE_CONTEXT_CHARS", "12000")))
 
 ARTICLE_TOKENS = max(
-    520, int(os.getenv("OLLAMA_ARTICLE_TOKENS", "900"))
+    700, int(os.getenv("OLLAMA_ARTICLE_TOKENS", "1200"))
 )
 AUDIT_TOKENS = max(
     120, int(os.getenv("OLLAMA_AUDIT_TOKENS", "180"))
 )
 REPAIR_TOKENS = max(
-    280, int(os.getenv("OLLAMA_REPAIR_TOKENS", "420"))
+    700, int(os.getenv("OLLAMA_REPAIR_TOKENS", "1200"))
 )
 
 MIN_ARTICLE_WORDS = max(
@@ -859,9 +859,50 @@ def _schema_ok(article):
 
 
 def _body_word_count(article):
-    """Count only actual article-body text for the evidence-density floor."""
+    """Count only actual article-body text for monitoring; never used as a floor."""
     values = list(article.get("paragraphs", []))
     return len(" ".join(str(value) for value in values if value).split())
+
+
+def _required_paragraphs(fact_count):
+    """Evidence-driven article structure; deliberately not a word-count rule."""
+    try:
+        count = int(fact_count)
+    except (TypeError, ValueError):
+        count = 0
+    if count <= 0:
+        return 1
+    if count <= 6:
+        return count
+    return 6
+
+
+def _article_structure_check(article, evidence):
+    """Deterministic fail-closed structure gate before any factual PASS."""
+    facts = evidence.get("facts", []) if isinstance(evidence, dict) else []
+    fact_count = len(facts) if isinstance(facts, list) else 0
+    paragraphs = article.get("paragraphs", []) if isinstance(article, dict) else []
+    if not isinstance(paragraphs, list) or not paragraphs:
+        return {"passed": False, "reason": "article has no paragraphs", "required_paragraphs": _required_paragraphs(fact_count), "actual_paragraphs": 0}
+
+    required = _required_paragraphs(fact_count)
+    actual = len([p for p in paragraphs if isinstance(p, str) and p.strip()])
+    if fact_count >= 3 and actual < required:
+        return {
+            "passed": False,
+            "reason": "article structure is too compressed for the locked evidence",
+            "required_paragraphs": required,
+            "actual_paragraphs": actual,
+            "fact_count": fact_count,
+        }
+
+    return {
+        "passed": True,
+        "reason": "evidence-driven paragraph structure satisfied",
+        "required_paragraphs": required,
+        "actual_paragraphs": actual,
+        "fact_count": fact_count,
+    }
 
 
 # ============================================================
@@ -890,30 +931,7 @@ _ARTICLE_FORMAT = {
 
 
 
-def _article_length_policy(fact_count):
-    if fact_count <= 2:
-        return (
-            "BODY LENGTH: Aim for approximately 90-130 words across the "
-            "substantive paragraphs. Be concise but complete; use the available "
-            "verified detail and do not pad."
-        )
-    if fact_count <= 4:
-        return (
-            "BODY LENGTH: Aim for approximately 160-220 words across at least "
-            "3 substantive paragraphs. Cover the distinct verified facts clearly "
-            "instead of compressing them into one or two sentences. Do not pad."
-        )
-    return (
-        "BODY LENGTH: Aim for approximately 230-330 words across at least "
-        "4 substantive paragraphs. Give the reader materially richer coverage "
-        "of the verified evidence, with distinct details explained clearly. "
-        "Do not pad, speculate or repeat facts."
-    )
-
-
 def _article_prompt(evidence, source_context=None):
-    fact_count = len(evidence.get("facts", [])) if isinstance(evidence, dict) else 0
-    length_policy = _article_length_policy(fact_count)
     context_block = ""
     if WRITER_SOURCE_CONTEXT and source_context:
         bounded_context = str(source_context)[:WRITER_SOURCE_CONTEXT_CHARS]
@@ -965,18 +983,24 @@ NUMBERS AND CLAIM STRENGTH:
 - Never upgrade a weaker claim into a stronger claim.
 - If evidence conflicts, do not guess or reconcile it; use only uncontested information or state the material conflict.
 
-COVERAGE:
-- Use the distinct, relevant verified facts available in the locked evidence.
-- Do not stop after only the headline-level fact when additional relevant evidence exists.
-- Prefer another distinct verified fact over repeating an existing one.
-- Every paragraph must add a distinct supported fact or development.
-- Build the article around the evidence inventory: cover the important facts first, then add the useful supporting details.
-- Do not compress several independent facts into one overloaded sentence when they can be explained clearly across separate sentences or paragraphs.
-- For 3-4 locked facts, normally use at least 3 substantive paragraphs.
-- For 5+ locked facts, normally use at least 4 substantive paragraphs.
-- Do not pad, speculate, manufacture context or repeat facts to increase length.
-- Article length should reflect the amount of useful verified evidence: sparse evidence stays concise; rich evidence should receive materially richer coverage.
-- {length_policy}
+COVERAGE — FACT-BY-FACT WRITING CONTRACT:
+- Treat the locked evidence as the article's complete factual inventory.
+- Before writing, silently map every locked fact to the paragraph where it will be used.
+- Use EVERY locked fact that belongs to the same concrete story unless it is an exact duplicate.
+- Do NOT stop after the headline-level fact when additional locked facts are available.
+- Each distinct locked fact should appear as a distinct piece of information, not merely be implied.
+- Closely related facts may share a paragraph, but both must remain explicit.
+- Every paragraph must add new verified information. Never repeat a fact just to increase length.
+- For 3-4 locked facts, normally write 3-4 substantive paragraphs.
+- For 5-6 locked facts, normally write 4-6 substantive paragraphs.
+- For 7+ locked facts, use enough substantive paragraphs to cover the evidence clearly.
+- A substantive paragraph normally contains 2-3 factual sentences when the evidence supports them.
+- The article must become more detailed when the evidence inventory is richer.
+- This is NOT a word-count floor: never invent, pad, repeat or add generic background merely to hit a length.
+- Quality comes from explicit coverage of distinct verified facts, not arbitrary word count.
+- STRUCTURAL REQUIREMENT: the article body must contain at least {_required_paragraphs(len(evidence.get("facts", [])))} substantive paragraphs for the locked evidence count.
+- Do NOT compress a 3+ fact evidence set into one or two paragraphs.
+- Give each distinct locked fact explicit sentence-level treatment.
 
 STYLE:
 - Natural, fluent {LANGUAGE}; professional, clear, objective and precise.
@@ -990,8 +1014,14 @@ HEADLINE:
 - Use only the core verified entity and core verified development.
 - Do not add facts not present in locked evidence.
 
-FINAL ENTITLEMENT CHECK:
-Before returning JSON, silently check every sentence: identify the exact locked fact supporting it; verify every person, role, action, location and attribution; verify event date/status separately from publication date; and remove anything unsupported, inferred, stronger, newer or more specific than the evidence.
+FINAL EVIDENCE COVERAGE CHECK:
+Before returning JSON, silently:
+1. Enumerate every LOCKED EVIDENCE fact ID.
+2. Identify where each fact is explicitly represented in the article body.
+3. Make sure distinct facts are not collapsed into a vague headline summary.
+4. Ensure the paragraph structure reflects the number of useful verified facts.
+5. Verify every sentence against supporting evidence and remove anything unsupported.
+6. Keep the article detailed enough to expose the useful information already present, without padding or an arbitrary word target.
 
 Return ONLY the required JSON.
 
@@ -1002,9 +1032,9 @@ LOCKED EVIDENCE:
 
 def _generate_article(evidence, source_context=None):
     fact_count = len(evidence.get("facts", [])) if isinstance(evidence, dict) else 0
-    # Give richer evidence a materially larger output budget.
-    # The deterministic minimum below prevents extreme compression after generation.
-    dynamic_tokens = max(ARTICLE_TOKENS, min(1800, 520 + fact_count * 120))
+    # Give richer evidence a larger output capacity without imposing a word target.
+    # This is only a generation ceiling; article length remains evidence-driven.
+    dynamic_tokens = max(ARTICLE_TOKENS, min(2200, 700 + fact_count * 180))
     article = _call(
         _article_prompt(evidence, source_context=source_context),
         temperature=0.04,
@@ -1027,6 +1057,7 @@ _AUDIT_FORMAT = {
     "type": "object",
     "properties": {
         "passed": {"type": "boolean"},
+        "covered_fact_ids": {"type": "array", "items": {"type": "string"}},
         "errors": {
             "type": "array",
             "items": {
@@ -1035,21 +1066,13 @@ _AUDIT_FORMAT = {
                     "severity": {"type": "string"},
                     "claim": {"type": "string"},
                     "reason": {"type": "string"},
-                    "evidence_ids": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
+                    "evidence_ids": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": [
-                    "severity",
-                    "claim",
-                    "reason",
-                    "evidence_ids",
-                ],
+                "required": ["severity", "claim", "reason", "evidence_ids"],
             },
         },
     },
-    "required": ["passed", "errors"],
+    "required": ["passed", "covered_fact_ids", "errors"],
 }
 
 
@@ -1071,20 +1094,28 @@ Flag only material factual problems:
 - mixing a separate event
 - materially incomplete coverage: a relevant, non-redundant locked fact is omitted
 
-COVERAGE RULE:
-- Treat the LOCKED EVIDENCE facts as the complete verified evidence inventory for this article.
-- The article does not need to repeat every fact verbatim, but every materially relevant, non-redundant fact should be represented in the article.
-- If a locked fact is genuinely relevant to the selected event and is absent from the article, report it as a HIGH error with type "omitted_relevant_fact".
-- Do not flag a fact that is redundant with another covered fact or not useful to the reader.
+COVERAGE RULE — STRICT FACT INVENTORY:
+- LOCKED EVIDENCE is the complete verified factual inventory for this article.
+- Evaluate EVERY locked fact against the article body.
+- Assume every locked fact is relevant unless it is an exact duplicate or clearly unrelated.
+- A fact counts as covered only when the article explicitly communicates that fact or a faithful paraphrase.
+- Do NOT count a vague summary as covering multiple distinct facts.
+- Return covered_fact_ids containing EVERY locked fact explicitly represented in the body.
+- If any non-duplicate locked fact is missing, the audit MUST fail with a HIGH omitted_relevant_fact error.
+- A rich evidence set must produce a correspondingly information-dense article.
+- This is an evidence-coverage rule, NOT a word-count rule.
+- STRUCTURE: for 3-6 locked facts, the article body must contain at least the same number of substantive paragraphs as locked facts.
+- A 3+ fact article compressed into fewer paragraphs is a structural FAIL even if the model claims all facts are covered.
+
 
 Do NOT require identical wording.
 Do NOT use outside knowledge.
 Do NOT flag harmless wording differences.
 
 Return JSON:
-{{"passed":true,"errors":[]}}
+{{"passed":true,"covered_fact_ids":["F1","F2"],"errors":[]}}
 or
-{{"passed":false,"errors":[{{"severity":"","claim":"","reason":"","evidence_ids":["F1"]}}]}}
+{{"passed":false,"covered_fact_ids":["F1"],"errors":[{{"severity":"HIGH","claim":"","reason":"","evidence_ids":["F2"]}}]}}
 
 LOCKED EVIDENCE:
 {_compact(evidence)}
@@ -1108,9 +1139,25 @@ def _audit(article, evidence):
 
     passed = bool(result.get("passed", False))
     errors = result.get("errors", [])
+    covered_fact_ids = result.get("covered_fact_ids", [])
+    if not isinstance(covered_fact_ids, list):
+        covered_fact_ids = []
 
-    if not isinstance(errors, list):
-        errors = []
+    valid_fact_ids = {
+        str(f.get("id", "")).strip()
+        for f in (evidence.get("facts", []) if isinstance(evidence, dict) else [])
+        if isinstance(f, dict) and str(f.get("id", "")).strip()
+    }
+
+    raw_covered = {str(x).strip() for x in covered_fact_ids if str(x).strip()}
+    invalid_covered_ids = sorted(
+        raw_covered - valid_fact_ids,
+        key=lambda x: int(x[1:]) if x[1:].isdigit() else 999999,
+    )
+    covered_fact_ids = sorted(
+        raw_covered & valid_fact_ids,
+        key=lambda x: int(x[1:]) if x[1:].isdigit() else 999999,
+    )
 
     clean = []
     for error in errors:
@@ -1136,13 +1183,55 @@ def _audit(article, evidence):
             "claim": claim,
             "reason": reason,
             "evidence_ids": [
-                str(x) for x in ids if str(x).strip()
+                str(x).strip()
+                for x in ids
+                if str(x).strip() in valid_fact_ids
             ],
         })
 
+    covered_set = set(covered_fact_ids)
+    missing_ids = [
+        fid for fid in sorted(valid_fact_ids, key=lambda x: int(x[1:]) if x[1:].isdigit() else 999999)
+        if fid not in covered_set
+    ]
+
+    # Deterministic evidence-coverage backstop. This is deliberately not a word floor.
+    # Invalid IDs are also a hard audit failure: the auditor must never be allowed
+    # to claim coverage for evidence that does not exist in this lock.
+    if invalid_covered_ids:
+        clean.append({
+            "severity": "HIGH",
+            "claim": f"Auditor returned invalid covered fact IDs: {', '.join(invalid_covered_ids)}.",
+            "reason": "covered_fact_ids must contain only fact IDs present in LOCKED EVIDENCE.",
+            "evidence_ids": [],
+        })
+
+    for fid in missing_ids:
+        clean.append({
+            "severity": "HIGH",
+            "claim": f"Locked fact {fid} is not represented in the article.",
+            "reason": "A non-duplicate locked fact is missing from the article body.",
+            "evidence_ids": [fid],
+        })
+
+    structure = _article_structure_check(article, evidence)
+    if not structure["passed"]:
+        clean.append({
+            "severity": "HIGH",
+            "claim": "Article body is structurally too compressed for its locked evidence.",
+            "reason": (
+                f"Required at least {structure['required_paragraphs']} substantive paragraphs "
+                f"for {structure.get('fact_count', len(valid_fact_ids))} locked facts, "
+                f"but received {structure['actual_paragraphs']}."
+            ),
+            "evidence_ids": sorted(valid_fact_ids, key=lambda x: int(x[1:]) if x[1:].isdigit() else 999999),
+        })
+
     return {
-        "passed": passed and not clean,
+        "passed": passed and not clean and not missing_ids and structure["passed"],
+        "covered_fact_ids": covered_fact_ids,
         "errors": clean,
+        "structure": structure,
     }
 
 
@@ -1154,20 +1243,36 @@ _REPAIR_FORMAT = _ARTICLE_FORMAT
 
 
 def _repair(article, evidence, audit):
+    fact_count = len(evidence.get("facts", [])) if isinstance(evidence, dict) else 0
+    # Repair must have enough headroom to rebuild a rich evidence-backed article.
+    # This is a generation ceiling only; it is NOT a minimum word target.
+    dynamic_tokens = max(
+        REPAIR_TOKENS,
+        min(2600, 800 + fact_count * 220),
+    )
+
     return _call(
         f"""
-Repair this article using ONLY the LOCKED EVIDENCE and AUDIT.
+REPAIR THE ARTICLE FOR COMPLETE EVIDENCE COVERAGE.
+
+Use ONLY the LOCKED EVIDENCE. The AUDIT identifies factual problems and/or locked facts
+that the article failed to cover.
 
 Rules:
-- Fix only the listed factual problems.
-- For omitted_relevant_fact issues, add the missing fact using ONLY the cited LOCKED EVIDENCE.
-- Delete unsupported material instead of inventing a replacement.
-- If an entity attribute conflicts with LOCKED EVIDENCE, delete the incorrect attribute or
-  replace it only with the exact supported attribute from LOCKED EVIDENCE.
-- Preserve supported material.
-- Do not add new facts.
-- Do not change dates, numbers, roles, status or certainty except to correct a listed
-  contradiction using the exact LOCKED EVIDENCE.
+- Produce a complete, publication-ready article, not a tiny patch.
+- Preserve supported material that remains useful.
+- Integrate EVERY non-duplicate locked fact identified by the audit as omitted.
+- Each added fact must be explicit and faithful to the LOCKED EVIDENCE.
+- Organize the facts into a coherent progression around ONE concrete story.
+- Give distinct facts enough sentence-level treatment to remain informative.
+- HARD STRUCTURE: for 3-6 locked facts, return at least the same number of substantive paragraphs as locked facts.
+- Do not compress multiple omitted facts into one summary paragraph.
+- For 3-4 locked facts, use at least 3-4 substantive paragraphs.
+- For 5-6 locked facts, normally use 4-6 substantive paragraphs when supported.
+- For 7+ locked facts, use enough substantive paragraphs to expose the useful evidence.
+- Do not add generic background, filler, speculation or outside knowledge.
+- Delete unsupported material rather than inventing a replacement.
+- Correct dates, numbers, roles, status or certainty only from LOCKED EVIDENCE.
 - Do not create quotes or attribution.
 - Keep the article in {LANGUAGE}.
 - Return only the article JSON.
@@ -1182,7 +1287,7 @@ ARTICLE:
 {_compact(article)}
 """,
         temperature=0.0,
-        num_predict=REPAIR_TOKENS,
+        num_predict=dynamic_tokens,
         num_thread=NUM_THREADS,
         response_format=_REPAIR_FORMAT,
     )
@@ -1217,9 +1322,13 @@ def _sanitize_article(article):
 def _audit_or_raise(article, evidence, label):
     audit = _audit(article, evidence)
 
+    total_facts = len(evidence.get("facts", [])) if isinstance(evidence, dict) else 0
+    covered_facts = len(audit.get("covered_fact_ids", []))
     print(
         f"[PIPELINE] {label}: "
         f"{'PASS' if audit['passed'] else 'FAIL'}"
+        f" | evidence_facts={total_facts}"
+        f" | covered_facts={covered_facts}"
     )
 
     if not audit["passed"]:
@@ -1246,6 +1355,24 @@ def extract_evidence(source):
 def evidence_min_words(evidence):
     """Compatibility wrapper: there is intentionally no body-word floor."""
     return 0
+
+
+def validate_article_structure(article, evidence, label="Article structure"):
+    """Public fail-closed evidence-driven paragraph structure check."""
+    result = _article_structure_check(article, evidence)
+    print(
+        f"[STRUCTURE] {label} | "
+        f"{'PASS' if result['passed'] else 'FAIL'} | "
+        f"required_paragraphs={result['required_paragraphs']} | "
+        f"actual_paragraphs={result['actual_paragraphs']} | "
+        f"facts={result.get('fact_count', len(evidence.get('facts', [])) if isinstance(evidence, dict) else 0)}"
+    )
+    if not result["passed"]:
+        raise ValueError(
+            f"Article structure failed: required {result['required_paragraphs']} substantive "
+            f"paragraphs, got {result['actual_paragraphs']}"
+        )
+    return result
 
 
 def generate(prompt, retries=0, evidence=None):
