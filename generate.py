@@ -6,10 +6,11 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-print("[TrendCurrent PIPELINE] universal-fact-lock-v2.4-evidence-gate")
+print("[TrendCurrent PIPELINE] universal-fact-lock-v2.7.0-source-independence-fact-lineage-substantive-value")
 
 import re
 import os
+import difflib
 import subprocess
 from datetime import date
 
@@ -17,7 +18,7 @@ from config import MAX_ARTICLES_PER_RUN, LANGUAGE
 from rss import fetch_trends
 from news import fetch_news, extract_article
 from prompt import build_prompt
-from ollama_client import generate, extract_evidence, validate_article_structure
+from ollama_client import generate, extract_evidence, validate_article_structure, substantive_story_value_gate
 from ollama import chat
 from config import MODEL
 from fact_guard import validate as fact_guard_validate
@@ -582,11 +583,187 @@ SOURCE HEADLINES:
 SEMANTIC_RESCUE_MIN_CONFIDENCE = 90
 
 
+def _source_independence_text(item):
+    """Return publisher text used only for conservative syndication detection."""
+    if not isinstance(item, dict):
+        return ""
+    title = str(item.get("title", "") or "").strip()
+    summary = str(item.get("summary", "") or "").strip()
+    content = str(item.get("content", "") or "").strip()
+    # Keep the publisher body as the primary signal. RSS summary is useful when
+    # extraction is short, but should never dominate a long article body.
+    body = content if len(content) >= 500 else summary
+    text = " ".join([title, summary, body]).strip()
+    text = unicodedata.normalize("NFKC", text).casefold()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _source_shingles(text, size=5):
+    """Conservative word shingles; useful for detecting copied/syndicated text."""
+    words = re.findall(r"[a-z0-9À-ÿ']+", unicodedata.normalize("NFKD", text))
+    if len(words) < size:
+        return set()
+    return {" ".join(words[i:i + size]) for i in range(len(words) - size + 1)}
+
+
+def _source_pair_similarity(a, b):
+    """
+    Return deterministic similarity signals for source independence.
+
+    This is intentionally much stricter than Story Concentration:
+    two sources reporting the same event are NOT duplicates merely because they
+    share entities, dates, names or a few facts. We require substantial textual
+    overlap before treating one as a syndicated/reprinted copy.
+    """
+    ta = _source_independence_text(a)
+    tb = _source_independence_text(b)
+    if not ta or not tb:
+        return 0.0, 0.0, 0.0
+
+    title_a = " ".join(str(a.get("title", "") or "").split()).casefold()
+    title_b = " ".join(str(b.get("title", "") or "").split()).casefold()
+    title_ratio = difflib.SequenceMatcher(None, title_a, title_b).ratio()
+
+    sa = _source_shingles(ta)
+    sb = _source_shingles(tb)
+    shingle_jaccard = (
+        len(sa & sb) / len(sa | sb)
+        if sa and sb else 0.0
+    )
+
+    # Character-level similarity is a secondary safety signal. It is useful for
+    # small rewrites but cannot independently trigger deduplication.
+    char_ratio = difflib.SequenceMatcher(
+        None,
+        ta[:6000],
+        tb[:6000],
+    ).ratio()
+
+    return title_ratio, shingle_jaccard, char_ratio
+
+
+def _deduplicate_syndicated_sources(news):
+    """
+    Collapse only high-confidence syndicated/reprinted copies.
+
+    Critical distinction:
+      6 sources about one event != 6 independent sources.
+      6 copies of one report = 1 independent source family.
+
+    Independent reporting is preserved unless there is strong textual evidence
+    that two publisher articles are substantially the same underlying copy.
+    This layer is language-agnostic at the pipeline level and deliberately does
+    not use source-name allow/deny lists.
+    """
+    items = list(news or [])
+    n = len(items)
+    if n < 2:
+        return {
+            "items": items,
+            "kept_indices": list(range(n)),
+            "duplicate_indices": [],
+            "families": [[i] for i in range(n)],
+        }
+
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    pair_debug = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            title_ratio, shingle_jaccard, char_ratio = _source_pair_similarity(items[i], items[j])
+
+            # Very high title + body overlap is strong evidence of a copied story.
+            # Body shingle overlap is the principal signal because independent
+            # reporting of the same event normally uses materially different prose.
+            high_copy = (
+                shingle_jaccard >= 0.62
+                and char_ratio >= 0.72
+            )
+            near_verbatim = (
+                shingle_jaccard >= 0.48
+                and char_ratio >= 0.82
+                and title_ratio >= 0.72
+            )
+            short_copy = (
+                title_ratio >= 0.88
+                and shingle_jaccard >= 0.38
+                and char_ratio >= 0.78
+            )
+
+            if high_copy or near_verbatim or short_copy:
+                union(i, j)
+                pair_debug.append({
+                    "pair": [i, j],
+                    "title": round(title_ratio, 3),
+                    "shingle": round(shingle_jaccard, 3),
+                    "char": round(char_ratio, 3),
+                })
+
+    families = {}
+    for idx in range(n):
+        families.setdefault(find(idx), []).append(idx)
+    families = [sorted(v) for v in families.values()]
+    families.sort(key=lambda family: family[0])
+
+    duplicate_indices = []
+    kept_indices = []
+    for family in families:
+        # Preserve the first source. The discovery seed is intentionally inserted
+        # first, so the concrete fresh story is never displaced by a later copy.
+        kept_indices.append(family[0])
+        duplicate_indices.extend(family[1:])
+
+    print(
+        f"[SOURCE INDEPENDENCE] input={n} | "
+        f"independent_families={len(families)} | "
+        f"duplicates_removed={len(duplicate_indices)}"
+    )
+    if duplicate_indices:
+        print(
+            f"[SOURCE INDEPENDENCE] duplicate_indices="
+            f"{','.join(str(i + 1) for i in duplicate_indices)}"
+        )
+        for pair in pair_debug[:12]:
+            print(
+                f"[SOURCE INDEPENDENCE] pair={pair['pair'][0] + 1},{pair['pair'][1] + 1} "
+                f"title={pair['title']:.3f} shingle={pair['shingle']:.3f} "
+                f"char={pair['char']:.3f}"
+            )
+
+    return {
+        "items": [items[i] for i in kept_indices],
+        "kept_indices": kept_indices,
+        "duplicate_indices": duplicate_indices,
+        "families": families,
+        "pair_debug": pair_debug,
+    }
+
+
 def _decide_story_sources(news, topic):
     """Single authority for choosing the exact sources used by evidence extraction."""
-    items = list(news or [])
+    original_items = list(news or [])
+    independence = _deduplicate_syndicated_sources(original_items)
+    items = list(independence["items"])
     profile = _story_pool_profile(items, topic)
     count = profile["count"]
+
+    print(
+        f"[TOPIC FILTER] SOURCE INDEPENDENCE | "
+        f"input={len(original_items)} | independent={count} | "
+        f"duplicates_removed={len(independence.get('duplicate_indices', []))}"
+    )
 
     print(
         f"[TOPIC FILTER] STORY SOURCE DECISION | lexical={profile['status']} "
@@ -741,30 +918,53 @@ def _decide_story_sources(news, topic):
     if not selected_indices:
         raise Exception("Story source decision produced an empty evidence source set")
 
+    # The internal story/independence calculations use the filtered independent
+    # pool, but callers still hold the original `news` list. Map indices back to
+    # that original list before returning, so evidence extraction receives the
+    # exact intended publisher records and no duplicate can silently re-enter.
+    selected_original_indices = [
+        independence["kept_indices"][i]
+        for i in selected_indices
+        if 0 <= i < len(independence.get("kept_indices", []))
+    ]
+    selected_original_indices = sorted(dict.fromkeys(selected_original_indices))
+    if not selected_original_indices:
+        raise Exception("Story source decision produced no original source indices")
+
     print(
         f"[TOPIC FILTER] STORY SOURCE DECISION PASS | "
-        f"kept={len(selected_indices)}/{count} | reason={reason} | semantic={semantic_status}"
+        f"kept={len(selected_indices)}/{count} independent | "
+        f"original_kept={len(selected_original_indices)}/{len(original_items)} | "
+        f"reason={reason} | semantic={semantic_status}"
     )
     monitor.candidate_event(
         "story_source_selection",
         status=status,
         reason=reason,
-        source_count=count,
-        selected_indices=selected_indices,
-        selected_count=len(selected_indices),
+        source_count=len(original_items),
+        selected_indices=selected_original_indices,
+        selected_count=len(selected_original_indices),
         semantic_status=semantic_status,
         profile=profile,
+        original_source_count=len(original_items),
+        independent_source_count=count,
+        duplicates_removed=len(independence.get("duplicate_indices", [])),
+        independence_families=independence.get("families", []),
     )
-    for idx in selected_indices:
-        print(f"[TOPIC FILTER] Evidence source -> {str(items[idx].get('title', '')).strip()}")
+    for idx in selected_original_indices:
+        print(f"[TOPIC FILTER] Evidence source -> {str(original_items[idx].get('title', '')).strip()}")
 
     return {
         "status": status,
         "reason": reason,
-        "count": count,
-        "selected_indices": selected_indices,
-        "selected_count": len(selected_indices),
+        "count": len(original_items),
+        "selected_indices": selected_original_indices,
+        "selected_count": len(selected_original_indices),
         "semantic_status": semantic_status,
+        "original_source_count": len(original_items),
+        "independent_source_count": count,
+        "duplicates_removed": len(independence.get("duplicate_indices", [])),
+        "independence_families": independence.get("families", []),
     }
 
 
@@ -1170,406 +1370,6 @@ def validate_article(article):
 
 
 # ============================================================
-# FINAL ARTICLE STORY QUALITY GATE
-# ============================================================
-# This is an editorial gate, not a factuality gate.
-# Fact Guard answers: "Are the claims supported?"
-# Story Quality Gate answers: "Is this ONE coherent news story?"
-#
-# IMPORTANT:
-# - Short but clean articles PASS.
-# - Relevant context around the main event is allowed.
-# - Roundups, mixed stories, generic topic digests and unrelated
-#   second stories are REJECTED.
-# - BORDERLINE is treated as a production rejection. We never spend
-#   downstream resources (including image generation) on an uncertain article.
-# - PASS also requires minimum editorial confidence; a low-confidence PASS
-#   is converted to BORDERLINE.
-#
-# This gate deliberately runs AFTER generate_valid_article() and BEFORE
-# save_article(), so an article cannot become a production success until
-# it passes both factual and editorial validation.
-STORY_QUALITY_THREADS = max(1, int(os.getenv("STORY_QUALITY_THREADS", "16")))
-STORY_QUALITY_CTX = max(4096, int(os.getenv("STORY_QUALITY_CTX", "8192")))
-STORY_QUALITY_BATCH = max(64, int(os.getenv("STORY_QUALITY_BATCH", "256")))
-STORY_QUALITY_TOKENS = max(128, int(os.getenv("STORY_QUALITY_TOKENS", "256")))
-STORY_QUALITY_MIN_PASS_CONFIDENCE = max(
-    0,
-    min(100, int(os.getenv("STORY_QUALITY_MIN_PASS_CONFIDENCE", "70"))),
-)
-
-
-def _story_quality_text(article):
-    paragraphs = article.get("paragraphs", [])
-    if not isinstance(paragraphs, list):
-        return ""
-    return "\n\n".join(
-        str(p).strip() for p in paragraphs if str(p).strip()
-    )
-
-
-def _story_quality_evidence_summary(evidence):
-    """Keep the quality-gate context compact while preserving story identity."""
-    if not isinstance(evidence, dict):
-        return ""
-
-    facts = evidence.get("facts", [])
-    if not isinstance(facts, list):
-        facts = []
-
-    lines = []
-    for idx, fact in enumerate(facts[:12], 1):
-        if isinstance(fact, dict):
-            # Evidence schemas can evolve; keep only useful semantic fields.
-            parts = []
-            for key in ("fact", "claim", "statement", "text", "event", "entity"):
-                value = str(fact.get(key, "")).strip()
-                if value:
-                    parts.append(value)
-            if parts:
-                lines.append(f"FACT {idx}: " + " | ".join(dict.fromkeys(parts)))
-        elif str(fact).strip():
-            lines.append(f"FACT {idx}: {str(fact).strip()}")
-
-    if not lines:
-        return "No structured locked facts were available."
-
-    return "\n".join(lines)
-
-
-def _story_quality_source_titles(trend):
-    titles = []
-    for item in trend.get("news", []) or []:
-        title = str(item.get("title", "")).strip()
-        if title:
-            titles.append(title)
-        if len(titles) >= 8:
-            break
-    return "\n".join(f"- {title}" for title in titles) or "- No source headlines available."
-
-
-def _deterministic_story_quality_flags(article):
-    """
-    Conservative local red flags for obvious roundup/list behavior.
-
-    These are NOT used as automatic rejection rules because normal news
-    language can contain similar words. They are passed to the editorial
-    model as warning signals so the model can make the final decision.
-    """
-    text = _story_quality_text(article).casefold()
-    flags = []
-
-    roundup_patterns = [
-        # English
-        r"\bother (?:major|key|notable|important) (?:news|stories|developments)\b",
-        r"\bother stories\b",
-        r"\bhere are (?:the|some) (?:latest|top|key|major)\b",
-        r"\bmeanwhile\b",
-        r"\bin other news\b",
-        r"\balso in (?:sports|business|technology|entertainment|news)\b",
-        r"\bseveral (?:other|major|key) (?:events|developments|stories)\b",
-        r"\btop \d+\b",
-        r"\b\d+ things to know\b",
-        r"\bwhat you need to know\b",
-
-        # Indonesian
-        r"\bberita (?:lain|terkini|utama)\b",
-        r"\bberita lainnya\b",
-        r"\bsementara itu\b",
-        r"\bdi sisi lain\b",
-        r"\bselain itu\b",
-        r"\bbeberapa (?:berita|peristiwa|perkembangan)\b",
-        r"\bberikut (?:berita|hal|informasi)\b",
-        r"\b\d+ hal yang perlu diketahui\b",
-        r"\bapa yang perlu diketahui\b",
-
-        # Spanish
-        r"\botras (?:noticias|historias|novedades)\b",
-        r"\bmientras tanto\b",
-        r"\bpor otro lado\b",
-        r"\ben otras noticias\b",
-        r"\bvarias (?:noticias|historias|novedades)\b",
-        r"\b\d+ cosas que debes saber\b",
-
-        # French
-        r"\bd'autres (?:actualités|nouvelles|informations)\b",
-        r"\bpendant ce temps\b",
-        r"\bdans d'autres actualités\b",
-        r"\bplusieurs (?:actualités|nouvelles|événements)\b",
-        r"\bà savoir\b",
-
-        # German
-        r"\bweitere (?:nachrichten|meldungen|entwicklungen)\b",
-        r"\bindessen\b",
-        r"\bin anderen nachrichten\b",
-        r"\bmehrere (?:nachrichten|ereignisse|entwicklungen)\b",
-        r"\bwas sie wissen müssen\b",
-
-        # Italian
-        r"\baltre (?:notizie|storie|novità)\b",
-        r"\bnel frattempo\b",
-        r"\bin altre notizie\b",
-        r"\bdiverse (?:notizie|storie|novità)\b",
-        r"\bcose da sapere\b",
-
-        # Portuguese
-        r"\boutros (?:notícias|casos|acontecimentos)\b",
-        r"\benquanto isso\b",
-        r"\bem outras notícias\b",
-        r"\bvárias (?:notícias|histórias|atualizações)\b",
-        r"\bo que você precisa saber\b",
-    ]
-
-    for pattern in roundup_patterns:
-        if re.search(pattern, text, flags=re.IGNORECASE):
-            flags.append(pattern)
-
-    # Repeated topic shifts are a useful warning, but not a hard rule.
-    transition_hits = len(re.findall(
-        r"\b(?:"
-        r"meanwhile|separately|in a separate development|elsewhere|on another front|"
-        r"sementara itu|di sisi lain|selain itu|"
-        r"mientras tanto|por otro lado|"
-        r"pendant ce temps|d'un autre côté|"
-        r"indessen|andererseits|"
-        r"nel frattempo|d'altra parte|"
-        r"enquanto isso|por outro lado"
-        r")\b",
-        text,
-        flags=re.IGNORECASE,
-    ))
-    if transition_hits >= 2:
-        flags.append(f"multiple_story_transition_markers:{transition_hits}")
-
-    return flags
-
-
-def story_quality_gate(article, trend):
-    """
-    Final editorial quality decision for the generated article.
-
-    Returns the article only on PASS. REMOVE and BORDERLINE raise an
-    exception, preventing save_article() and therefore preventing any
-    downstream image generation for the rejected candidate.
-    """
-    validate_article(article)
-
-    topic = str(trend.get("title", "")).strip()
-    article_title = str(article.get("title", "")).strip()
-    article_description = str(article.get("description", "")).strip()
-    article_h1 = str(article.get("h1", "")).strip()
-    article_body = _story_quality_text(article)
-    evidence = trend.get("_evidence_lock", {})
-
-    local_flags = _deterministic_story_quality_flags(article)
-    local_flag_text = (
-        "\n".join(f"- {flag}" for flag in local_flags)
-        if local_flags
-        else "- None detected"
-    )
-
-    prompt = f"""
-You are the FINAL EDITORIAL STORY QUALITY GATE for a professional {LANGUAGE} news site.
-
-Your task is NOT to fact-check the article and NOT to improve or rewrite it.
-Fact Guard has already handled factual validation.
-
-Your ONLY job is to determine whether the generated article is ONE clearly
-recognizable, coherent news story suitable for publication as a single article.
-
-MAIN SELECTED TOPIC:
-{topic}
-
-ARTICLE TITLE:
-{article_title}
-
-ARTICLE H1:
-{article_h1}
-
-ARTICLE DESCRIPTION:
-{article_description}
-
-GENERATED ARTICLE BODY:
-{article_body}
-
-LOCKED EVIDENCE / STORY FACTS:
-{_story_quality_evidence_summary(evidence)}
-
-SOURCE HEADLINES FOR CONTEXT ONLY:
-{_story_quality_source_titles(trend)}
-
-DETERMINISTIC WARNING SIGNALS:
-{local_flag_text}
-
-EDITORIAL STANDARD:
-
-PASS when:
-- The article clearly centers on ONE identifiable event, development, person,
-  decision, announcement, incident, match, transfer, release, or other single
-  news story.
-- Every paragraph materially belongs to that same story.
-- Each paragraph should add meaningful verified information, such as a new fact,
-  consequence, reaction, development, timing detail, or necessary context.
-- Relevant background/context about the same story is allowed when it adds useful
-  information rather than merely restating the main event.
-- A short article is completely acceptable if its paragraphs contain distinct,
-  useful information and it cleanly covers one story.
-- A small amount of closely related context does NOT make it a roundup.
-- A second paragraph can explain consequences, reactions, history or context
-  when those details are directly connected to the same main story and add new
-  information.
-
-REMOVE when:
-- It is a roundup or digest of multiple independent news stories.
-- It combines several unrelated people, events, topics, announcements or
-  developments under one article.
-- It is a finance/investment roundup rather than one specific financial story.
-- It is a sports roundup rather than one specific sports story.
-- It is a generic "latest news" / "AI news" / topic roundup containing
-  unrelated developments.
-- It begins with one story but then changes into a different independent story.
-- It contains a list of separate stories disguised as one article.
-- The article's identity is broad enough that there is no single central event
-  or development.
-- Multiple paragraphs substantially repeat the same factual information without
-  adding meaningful new information. This is a quality failure even when every
-  sentence is factually supported and the article concerns only one story.
-- The body repeatedly rephrases the same event, outcome, injury, decision, or
-  consequence instead of progressing through distinct verified facts.
-
-BORDERLINE when:
-- It is genuinely unclear whether the article is one story or multiple stories.
-- The article has a central story but a substantial portion shifts into
-  independent developments that cannot reasonably be treated as context.
-- One or more paragraphs may be unnecessarily repetitive, but the repetition is
-  limited enough that a confident REMOVE decision is not justified.
-- The editorial decision itself is low-confidence.
-
-IMPORTANT:
-- DO NOT reject an article merely because it is short.
-- DO NOT reject an article merely because it has multiple paragraphs.
-- DO NOT reject relevant consequences, reactions, background or context when they
-  add meaningful new information.
-- DO NOT use article length, source count or raw number of facts as the decision.
-- Judge both STORY IDENTITY/COHERENCE and INFORMATION DENSITY.
-- For information density, compare paragraphs against each other and against the
-  locked facts: ask whether each paragraph contributes something materially new.
-- A sentence can be individually factual yet still be editorially redundant if it
-  only restates a fact already communicated without adding useful information.
-- Do not infer missing facts or demand details that are absent from the evidence.
-- Do not demand that every available fact be used. A concise article may omit facts
-  when they are unnecessary, but the facts it does use should not be needlessly
-  repeated.
-- A factual roundup is still REMOVE.
-- A concise single-story article with distinct useful information is PASS.
-
-DECISION PRIORITY:
-1. Is there one unmistakable central story?
-2. Do the paragraphs remain about that story?
-3. Does each paragraph materially advance the article with new verified information
-   or necessary context?
-4. Is any repetition substantial enough to make the article feel padded or
-   materially less informative?
-5. Only then consider whether there is a clear reason for REMOVE/BORDERLINE.
-
-Return ONLY valid JSON:
-{{
-  "verdict": "PASS",
-  "confidence": 0,
-  "reason": ""
-}}
-
-Allowed verdict values: PASS, REMOVE, BORDERLINE.
-confidence must be an integer from 0 to 100.
-reason must be a concise editorial explanation, maximum 35 words.
-"""
-
-    print("[STORY QUALITY] Checking final article...")
-
-    response = chat(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        options={
-            "temperature": 0.0,
-            "top_p": 0.85,
-            "top_k": 40,
-            "num_ctx": STORY_QUALITY_CTX,
-            "num_predict": STORY_QUALITY_TOKENS,
-            "num_batch": STORY_QUALITY_BATCH,
-            "num_thread": STORY_QUALITY_THREADS,
-        },
-        format={
-            "type": "object",
-            "properties": {
-                "verdict": {
-                    "type": "string",
-                    "enum": ["PASS", "REMOVE", "BORDERLINE"],
-                },
-                "confidence": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 100,
-                },
-                "reason": {"type": "string"},
-            },
-            "required": ["verdict", "confidence", "reason"],
-        },
-    )
-
-    raw = response.message.content or ""
-    try:
-        result = json.loads(raw)
-    except Exception as exc:
-        raise Exception(f"Story Quality Gate returned invalid JSON: {exc}") from exc
-
-    if not isinstance(result, dict):
-        raise Exception("Story Quality Gate did not return a JSON object")
-
-    verdict = str(result.get("verdict", "")).strip().upper()
-    try:
-        confidence = int(result.get("confidence", 0))
-    except (TypeError, ValueError):
-        confidence = 0
-    reason = " ".join(str(result.get("reason", "")).split()).strip()
-
-    if verdict not in {"PASS", "REMOVE", "BORDERLINE"}:
-        raise Exception(f"Story Quality Gate returned invalid verdict: {verdict!r}")
-
-    confidence = max(0, min(100, confidence))
-
-    # A PASS with low confidence is not safe enough for production.
-    # Treat it as BORDERLINE so uncertain articles never reach persistence
-    # or any downstream image-generation pipeline.
-    if verdict == "PASS" and confidence < STORY_QUALITY_MIN_PASS_CONFIDENCE:
-        verdict = "BORDERLINE"
-        reason = (
-            f"Low editorial confidence ({confidence} < "
-            f"{STORY_QUALITY_MIN_PASS_CONFIDENCE})"
-            + (f": {reason}" if reason else "")
-        )
-
-    print(
-        f"[STORY QUALITY] {verdict} | confidence={confidence} "
-        f"| {reason or 'No reason supplied'}"
-    )
-    monitor.candidate_event(
-        "story_quality",
-        verdict=verdict,
-        confidence=confidence,
-        reason=reason,
-        local_flags=local_flags,
-    )
-
-    if verdict != "PASS":
-        raise Exception(
-            f"Story Quality Gate {verdict.lower()} "
-            f"(confidence={confidence}): {reason or 'article is not one coherent story'}"
-        )
-
-    return article
-
-
-
 def _enrich_evidence_for_generation(evidence, trend):
     """
     Add deterministic topic context to the already locked evidence.
@@ -1787,7 +1587,7 @@ def git_push():
 
 
 def main():
-    monitor.start_run(language=LANGUAGE, model=MODEL, pipeline="universal-fact-lock-v2.4-evidence-gate", max_articles=MAX_ARTICLES_PER_RUN)
+    monitor.start_run(language=LANGUAGE, model=MODEL, pipeline="universal-fact-lock-v2.7.0-source-independence-fact-lineage-substantive-value", max_articles=MAX_ARTICLES_PER_RUN)
     processed = load_processed()
     trends = fetch_trends()
     print(f"[TOPIC FILTER] Raw trends received: {len(trends)}")
@@ -1988,6 +1788,9 @@ def main():
                 )
                 continue
 
+            # Story Source Decision returns indices mapped back to the original
+            # news list, so the exact independent source selection flows unchanged
+            # into scoring, evidence extraction and Fact Guard.
             trend["news"] = news
             topic_final = score_with_news(trend, news)
             trend["_topic_final"] = topic_final
@@ -2059,7 +1862,7 @@ def main():
                 # Evidence extraction itself is required to know whether the
                 # story is sufficiently supported. Once extraction returns,
                 # however, there is no value in invoking article generation,
-                # factual audit, headline repair, Fact Guard, or Story Quality
+                # factual audit, headline repair, or Fact Guard
                 # for a candidate with only 0-2 locked facts.
                 #
                 # This is intentionally a fact-count gate, not a word-count
@@ -2114,6 +1917,51 @@ def main():
                         ),
                     )
                     continue
+
+                # --------------------------------------------------------
+                # SUBSTANTIVE STORY VALUE GATE
+                # --------------------------------------------------------
+                # Evidence sufficiency answers "Do we have enough facts?"
+                # This separate gate answers "Do those facts describe a
+                # concrete, useful news development worth publishing?"
+                # It runs BEFORE article generation so technically valid but
+                # substantively empty candidates never consume the expensive
+                # writer/audit/repair pipeline.
+                print(
+                    f"[TOPIC FILTER] SUBSTANTIVE STORY VALUE CHECK | {keyword}"
+                )
+                try:
+                    substantive_story_value_gate(evidence_lock)
+                except Exception as substantive_error:
+                    trend["_production_status"] = "REJECT"
+                    trend["_production_reject_reason"] = str(substantive_error)
+                    monitor.candidate_event(
+                        "substantive_story_value",
+                        status="REJECT",
+                        reason=str(substantive_error),
+                        news_count=len(news),
+                        selected_source_indices=(story_selection or {}).get("selected_indices", []),
+                        selected_source_count=(story_selection or {}).get("selected_count"),
+                        evidence_source_chars=len(evidence_source),
+                        evidence_facts=locked_facts,
+                        evidence_fact_count=evidence_fact_count,
+                    )
+                    monitor.finish_candidate(
+                        "REJECT",
+                        reason=f"substantive_value={substantive_error}",
+                    )
+                    continue
+
+                monitor.candidate_event(
+                    "substantive_story_value",
+                    status="PASS",
+                    news_count=len(news),
+                    selected_source_indices=(story_selection or {}).get("selected_indices", []),
+                    selected_source_count=(story_selection or {}).get("selected_count"),
+                    evidence_source_chars=len(evidence_source),
+                    evidence_facts=locked_facts,
+                    evidence_fact_count=evidence_fact_count,
+                )
 
                 evidence_lock = _enrich_evidence_for_generation(
                     evidence_lock,
@@ -2170,15 +2018,6 @@ def main():
                 information_density=None,
             )
 
-            # --------------------------------------------------------
-            # FINAL ARTICLE STORY QUALITY GATE
-            # --------------------------------------------------------
-            # This is intentionally the last gate before persistence.
-            # If the article is a roundup, mixed story, generic topic digest,
-            # or otherwise editorially incoherent, it consumes ZERO production
-            # article slots and NEVER reaches save_article() / image generation.
-            article = story_quality_gate(article, trend)
-
             slug = slugify(keyword)
             article["slug"] = slug
 
@@ -2194,7 +2033,7 @@ def main():
             # Any candidate that fails after evidence lock is terminal for this
             # run. Do not retry the same expensive candidate; move immediately
             # to the next ranked topic. The article counter remains unchanged.
-            # This also covers Story Quality Gate REMOVE/BORDERLINE decisions.
+            # This also covers any terminal downstream validation failure.
             trend["_production_status"] = "REJECT"
             trend["_production_reject_reason"] = str(e)
             print(

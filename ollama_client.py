@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+import difflib
 from ollama import chat
 from config import MODEL, LANGUAGE
 
@@ -26,7 +27,7 @@ from config import MODEL, LANGUAGE
 #   * language-independent
 # ============================================================
 
-PIPELINE_VERSION = "universal-fact-lock-v2.5.1-evidence-coverage-hardened"
+PIPELINE_VERSION = "universal-fact-lock-v2.7.0-source-independence-fact-lineage-substantive-value"
 
 # IMPORTANT: Do not force a CPU thread count by default.
 # Ollama can auto-detect the runner's optimal thread count.
@@ -609,6 +610,418 @@ SOURCE MATERIAL:
 """
 
 
+
+def _fact_tokens(text):
+    """Normalize fact text into conservative lexical tokens for lineage checks."""
+    text = re.sub(r"[^\w\s]", " ", (text or "").casefold(), flags=re.UNICODE)
+    return [t for t in re.split(r"\s+", text) if len(t) > 1]
+
+
+def _fact_pair_similarity(a, b):
+    """Return conservative lexical similarity signals for two extracted facts."""
+    ta = _fact_tokens(a)
+    tb = _fact_tokens(b)
+    sa, sb = set(ta), set(tb)
+    jaccard = len(sa & sb) / max(1, len(sa | sb))
+    sequence = difflib.SequenceMatcher(None, a.casefold(), b.casefold()).ratio()
+    containment = (a.casefold() in b.casefold()) or (b.casefold() in a.casefold())
+    return jaccard, sequence, containment
+
+
+def _fact_lineage_candidates(facts):
+    """Build only conservative candidate pairs; do not merge on weak overlap."""
+    candidates = []
+    for i in range(len(facts)):
+        for j in range(i + 1, len(facts)):
+            a = str(facts[i].get("fact", "")).strip()
+            b = str(facts[j].get("fact", "")).strip()
+            if not a or not b:
+                continue
+            jaccard, sequence, containment = _fact_pair_similarity(a, b)
+            shared_tokens = len(set(ta := _fact_tokens(a)) & set(tb := _fact_tokens(b)))
+            # Candidate generation is intentionally broader than the merge rule.
+            # The semantic judge decides whether shared wording is actually the same
+            # information unit; weak pairs are excluded to keep CPU/LLM cost bounded.
+            if (jaccard >= 0.25 and shared_tokens >= 2) or sequence >= 0.55 or (containment and jaccard >= 0.50):
+                candidates.append({"i": i, "j": j, "jaccard": round(jaccard, 3), "sequence": round(sequence, 3), "containment": containment})
+    return candidates
+
+
+_FACT_LINEAGE_FORMAT = {
+    "type": "object",
+    "properties": {
+        "merge_pairs": {
+            "type": "array",
+            "items": {
+                "type": "array",
+                "minItems": 2,
+                "maxItems": 2,
+                "items": {"type": "integer", "minimum": 0},
+            },
+        }
+    },
+    "required": ["merge_pairs"],
+}
+
+
+def _fact_lineage_prompt(facts, candidates):
+    lines = []
+    for idx, fact in enumerate(facts):
+        lines.append(f"F{idx + 1}: {fact.get('fact', '')}")
+    candidate_text = ", ".join(f"F{c['i'] + 1}/F{c['j'] + 1}" for c in candidates)
+    return f"""
+You are TrendCurrent's fact-lineage judge.
+
+Determine which candidate fact pairs express the SAME underlying information unit.
+This is NOT an event/story similarity task. Two facts may concern the same event but
+must remain separate when the second adds a distinct verifiable detail.
+
+MERGE only when:
+- the second fact is a paraphrase, restatement, or narrower wording of the same core claim;
+- no materially new person, action, number, date, location, status, rule, result, or other
+  independently useful detail is introduced.
+
+DO NOT MERGE when the facts describe different dimensions of the event, even if they share
+most names or wording. For example, a missed penalty and the rule violation that caused
+the retake are separate information units.
+
+Candidate pairs: {candidate_text or 'none'}
+
+ALL FACTS:
+{chr(10).join(lines)}
+
+Return ONLY JSON:
+{{"merge_pairs":[[0,1]]}}
+Use zero-based fact indexes. Return an empty list when no candidate pair should merge.
+"""
+
+
+def _deduplicate_evidence_facts(facts):
+    """Collapse repeated evidence claims while preserving genuinely new details."""
+    if len(facts) < 2:
+        return facts, {"raw_facts": len(facts), "unique_information_units": len(facts), "merged_facts": 0, "merge_pairs": []}
+
+    candidates = _fact_lineage_candidates(facts)
+    accepted_pairs = []
+    if candidates:
+        try:
+            data = _call(
+                _fact_lineage_prompt(facts, candidates),
+                temperature=0.0,
+                num_predict=220,
+                num_thread=NUM_THREADS,
+                response_format=_FACT_LINEAGE_FORMAT,
+            )
+            raw_pairs = data.get("merge_pairs", []) if isinstance(data, dict) else []
+            candidate_set = {(c["i"], c["j"]) for c in candidates}
+            for pair in raw_pairs:
+                if not isinstance(pair, list) or len(pair) != 2:
+                    continue
+                try:
+                    i, j = int(pair[0]), int(pair[1])
+                except (TypeError, ValueError):
+                    continue
+                if i > j:
+                    i, j = j, i
+                if (i, j) in candidate_set and (i, j) not in accepted_pairs:
+                    accepted_pairs.append((i, j))
+        except Exception as exc:
+            # Fail open: lineage is an evidence-quality enhancement, never a reason
+            # to discard otherwise provenance-valid evidence when the judge is unavailable.
+            print(f"[FACT LINEAGE] judge unavailable | keeping extracted facts | error={exc}")
+
+    parent = list(range(len(facts)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i, j in accepted_pairs:
+        union(i, j)
+
+    families = {}
+    for idx in range(len(facts)):
+        families.setdefault(find(idx), []).append(idx)
+
+    merged = []
+    lineage_pairs = []
+    for members in families.values():
+        representative = dict(facts[members[0]])
+        if len(members) > 1:
+            representative["lineage_members"] = [facts[i]["id"] for i in members]
+            representative["lineage_source_excerpts"] = [facts[i].get("excerpt", "") for i in members if facts[i].get("excerpt")]
+            for i in members[1:]:
+                lineage_pairs.append([facts[members[0]]["id"], facts[i]["id"]])
+        merged.append(representative)
+
+    # Re-number locked facts after clustering; provenance is retained in lineage_members.
+    for idx, fact in enumerate(merged, 1):
+        fact["id"] = f"F{idx}"
+
+    stats = {
+        "raw_facts": len(facts),
+        "unique_information_units": len(merged),
+        "merged_facts": len(facts) - len(merged),
+        "merge_pairs": lineage_pairs,
+        "candidate_pairs": len(candidates),
+    }
+    return merged, stats
+
+
+
+# ============================================================
+# SUBSTANTIVE STORY VALUE GATE
+# ============================================================
+# This is a pre-generation editorial-value gate.
+#
+# Purpose:
+#   Reject candidates that are technically factual and source-grounded but do
+#   not contain a concrete news development or a useful reader takeaway.
+#
+# This is deliberately NOT:
+#   - a word-count gate
+#   - a source-count gate
+#   - a fact-count gate
+#   - a popularity/virality gate
+##
+# A small story can PASS when the evidence contains a concrete development.
+# A large evidence set can FAIL when it is mostly generic commentary, "interest"
+# statements, tipster/promotional framing, recycled context, or other content
+# that gives the reader little substantive news.
+SUBSTANTIVE_VALUE_TOKENS = max(
+    120, int(os.getenv("OLLAMA_SUBSTANTIVE_VALUE_TOKENS", "180"))
+)
+SUBSTANTIVE_VALUE_MIN_CONFIDENCE = max(
+    70, min(100, int(os.getenv("OLLAMA_SUBSTANTIVE_VALUE_MIN_CONFIDENCE", "80")))
+)
+
+_SUBSTANTIVE_VALUE_FORMAT = {
+    "type": "object",
+    "properties": {
+        "verdict": {
+            "type": "string",
+            "enum": ["PASS", "REJECT"],
+        },
+        "confidence": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100,
+        },
+        "concrete_development": {"type": "boolean"},
+        "reader_value": {"type": "boolean"},
+        "reason": {"type": "string"},
+    },
+    "required": [
+        "verdict",
+        "confidence",
+        "concrete_development",
+        "reader_value",
+        "reason",
+    ],
+}
+
+
+def _substantive_value_prompt(evidence):
+    facts = evidence.get("facts", []) if isinstance(evidence, dict) else []
+    lines = []
+
+    for idx, item in enumerate(facts[:EVIDENCE_MAX_FACTS], 1):
+        if not isinstance(item, dict):
+            continue
+
+        fact = str(item.get("fact", "")).strip()
+        excerpt = str(item.get("excerpt", "")).strip()
+
+        if not fact:
+            continue
+
+        # The excerpt is included as supporting context so the judge can
+        # distinguish concrete reporting from generic paraphrase. It remains
+        # evidence only; it is never used to add outside knowledge.
+        if excerpt:
+            excerpt = re.sub(r"\s+", " ", excerpt)[:420]
+            lines.append(f"F{idx}: {fact}\nSOURCE SENTENCE: {excerpt}")
+        else:
+            lines.append(f"F{idx}: {fact}")
+
+    facts_text = "\n\n".join(lines) or "No locked evidence facts available."
+
+    return f"""
+You are TrendCurrent's pre-generation substantive story value editor.
+
+Your job is NOT to judge writing quality, popularity, SEO, article length, or
+whether the topic is globally important.
+
+Your job is to decide whether the LOCKED EVIDENCE contains enough substantive
+news value to justify spending production capacity on a standalone news article.
+
+Return exactly one verdict:
+- PASS = the evidence contains a concrete news development and gives a reader
+  a useful factual takeaway.
+- REJECT = the evidence is technically factual but substantively empty, generic,
+  meta-level, promotional, repetitive, or lacks a concrete development.
+
+IMPORTANT DISTINCTION:
+A small or niche story may PASS. It does NOT need to be a major national or
+global event. A single concrete decision, result, appointment, incident,
+announcement, legal development, measurable change, discovery, death, or other
+specific development can be enough when the evidence clearly tells the reader
+what actually happened.
+
+REJECT examples:
+- "X is attracting attention."
+- "Fans are interested in X."
+- "A tipster discussed X's prospects."
+- "X is considered a contender."
+- "An expert gave insights" when the actual useful conclusion/details are absent.
+- Generic background or statements about why a person/event is important.
+- Rephrasing that an article/source discussed a topic without a concrete new
+  development.
+- Evidence that mostly says that something is being discussed, watched,
+  expected, or talked about, without establishing what actually happened or
+  changed.
+
+PASS examples:
+- A concrete result, decision, ruling, appointment, announcement, incident,
+  policy change, discovery, transaction, measurable development, or confirmed
+  event with enough factual detail for a reader to understand the development.
+- A niche/local story with a real event or change, even if it is not widely
+  significant.
+
+RULES:
+1. Judge ONLY the locked evidence below. Do not use outside knowledge.
+2. Do not reject merely because the story is niche, short, local, cultural,
+   entertainment-related, business-related, or otherwise not a major headline.
+3. Do not require a minimum number of facts or sources.
+4. Do not require a particular word count.
+5. Do not confuse "same story" with "valuable story"; this gate assumes the
+   evidence has already passed story concentration.
+6. A factual opinion/analysis story may PASS only when the evidence contains a
+   concrete underlying development that makes the analysis newsworthy.
+7. If the evidence explicitly lacks the actual details of the supposed
+   development and mainly describes interest, expectations, commentary, or
+   coverage itself, REJECT it.
+8. Do not infer significance, motives, causality, future outcomes, or importance
+   that is not present in the evidence.
+9. Be conservative about empty content, but do not impose a "big news only"
+   standard.
+10. Confidence must reflect how clearly the evidence supports the decision.
+
+Return ONLY this JSON shape:
+{{
+  "verdict":"PASS",
+  "confidence":95,
+  "concrete_development":true,
+  "reader_value":true,
+  "reason":"brief evidence-grounded reason"
+}}
+
+LOCKED EVIDENCE:
+{facts_text}
+"""
+
+
+def substantive_story_value_gate(evidence):
+    """
+    Fail closed before article generation when locked evidence lacks
+    substantive news value.
+
+    Returns the normalized decision on PASS. Raises ValueError on REJECT or
+    unavailable/invalid judge output so the candidate never reaches generation.
+    """
+    if not isinstance(evidence, dict):
+        raise ValueError("Substantive Story Value Gate requires an evidence object.")
+
+    facts = evidence.get("facts", [])
+    if not isinstance(facts, list) or not facts:
+        raise ValueError("Substantive Story Value Gate rejected empty evidence.")
+
+    started = time.perf_counter()
+
+    try:
+        result = _call(
+            _substantive_value_prompt(evidence),
+            temperature=0.0,
+            num_predict=SUBSTANTIVE_VALUE_TOKENS,
+            num_thread=NUM_THREADS,
+            response_format=_SUBSTANTIVE_VALUE_FORMAT,
+        )
+    except Exception as exc:
+        elapsed = time.perf_counter() - started
+        print(
+            f"[SUBSTANTIVE STORY VALUE] UNAVAILABLE | "
+            f"elapsed={elapsed:.2f}s | error={exc}"
+        )
+        raise ValueError(
+            f"Substantive Story Value Gate unavailable: {exc}"
+        ) from exc
+
+    if not isinstance(result, dict):
+        raise ValueError("Substantive Story Value Gate returned invalid JSON.")
+
+    verdict = str(result.get("verdict", "")).strip().upper()
+    try:
+        confidence = max(0, min(100, int(result.get("confidence", 0))))
+    except (TypeError, ValueError):
+        confidence = 0
+
+    concrete_development = bool(result.get("concrete_development", False))
+    reader_value = bool(result.get("reader_value", False))
+    reason = str(result.get("reason", "")).strip()[:500]
+
+    # Fail closed: a PASS is only valid when the judge explicitly identifies
+    # both a concrete development and a useful reader takeaway with adequate
+    # confidence. This prevents vague low-confidence approvals.
+    passed = (
+        verdict == "PASS"
+        and confidence >= SUBSTANTIVE_VALUE_MIN_CONFIDENCE
+        and concrete_development
+        and reader_value
+    )
+
+    if passed:
+        print(
+            f"[SUBSTANTIVE STORY VALUE] PASS | "
+            f"confidence={confidence} | concrete_development=true | "
+            f"reader_value=true | {reason}"
+        )
+        return {
+            "verdict": "PASS",
+            "confidence": confidence,
+            "concrete_development": True,
+            "reader_value": True,
+            "reason": reason,
+        }
+
+    if verdict == "REJECT":
+        rejection_reason = reason or "evidence lacks substantive news value"
+    elif verdict == "PASS":
+        rejection_reason = (
+            reason
+            or "judge did not establish both a concrete development and useful reader value"
+        )
+    else:
+        rejection_reason = f"invalid substantive value verdict: {verdict or 'empty'}"
+
+    print(
+        f"[SUBSTANTIVE STORY VALUE] REJECT | "
+        f"confidence={confidence} | concrete_development={str(concrete_development).lower()} | "
+        f"reader_value={str(reader_value).lower()} | {rejection_reason}"
+    )
+
+    raise ValueError(
+        f"Substantive Story Value Gate rejected candidate "
+        f"(confidence={confidence}): {rejection_reason}"
+    )
+
+
 def _source_excerpt_supported(source, excerpt):
     source_norm = re.sub(r"\s+", " ", (source or "")).strip().casefold()
     excerpt_norm = re.sub(r"\s+", " ", (excerpt or "")).strip().casefold()
@@ -797,10 +1210,21 @@ def _extract_evidence(source):
     if not facts:
         raise ValueError("Evidence extraction produced no usable facts.")
 
-    # Keep all provenance-verified facts across all chunks. Each chunk is already
-    # bounded by EVIDENCE_MAX_FACTS, so this preserves coverage without a second
-    # global truncation that could silently discard relevant evidence.
-    locked = facts
+    # Keep all provenance-verified facts, then collapse only facts that represent
+    # the same underlying information unit. This prevents syndicated/repeated
+    # reporting from inflating evidence count while preserving genuinely new details.
+    locked, lineage_stats = _deduplicate_evidence_facts(facts)
+    redundancy = (
+        1.0 - (lineage_stats["unique_information_units"] / max(1, lineage_stats["raw_facts"]))
+    )
+
+    print(
+        f"[FACT LINEAGE] raw_facts={lineage_stats['raw_facts']} "
+        f"| unique_information_units={lineage_stats['unique_information_units']} "
+        f"| merged_facts={lineage_stats['merged_facts']} "
+        f"| redundancy={redundancy:.3f} "
+        f"| candidate_pairs={lineage_stats.get('candidate_pairs', 0)}"
+    )
 
     group_counts = {}
     for fact in locked:
@@ -815,6 +1239,7 @@ def _extract_evidence(source):
     evidence = {
         "primary_group": primary_group,
         "facts": locked,
+        "fact_lineage": lineage_stats,
     }
 
     print(
