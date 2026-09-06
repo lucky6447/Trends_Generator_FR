@@ -7,7 +7,7 @@ from ollama import chat
 from config import MODEL
 
 
-FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.6.3-preserve-repair"
+FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.6.4-safe-coverage-stage-delete"
 
 NUM_THREADS = max(1, int(os.getenv("FACT_GUARD_NUM_THREADS", "16")))
 NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
@@ -191,6 +191,8 @@ def _supported_repair(issue: Dict[str, Any]) -> bool:
         "unsupported_quote",
         "wrong_fact",
         "wrong_platform",
+        "wrong_coverage",
+        "wrong_stage",
         "causal_claim",
         "event_status_mismatch",
         "event_date_mismatch",
@@ -215,6 +217,7 @@ def repair(
     article: Dict[str, Any],
     source: str,
     guard_result: Dict[str, Any],
+    repetition_result: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """
     Perform one consolidated targeted repair for all currently reported HIGH/MEDIUM blocking issues.
@@ -250,13 +253,14 @@ def repair(
     if not isinstance(guard_result, dict):
         raise ValueError("Fact Guard result must be a JSON object.")
 
+    repetition_mode = isinstance(repetition_result, dict)
     blocking = [
         x for x in guard_result.get("issues", [])
         if isinstance(x, dict)
         and str(x.get("severity", "")).strip().upper() in {"HIGH", "MEDIUM"}
     ]
 
-    if not blocking:
+    if not blocking and not repetition_mode:
         raise ValueError("Fact Guard repair requires at least one blocking issue.")
 
     unsupported = [x for x in blocking if not _supported_repair(x)]
@@ -268,6 +272,35 @@ def repair(
         raise ValueError(f"Unsupported Fact Guard repair type(s): {types}")
 
     issue_rules_parts = []
+    if repetition_mode:
+        repeated_pairs = repetition_result.get("repeated_pairs", [])
+        redundant_paragraphs = repetition_result.get("redundant_paragraphs", 0)
+        repeated_units = repetition_result.get("repeated_information_units", 0)
+        issue_rules_parts.append(
+            "REPETITION REPAIR (STRICT NON-EXPANSIVE PARAGRAPH REPAIR):\n"
+            "- The Repetition Guard is authoritative about which paragraphs repeat.\n"
+            "- Preserve the exact paragraph count and preserve the headline/title/H1.\n"
+            "- Do NOT rewrite any paragraph that is not identified as redundant or part of a reported repeated pair.\n"
+            "- For each redundant paragraph, first remove the smallest repeated sentence/claim.\n"
+            "- If that would leave the paragraph empty or unable to satisfy the existing structure, "
+            "replace ONLY that paragraph with ONE distinct factual unit that is already explicitly "
+            "present in the article and directly supported by the supplied source material.\n"
+            "- A replacement fact MUST NOT already be materially stated in any other paragraph. "
+            "Do not move/repeat an existing fact from another paragraph.\n"
+            "- Do NOT invent, infer, expand, combine, or paraphrase into a new factual unit.\n"
+            "- Do NOT use attribution, rewording, background, implications, consequences, or context "
+            "as a substitute for new information.\n"
+            "- Never repair repetition by rewriting multiple paragraphs into different wording.\n"
+            "- Never rebalance, enrich, reorder, split, or merge paragraphs.\n"
+            "- If no safe distinct source-supported factual unit can fill the redundant paragraph, "
+            "leave it unchanged and allow final validation to reject the article.\n"
+            "- Do NOT make the article longer merely to fix repetition.\n"
+            "- Do NOT change language, event scope, headline, or factual meaning outside the reported repetition.\n"
+            f"- Repeated paragraph pairs reported: {json.dumps(repeated_pairs, ensure_ascii=False)}\n"
+            f"- Redundant paragraphs reported: {redundant_paragraphs}\n"
+            f"- Repeated information units reported: {repeated_units}\n"
+            f"- Repetition Guard reason: {str(repetition_result.get('reason', '')).strip()}"
+        )
     for index, issue in enumerate(blocking, 1):
         raw_issue_type = str(issue.get("type", "")).strip()
         issue_type = _normalize_issue_type(raw_issue_type)
@@ -297,6 +330,17 @@ def repair(
                 "- DELETE-ONLY: remove the unsupported platform attribution "
                 "unless the issue/source excerpt directly establishes a safe correction.\n"
                 "- Never substitute a platform from outside knowledge.\n"
+                "- Preserve surrounding source-supported reporting where possible."
+            )
+        elif issue_type in {"wrong_coverage", "wrong_stage"}:
+            rules = (
+                "- DELETE-ONLY: remove the unsupported coverage/provider or stage "
+                "attribution identified by Fact Guard.\n"
+                "- Do not replace it with another provider, programme, stage, label, "
+                "or category unless the reported issue itself contains an explicit "
+                "source-supported correction.\n"
+                "- Never infer a replacement from context, convention, nearby entities, "
+                "or outside knowledge.\n"
                 "- Preserve surrounding source-supported reporting where possible."
             )
         elif issue_type in {
@@ -371,8 +415,8 @@ def repair(
     prompt = f"""
 You are TrendCurrent's targeted Fact Guard repair engine.
 
-Repair ONE already-generated article after an independent Fact Guard found
-one or more blocking factual errors.
+Repair ONE already-generated article after an independent quality guard found
+one or more blocking factual errors and/or paragraph-level repetition.
 
 SOURCE MATERIAL is the ONLY factual authority.
 

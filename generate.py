@@ -23,6 +23,7 @@ from ollama import chat
 from config import MODEL
 from fact_guard import validate as fact_guard_validate
 from fact_guard_repair import repair as fact_guard_repair
+from repetition_guard import validate as repetition_guard_validate
 import json
 import unicodedata
 from html_generator import render_article, save_article
@@ -1268,6 +1269,27 @@ def _enrich_evidence_for_generation(evidence, trend):
 
     return enriched
 
+def _run_repetition_guard(article, generation_evidence, event_name="repetition_guard"):
+    print("[REPETITION GUARD] Checking paragraph-level information novelty...")
+    _rep_started = __import__("time").perf_counter()
+    repetition = repetition_guard_validate(article, generation_evidence)
+    _rep_elapsed = __import__("time").perf_counter() - _rep_started
+    print(f"[REPETITION GUARD TIMER] {event_name} END | elapsed={_rep_elapsed:.2f}s")
+    monitor.candidate_event(
+        event_name,
+        status=repetition.get("status"),
+        paragraph_count=repetition.get("paragraph_count"),
+        paragraphs_with_new_information=repetition.get("paragraphs_with_new_information"),
+        redundant_paragraphs=repetition.get("redundant_paragraphs"),
+        repeated_information_units=repetition.get("repeated_information_units"),
+        repeated_pairs=repetition.get("repeated_pairs"),
+        unique_information_units=repetition.get("unique_information_units"),
+        information_density=repetition.get("information_density"),
+        reason=repetition.get("reason"),
+    )
+    return repetition
+
+
 def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max_attempts=1, prelocked_evidence=None):
     last = None
 
@@ -1282,14 +1304,13 @@ def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max
             validate_article_structure(article, generation_evidence, label="Initial generated article")
 
             locked_facts = generation_evidence.get("facts", [])
-            paragraph_text = " ".join(
-                str(p) for p in article.get("paragraphs", [])
-            ).strip()
+            paragraph_text = " ".join(str(p) for p in article.get("paragraphs", [])).strip()
             if isinstance(locked_facts, list) and len(locked_facts) >= 3:
                 print(
                     f"[EVIDENCE COVERAGE] locked_facts={len(locked_facts)} "
                     f"| article_words={len(paragraph_text.split())}"
                 )
+
             article = enforce_headline_policy(article, trend)
             validate_article(article)
             validate_language_integrity(article)
@@ -1301,7 +1322,6 @@ def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max
                 article,
                 reference_date=reference_date,
             )
-
             monitor.candidate_event(
                 "fact_guard",
                 status=guard.get("status"),
@@ -1310,32 +1330,28 @@ def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max
                 guard=guard,
             )
 
+            # Existing Fact Guard repair path. Its result is ALWAYS rechecked by
+            # both Fact Guard and Repetition Guard before publication.
             if guard["status"] != "PASS":
                 print("[FACT GUARD] FLAG - article requires repair.")
                 print(json.dumps(guard, ensure_ascii=False, indent=2))
-
                 try:
                     print("[FACT GUARD REPAIR] Attempting targeted repair v1.0...")
-                    repaired = fact_guard_repair(
-                        article,
-                        fact_guard_source,
-                        guard,
-                    )
+                    _repair_started = __import__("time").perf_counter()
+                    repaired = fact_guard_repair(article, fact_guard_source, guard)
+                    _repair_elapsed = __import__("time").perf_counter() - _repair_started
+                    print(f"[FACT GUARD REPAIR TIMER] fact_guard_repair END | elapsed={_repair_elapsed:.2f}s")
                     validate_article(repaired)
                     validate_article_structure(repaired, generation_evidence, label="Fact Guard repaired article")
                     repaired = enforce_headline_policy(repaired, trend)
                     validate_article(repaired)
                     validate_article_structure(repaired, generation_evidence, label="Fact Guard repaired article final")
                     validate_language_integrity(repaired)
-                    print("[LANGUAGE GUARD] REPAIRED ARTICLE PASS")
 
                     print("[FACT GUARD REPAIR] Re-checking repaired article...")
                     repaired_guard = fact_guard_validate(
-                        fact_guard_source,
-                        repaired,
-                        reference_date=reference_date,
+                        fact_guard_source, repaired, reference_date=reference_date
                     )
-
                     monitor.candidate_event(
                         "fact_guard_repair_check",
                         status=repaired_guard.get("status"),
@@ -1344,48 +1360,103 @@ def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max
                         guard=repaired_guard,
                         repaired_article=repaired,
                     )
-
                     if repaired_guard["status"] != "PASS":
-                        print("[FACT GUARD REPAIR] FAIL - repaired article blocked.")
-                        print(
-                            json.dumps(
-                                repaired_guard,
-                                ensure_ascii=False,
-                                indent=2,
-                            )
-                        )
                         raise Exception(
                             "Fact Guard repair failed re-validation "
                             f"({repaired_guard['blocking_issues']} blocking issue(s))"
                         )
 
+                    repetition = _run_repetition_guard(
+                        repaired, generation_evidence, "repetition_guard_repaired"
+                    )
+                    if repetition.get("status") != "PASS":
+                        print("[REPETITION GUARD] REJECT - repaired article")
+                        print(json.dumps(repetition, ensure_ascii=False, indent=2))
+                        raise Exception(
+                            "Repetition Guard blocked repaired article: "
+                            f"{repetition.get('reason', 'paragraph redundancy detected')}"
+                        )
+
+                    print("[FACT GUARD REPAIR] PASS - repaired article accepted.")
+                    print("[REPETITION GUARD] PASS - repaired article")
                     validate_language_integrity(repaired)
                     print("[LANGUAGE GUARD] FINAL REPAIRED ARTICLE PASS")
-                    print("[FACT GUARD REPAIR] PASS - repaired article accepted.")
-
-                    if repaired_guard.get("review_items", 0):
-                        print(
-                            f"[FACT GUARD] PASS with "
-                            f"{repaired_guard['review_items']} review item(s)."
-                        )
-                    else:
-                        print("[FACT GUARD] PASS")
-
                     return repaired
-
                 except Exception as repair_error:
                     raise Exception(
                         f"Fact Guard blocked article; repair failed: {repair_error}"
                     ) from repair_error
 
-            if guard.get("review_items", 0):
-                print(
-                    f"[FACT GUARD] PASS with "
-                    f"{guard['review_items']} review item(s)."
-                )
-            else:
-                print("[FACT GUARD] PASS")
+            print("[FACT GUARD] PASS")
 
+            repetition = _run_repetition_guard(article, generation_evidence)
+            if repetition.get("status") != "PASS":
+                print("[REPETITION GUARD] FLAG - attempting one targeted repair...")
+                print(json.dumps(repetition, ensure_ascii=False, indent=2))
+
+                # IMPORTANT: do not generate a new article. Reuse the already
+                # validated article and the same locked evidence, and let the
+                # existing Fact Guard repair engine perform ONE targeted
+                # paragraph-level repair.
+                try:
+                    # Repetition repair is intentionally constrained to a
+                    # delete/restructure operation. It must never invent a new
+                    # information unit to fill a redundant paragraph.
+                    _repair_started = __import__("time").perf_counter()
+                    repaired = fact_guard_repair(
+                        article,
+                        fact_guard_source,
+                        {"issues": []},
+                        repetition_result=repetition,
+                    )
+                    _repair_elapsed = __import__("time").perf_counter() - _repair_started
+                    print(f"[FACT GUARD REPAIR TIMER] repetition_repair END | elapsed={_repair_elapsed:.2f}s")
+                    validate_article(repaired)
+                    validate_article_structure(repaired, generation_evidence, label="Repetition repaired article")
+                    repaired = enforce_headline_policy(repaired, trend)
+                    validate_article(repaired)
+                    validate_article_structure(repaired, generation_evidence, label="Repetition repaired article final")
+                    validate_language_integrity(repaired)
+
+                    print("[FACT GUARD] Re-checking repetition-repaired article...")
+                    repaired_guard = fact_guard_validate(
+                        fact_guard_source, repaired, reference_date=reference_date
+                    )
+                    monitor.candidate_event(
+                        "fact_guard_repetition_repair_check",
+                        status=repaired_guard.get("status"),
+                        review_items=repaired_guard.get("review_items"),
+                        blocking_issues=repaired_guard.get("blocking_issues"),
+                        guard=repaired_guard,
+                        repaired_article=repaired,
+                    )
+                    if repaired_guard["status"] != "PASS":
+                        raise Exception(
+                            "Fact Guard failed after repetition repair "
+                            f"({repaired_guard['blocking_issues']} blocking issue(s))"
+                        )
+
+                    final_repetition = _run_repetition_guard(
+                        repaired, generation_evidence, "repetition_guard_repair_check"
+                    )
+                    if final_repetition.get("status") != "PASS":
+                        print("[REPETITION GUARD] FINAL REJECT - repair did not remove redundancy")
+                        print(json.dumps(final_repetition, ensure_ascii=False, indent=2))
+                        raise Exception(
+                            "Repetition repair failed re-validation: "
+                            f"{final_repetition.get('reason', 'paragraph redundancy remains')}"
+                        )
+
+                    print("[REPETITION GUARD] PASS - repaired article")
+                    validate_language_integrity(repaired)
+                    print("[LANGUAGE GUARD] FINAL ARTICLE PASS")
+                    return repaired
+                except Exception as repair_error:
+                    raise Exception(
+                        f"Repetition Guard blocked article; targeted repair failed: {repair_error}"
+                    ) from repair_error
+
+            print("[REPETITION GUARD] PASS")
             validate_language_integrity(article)
             print("[LANGUAGE GUARD] FINAL ARTICLE PASS")
             return article
@@ -1393,11 +1464,7 @@ def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max
         except Exception as e:
             last = e
             print(f"Validation failed ({i+1}/{max_attempts}): {e}")
-
-            # A failed Fact Guard repair is terminal for this candidate.
-            # Re-generating from the same evidence only repeats the expensive
-            # audit/repair cycle instead of improving the underlying condition.
-            if "Fact Guard blocked article; repair failed:" in str(e):
+            if "Fact Guard blocked article; repair failed:" in str(e) or "Repetition Guard blocked article; targeted repair failed:" in str(e):
                 break
 
     raise Exception(last)

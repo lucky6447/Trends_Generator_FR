@@ -97,6 +97,26 @@ def clear_candidate():
     global _CURRENT
     _CURRENT = None
 
+def ollama_timing(stage, **data):
+    """Log one Ollama call timing record without affecting production behavior."""
+    try:
+        current = _CURRENT or {}
+        record = {
+            "record": "ollama",
+            "event": "ollama_timing",
+            "timestamp": _now(),
+            "run_id": _RUN_ID,
+            "candidate_id": current.get("candidate_id"),
+            "keyword": current.get("keyword"),
+            "stage": str(stage or "unknown"),
+        }
+        record.update(data)
+        _write(record)
+    except Exception:
+        # Ollama telemetry must never affect generation.
+        pass
+
+
 def candidate_event(event, **data):
     try:
         current = _CURRENT or {}

@@ -106,12 +106,50 @@ class _SourceImageParser(HTMLParser):
         if not self._in_jsonld:
             return
 
-        for pattern in (
-            r'"image"\s*:\s*"([^"]+)"',
-        ):
-            self.candidates.extend(
-                re.findall(pattern, data, flags=re.IGNORECASE)
-            )
+        # JSON-LD is handled separately so that only image.url is accepted.
+        return
+
+
+def _extract_jsonld_images(html):
+    """Extract only JSON-LD image.url values; never use contentUrl."""
+    import json
+
+    images = []
+    pattern = r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>'
+
+    for match in re.finditer(pattern, html, flags=re.I | re.S):
+        raw = match.group(1).strip()
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        def walk(obj):
+            if isinstance(obj, dict):
+                image = obj.get("image")
+
+                if isinstance(image, dict):
+                    image_url = image.get("url")
+                    if isinstance(image_url, str):
+                        images.append(image_url)
+
+                elif isinstance(image, list):
+                    for item in image:
+                        if isinstance(item, dict):
+                            image_url = item.get("url")
+                            if isinstance(image_url, str):
+                                images.append(image_url)
+
+                for value in obj.values():
+                    walk(value)
+
+            elif isinstance(obj, list):
+                for item in obj:
+                    walk(item)
+
+        walk(data)
+
+    return images
 
 
 def resolve_google_news_url(url):
@@ -238,9 +276,12 @@ def extract_source_image(url):
     except Exception:
         pass
 
+    candidates = list(parser.candidates)
+    candidates.extend(_extract_jsonld_images(html))
+
     seen = set()
 
-    for candidate in parser.candidates:
+    for candidate in candidates:
         image_url = urljoin(
             final_url or publisher_url,
             str(candidate).strip(),
@@ -401,6 +442,16 @@ def fetch_news_multi(queries, per_query_limit=8, max_results=18):
         contents = list(executor.map(lambda a: extract_article(a["link"]), candidates))
     for article, content in zip(candidates, contents):
         article["content"] = content or article.get("summary", "")
+
+    with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as executor:
+        images = list(executor.map(lambda a: extract_source_image(a["link"]), candidates))
+
+    for article, image_data in zip(candidates, images):
+        image_data = image_data or {}
+        article["image"] = image_data.get("image", "")
+        article["image_source_url"] = image_data.get("source_url", "")
+        article["image_source"] = image_data.get("source", "")
+
     return filter_similar_articles(candidates, max_results=max_results)
 
 
@@ -417,4 +468,14 @@ def fetch_news(query, limit=20):
         contents = list(executor.map(lambda a: extract_article(a["link"]), prepared))
     for article, content in zip(prepared, contents):
         article["content"] = content or article.get("summary", "")
+
+    with ThreadPoolExecutor(max_workers=min(8, len(prepared))) as executor:
+        images = list(executor.map(lambda a: extract_source_image(a["link"]), prepared))
+
+    for article, image_data in zip(prepared, images):
+        image_data = image_data or {}
+        article["image"] = image_data.get("image", "")
+        article["image_source_url"] = image_data.get("source_url", "")
+        article["image_source"] = image_data.get("source", "")
+
     return filter_similar_articles(prepared)

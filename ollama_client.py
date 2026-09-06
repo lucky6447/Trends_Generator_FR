@@ -5,6 +5,7 @@ import time
 import difflib
 from ollama import chat
 from config import MODEL, LANGUAGE
+import generator_monitor as monitor
 
 
 # ============================================================
@@ -171,6 +172,7 @@ def _call(
     num_predict=500,
     num_thread=None,
     response_format="json",
+    stage=None,
 ):
     started = time.perf_counter()
     # None means "do not send num_thread", allowing Ollama to auto-detect.
@@ -256,6 +258,28 @@ def _call(
         + (f" | prompt_tok_s={prompt_tok_s:.2f}" if prompt_tok_s is not None else "")
         + (f" | eval_tok_s={tok_s:.2f}" if tok_s is not None else "")
     )
+
+    if stage:
+        try:
+            monitor.ollama_timing(
+                stage,
+                elapsed_seconds=round(elapsed, 3),
+                load_duration=timing.get("load_duration"),
+                prompt_eval_duration=timing.get("prompt_eval_duration"),
+                eval_duration=timing.get("eval_duration"),
+                total_duration=timing.get("total_duration"),
+                prompt_eval_count=timing.get("prompt_eval_count"),
+                eval_count=timing.get("eval_count"),
+                prompt_tok_s=prompt_tok_s,
+                eval_tok_s=tok_s,
+                num_predict=num_predict,
+                prompt_chars=len(prompt),
+                threads=threads,
+                batch=batch,
+            )
+        except Exception:
+            # Telemetry must never affect generation.
+            pass
 
     try:
         return _extract_json_object(raw)
@@ -494,6 +518,19 @@ FACT RULES:
 - Prefer a concrete source-supported fact over generic background wording.
 - Do not select a numeric or other materially conflicting claim merely from a headline or metadata.
 - When the factual bodies of sources conflict on a number, date, status or attribution and the conflict is not explicitly resolved, omit the disputed detail rather than choosing one by guesswork.
+- RESULT / SCORE ATTRIBUTION — HARD LOCK:
+- A score or result must NEVER be used to infer which team, player or side won.
+- Never assume that the first number belongs to the first named team, or that the higher
+  number belongs to the first named team.
+- Never infer winner, loser, winning side or "in favor of" attribution from score ordering,
+  team ordering, sentence position, headline wording, convention or outside knowledge.
+- State the score itself only when the source explicitly supports that score.
+- State which side won or lost only when the source sentence explicitly establishes that
+  result or explicitly links the result to the named side.
+- If the score is explicit but the winner attribution is not explicit, keep the score as a
+  score-only fact and omit the winner/loser attribution.
+- If winner, loser or result attribution is ambiguous or cannot be established directly
+  from the source sentence, omit that attribution rather than guessing.
 - Return ONLY JSON.
 
 IMPORTANT OUTPUT REQUIREMENT:
@@ -533,6 +570,19 @@ RULES:
 - Never invent or alter an ID.
 - No excerpts, source names, dates or status fields outside "f".
 - No outside knowledge.
+- RESULT / SCORE ATTRIBUTION — HARD LOCK:
+- A score or result must NEVER be used to infer which team, player or side won.
+- Never assume that the first number belongs to the first named team, or that the higher
+  number belongs to the first named team.
+- Never infer winner, loser, winning side or "in favor of" attribution from score ordering,
+  team ordering, sentence position, headline wording, convention or outside knowledge.
+- State the score itself only when the source explicitly supports that score.
+- State which side won or lost only when the source sentence explicitly establishes that
+  result or explicitly links the result to the named side.
+- If the score is explicit but the winner attribution is not explicit, keep the score as a
+  score-only fact and omit the winner/loser attribution.
+- If winner, loser or result attribution is ambiguous or cannot be established directly
+  from the source sentence, omit that attribution rather than guessing.
 - Return ONLY JSON.
 
 SOURCE:
@@ -564,6 +614,19 @@ RULES:
 - "f" must be a concise supported fact.
 - Do not generate excerpts, source names, dates or status fields.
 - Do not invent facts or use outside knowledge.
+- RESULT / SCORE ATTRIBUTION — HARD LOCK:
+- A score or result must NEVER be used to infer which team, player or side won.
+- Never assume that the first number belongs to the first named team, or that the higher
+  number belongs to the first named team.
+- Never infer winner, loser, winning side or "in favor of" attribution from score ordering,
+  team ordering, sentence position, headline wording, convention or outside knowledge.
+- State the score itself only when the source explicitly supports that score.
+- State which side won or lost only when the source sentence explicitly establishes that
+  result or explicitly links the result to the named side.
+- If the score is explicit but the winner attribution is not explicit, keep the score as a
+  score-only fact and omit the winner/loser attribution.
+- If winner, loser or result attribution is ambiguous or cannot be established directly
+  from the source sentence, omit that attribution rather than guessing.
 
 SOURCE:
 {indexed_source}
@@ -604,6 +667,19 @@ STRICT PROVENANCE RULES:
 - Keep all facts within the same main event/story.
 - Do not infer motives, causes, significance, outcomes or outside facts.
 - Do not generate excerpts, source names, dates or status fields separately.
+- RESULT / SCORE ATTRIBUTION — HARD LOCK:
+- A score or result must NEVER be used to infer which team, player or side won.
+- Never assume that the first number belongs to the first named team, or that the higher
+  number belongs to the first named team.
+- Never infer winner, loser, winning side or "in favor of" attribution from score ordering,
+  team ordering, sentence position, headline wording, convention or outside knowledge.
+- State the score itself only when the source explicitly supports that score.
+- State which side won or lost only when the source sentence explicitly establishes that
+  result or explicitly links the result to the named side.
+- If the score is explicit but the winner attribution is not explicit, keep the score as a
+  score-only fact and omit the winner/loser attribution.
+- If winner, loser or result attribution is ambiguous or cannot be established directly
+  from the source sentence, omit that attribution rather than guessing.
 
 SOURCE MATERIAL:
 {indexed_source}
@@ -1466,6 +1542,7 @@ def _generate_article(evidence, source_context=None):
         num_predict=dynamic_tokens,
         num_thread=NUM_THREADS,
         response_format=_ARTICLE_FORMAT,
+        stage="article_generation",
     )
 
     if not _schema_ok(article):
@@ -1550,13 +1627,14 @@ ARTICLE:
 """
 
 
-def _audit(article, evidence):
+def _audit(article, evidence, stage="initial_audit"):
     result = _call(
         _audit_prompt(article, evidence),
         temperature=0.0,
         num_predict=AUDIT_TOKENS,
         num_thread=NUM_THREADS,
         response_format=_AUDIT_FORMAT,
+        stage=stage,
     )
 
     if not isinstance(result, dict):
@@ -1752,6 +1830,7 @@ ARTICLE:
         num_predict=dynamic_tokens,
         num_thread=NUM_THREADS,
         response_format=_REPAIR_FORMAT,
+        stage="repair",
     )
 
 
@@ -1781,8 +1860,8 @@ def _sanitize_article(article):
     return clean
 
 
-def _audit_or_raise(article, evidence, label):
-    audit = _audit(article, evidence)
+def _audit_or_raise(article, evidence, label, stage="initial_audit"):
+    audit = _audit(article, evidence, stage=stage)
 
     total_facts = len(evidence.get("facts", [])) if isinstance(evidence, dict) else 0
     covered_facts = len(audit.get("covered_fact_ids", []))
@@ -1886,6 +1965,7 @@ def generate(prompt, retries=0, evidence=None):
         article,
         evidence,
         "Initial audit",
+        stage="initial_audit",
     )
 
     if audit["passed"]:
@@ -1920,6 +2000,7 @@ def generate(prompt, retries=0, evidence=None):
         repaired,
         evidence,
         "Final audit",
+        stage="final_audit",
     )
 
     if not final_audit["passed"]:
