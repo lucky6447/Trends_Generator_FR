@@ -1,6 +1,7 @@
 import feedparser
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import re
 
 from config import RSS_URL
 
@@ -48,8 +49,23 @@ def clean(value):
 
 
 def should_skip(title):
-    title = title.lower()
+    title = clean(title).casefold()
     return any(keyword in title for keyword in SKIP_KEYWORDS)
+
+
+def _published_value(item):
+    """Use the first valid RSS publication/update field available."""
+    for field in ("published", "pubDate", "updated", "date", "dc_date"):
+        value = item.get(field)
+        if value:
+            return clean(value)
+    return ""
+
+
+def _title_key(title):
+    value = clean(title).casefold()
+    value = re.sub(r"[^\w\s]+", " ", value, flags=re.UNICODE)
+    return " ".join(value.split())
 
 
 def _age_hours(published):
@@ -65,25 +81,30 @@ def _age_hours(published):
 
 
 def fetch_trends():
-    feed = feedparser.parse(RSS_URL)
+    """Return only fresh, non-duplicate trend signals with normalized metadata."""
+    try:
+        feed = feedparser.parse(RSS_URL)
+    except Exception as exc:
+        print(f"[TREND RSS] parse failed: {exc}")
+        return []
 
     trends = []
     dropped_old = 0
     dropped_unknown_age = 0
+    dropped_duplicates = 0
+    seen_titles = set()
+    seen_links = set()
 
-    for item in feed.entries:
+    for item in getattr(feed, "entries", []) or []:
         title = clean(item.get("title"))
-        published = clean(item.get("published"))
+        published = _published_value(item)
+        link = clean(item.get("link"))
 
-        if not title:
-            continue
-
-        if should_skip(title):
+        if not title or should_skip(title):
             continue
 
         age = _age_hours(published)
         if age is None:
-            # Strict experimental mode: unknown age is not considered fresh.
             dropped_unknown_age += 1
             continue
 
@@ -91,18 +112,28 @@ def fetch_trends():
             dropped_old += 1
             continue
 
+        title_key = _title_key(title)
+        link_key = link.casefold()
+        if title_key in seen_titles or (link_key and link_key in seen_links):
+            dropped_duplicates += 1
+            continue
+
+        seen_titles.add(title_key)
+        if link_key:
+            seen_links.add(link_key)
+
         trends.append({
             "title": title,
-            "link": clean(item.get("link")),
+            "link": link,
             "published": published,
             "traffic": clean(item.get("ht_approx_traffic")),
             "age_hours": round(age, 2),
         })
 
     print(
-        f"[TREND FRESHNESS] RSS entries={len(feed.entries)} | "
+        f"[TREND FRESHNESS] RSS entries={len(getattr(feed, 'entries', []) or [])} | "
         f"kept={len(trends)} | old>{MAX_TREND_AGE_HOURS:g}h={dropped_old} | "
-        f"unknown_age={dropped_unknown_age}"
+        f"unknown_age={dropped_unknown_age} | duplicates={dropped_duplicates}"
     )
 
     return trends

@@ -30,7 +30,7 @@ from config import MODEL
 #   3) no automatic article rewriting
 # ============================================================
 
-FACT_GUARD_VERSION = "fact-guard-v1.1.9-conservative-event-date-source-id"
+FACT_GUARD_VERSION = "fact-guard-v1.2.0-single-audit-compact-evidence"
 
 # Performance configuration:
 # Threads and batch are intentionally left to Ollama by default.
@@ -47,7 +47,7 @@ FACT_GUARD_PARALLEL_AUDITS = (
 )
 
 NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
-AUDIT_TOKENS = max(300, int(os.getenv("FACT_GUARD_AUDIT_TOKENS", "520")))
+AUDIT_TOKENS = max(120, int(os.getenv("FACT_GUARD_AUDIT_TOKENS", "180")))
 
 print(f"[FACT GUARD] {FACT_GUARD_VERSION}")
 
@@ -1259,6 +1259,15 @@ STRICT RULES:
   new/current transfer, is HIGH.
 - REVIEW means the wording requires human/secondary verification.
 - Ignore style, grammar and harmless editorial wording.
+- ENTITY/ROLE LOCK: For every named person/entity, verify that each action, role,
+  relationship and attribution belongs to the correct entity. A wrong person-role
+  or wrong person-action attribution is HIGH.
+- TEMPORAL LOCK: Bind dates, results, statuses and developments to the exact event
+  represented by the source evidence. Do not combine facts from different events,
+  rounds, dates or states as though they were one.
+- EVENT-STATUS LOCK: scheduled/expected/proposed/reported is not completed or confirmed
+  unless the source explicitly says so.
+- NUMBER/RESULT LOCK: verify every number, score, percentage and result attribution.
 
 For every issue, provide a short source excerpt that directly supports
 your conclusion. If no source excerpt can be identified, leave it empty
@@ -1692,67 +1701,13 @@ def validate(
 
     run_entity = _entity_attribution_signals(article)
 
-    # The broad semantic audit is always independent and remains mandatory.
-    # The focused audits are also independent of one another. In benchmark
-    # mode they may execute concurrently; their prompts, models, options,
-    # triggers, result parsing and issue normalization are unchanged.
-    if FACT_GUARD_PARALLEL_AUDITS:
-        jobs = {
-            "semantic": lambda: _ollama_audit(source, article),
-        }
-        if run_temporal:
-            jobs["temporal"] = lambda: _ollama_temporal_audit(source, article)
-        if run_event_date:
-            jobs["event_date"] = lambda: _ollama_event_date_audit(
-                source, article, reference_date
-            )
-        if run_entity:
-            jobs["entity_attribution"] = lambda: _ollama_entity_attribution_audit(
-                source, article
-            )
-
-        parallel_started = time.perf_counter()
-        results: Dict[str, Dict[str, Any]] = {}
-
-        with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
-            futures = {
-                executor.submit(job): name
-                for name, job in jobs.items()
-            }
-            for future in as_completed(futures):
-                name = futures[future]
-                results[name] = future.result()
-
-        print(
-            f"[FACT GUARD TIMER] parallel audit group END | "
-            f"elapsed={time.perf_counter() - parallel_started:.2f}s | "
-            f"audits={len(jobs)}"
-        )
-
-        semantic = results["semantic"]
-        temporal = results.get("temporal", {"issues": []})
-        event_date = results.get("event_date", {"issues": []})
-        entity_attribution = results.get(
-            "entity_attribution", {"issues": []}
-        )
-    else:
-        semantic = _ollama_audit(source, article)
-
-        temporal = {"issues": []}
-        if run_temporal:
-            temporal = _ollama_temporal_audit(source, article)
-
-        event_date = {"issues": []}
-        if run_event_date:
-            event_date = _ollama_event_date_audit(
-                source, article, reference_date
-            )
-
-        entity_attribution = {"issues": []}
-        if run_entity:
-            entity_attribution = _ollama_entity_attribution_audit(
-                source, article
-            )
+    # ONE production semantic audit. It explicitly covers entity attribution,
+    # chronology, event status and numbers, so independent focused audits do not
+    # re-run the same long source/article context on the CPU.
+    semantic = _ollama_audit(source, article)
+    temporal = {"issues": []}
+    event_date = {"issues": []}
+    entity_attribution = {"issues": []}
 
     all_issues = (
         deterministic

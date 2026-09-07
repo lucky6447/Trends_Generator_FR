@@ -6,7 +6,6 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-print("[TrendCurrent PIPELINE] universal-fact-lock-v2.7.0-source-independence-fact-lineage-substantive-value")
 
 import re
 import os
@@ -16,14 +15,12 @@ from datetime import date
 
 from config import MAX_ARTICLES_PER_RUN, LANGUAGE
 from rss import fetch_trends
-from news import fetch_news, extract_article
+from news import fetch_news, hydrate_story_sources, hydrate_news_items
 from prompt import build_prompt
 from ollama_client import generate, extract_evidence, validate_article_structure, substantive_story_value_gate
 from ollama import chat
 from config import MODEL
 from fact_guard import validate as fact_guard_validate
-from fact_guard_repair import repair as fact_guard_repair
-from repetition_guard import validate as repetition_guard_validate
 import json
 import unicodedata
 from html_generator import render_article, save_article
@@ -115,13 +112,17 @@ def validate_language_integrity(article):
 
 # Article length is determined by the amount of usable verified evidence.
 # There is no artificial word-count target or evidence-count-based minimum.
-#
-# Evidence sufficiency is a separate production-capacity gate: if the locked
-# evidence contains only 0-2 facts, the candidate is rejected before article
-# generation. This avoids spending the expensive generation/audit pipeline on
-# articles that cannot carry enough verified information to be meaningful.
+# Evidence with 1-2 facts is allowed to reach the substantive story-value gate;
+# that gate remains responsible for deciding whether the evidence can support
+# a meaningful standalone article.
+
+# Evidence sufficiency is a hard pre-generation eligibility gate.
+# Count only provenance-verified, deduplicated information units; syndicated
+# duplicates must not inflate the minimum. Candidates with fewer than 3
+# genuinely distinct usable facts are rejected before substantive-value judging
+# and before the expensive article-generation pipeline.
 EVIDENCE_MIN_FACTS_FOR_GENERATION = max(
-    1,
+    3,
     int(os.getenv("EVIDENCE_MIN_FACTS_FOR_GENERATION", "3")),
 )
 
@@ -834,6 +835,15 @@ def _discover_concrete_story_candidates(news, topic):
             components = [list(range(len(residual)))]
         for component in components:
             selected = [remaining[i] for i in component if 0 <= i < len(remaining)]
+            # A singleton residual is only an isolated outlier from a mixed
+            # topic pool, not a corroborated concrete story. Do not send it
+            # downstream to publisher hydration/evidence extraction.
+            if len(selected) < 2:
+                print(
+                    f"[STORY DISCOVERY] DROP residual singleton | "
+                    f"sources={len(selected)} | topic={topic}"
+                )
+                continue
             add_candidate(selected, "MIXED_RESIDUAL")
 
     print(
@@ -899,15 +909,18 @@ def _build_evidence_source(news, story_selection):
     for item in selected_news:
         title = str(item.get("title", "")).strip()
         summary = str(item.get("summary", "")).strip()
+        description = str(item.get("description", "")).strip()
         source = str(item.get("source", "")).strip()
         published = str(item.get("published", "")).strip()
         content = str(item.get("content", "")).strip()
-        evidence_text = content if len(content) >= 300 else summary
+        fallback_text = " ".join(x for x in (summary, description) if x).strip()
+        evidence_text = content if len(content) >= 300 else fallback_text
         compact_sources.append({
             "title": title,
             "source": source,
             "published": published,
             "summary": summary,
+            "description": description,
             "content": evidence_text[:5000],
         })
 
@@ -998,14 +1011,32 @@ def _build_fact_guard_source(news):
 
 
 
+def _shorten_headline(title):
+    title = " ".join(str(title or "").split()).strip()
+    if not title:
+        return title
+    if len(title) <= 65 and len(title.split()) <= 10:
+        return title
+
+    candidates = []
+    for sep in (" — ", " – ", " - ", ": ", "; ", ", "):
+        if sep in title:
+            candidates.extend(part.strip() for part in title.split(sep) if part.strip())
+    valid = [c for c in candidates if len(c) <= 65 and len(c.split()) <= 10]
+    if valid:
+        return max(valid, key=lambda x: (len(x), len(x.split())))
+
+    words = title.split()
+    kept = []
+    for word in words:
+        candidate = " ".join(kept + [word])
+        if len(candidate) > 65 or len(kept) + 1 > 10:
+            break
+        kept.append(word)
+    return " ".join(kept).rstrip(" ,:;–—-")
+
 HEADLINE_MAX_WORDS = 10
 HEADLINE_MAX_CHARS = 65
-
-# Headline-only repair must never invoke the full universal fact-lock pipeline.
-HEADLINE_REPAIR_THREADS = max(1, int(os.getenv("HEADLINE_REPAIR_THREADS", "16")))
-HEADLINE_REPAIR_CTX = max(2048, int(os.getenv("HEADLINE_REPAIR_CTX", "4096")))
-HEADLINE_REPAIR_BATCH = max(64, int(os.getenv("HEADLINE_REPAIR_BATCH", "256")))
-HEADLINE_REPAIR_TOKENS = max(48, int(os.getenv("HEADLINE_REPAIR_TOKENS", "96")))
 
 
 def _normalise_headline(text):
@@ -1019,188 +1050,65 @@ def _headline_source_suffix(title, news):
     normalized = _normalise_headline(title)
     if not normalized:
         return None
-
     parts = re.split(r"\s-\s", normalized)
     if len(parts) < 2:
         return None
-
     tail = parts[-1].strip(" .,:;\u2013\u2014")
     if not tail:
         return None
-
     for item in news or []:
         source = _normalise_headline(item.get("source", ""))
-        if not source:
-            continue
-        source = source.strip(" .,:;\u2013\u2014")
-        if tail == source or tail.endswith(source) or source.endswith(tail):
-            return tail
-
+        if source:
+            source = source.strip(" .,:;\u2013\u2014")
+            if tail == source or tail.endswith(source) or source.endswith(tail):
+                return tail
     if re.search(r"\.(?:co|com|id|net|org)(?:\.[a-z]{2,3})?$", tail):
         return tail
-
     return None
 
 
 def _headline_violations(article, trend):
     title = " ".join(str(article.get("title", "")).split()).strip()
     h1 = " ".join(str(article.get("h1", "")).split()).strip()
-    source_titles = [
-        str(x.get("title", "")).strip()
-        for x in trend.get("news", [])
-    ]
-
+    source_titles = [str(x.get("title", "")).strip() for x in trend.get("news", [])]
     violations = []
-
     if not title:
         violations.append("empty title")
     if len(title.split()) > HEADLINE_MAX_WORDS:
         violations.append(f"title exceeds {HEADLINE_MAX_WORDS} words")
     if len(title) > HEADLINE_MAX_CHARS:
         violations.append(f"title exceeds {HEADLINE_MAX_CHARS} characters")
-
     if not h1:
         violations.append("empty h1")
     if len(h1.split()) > HEADLINE_MAX_WORDS:
         violations.append(f"h1 exceeds {HEADLINE_MAX_WORDS} words")
     if len(h1) > HEADLINE_MAX_CHARS:
         violations.append(f"h1 exceeds {HEADLINE_MAX_CHARS} characters")
-
     if _headline_source_suffix(title, trend.get("news", [])):
         violations.append("publisher/source suffix in title")
     if _headline_source_suffix(h1, trend.get("news", [])):
         violations.append("publisher/source suffix in h1")
-
     title_norm = _normalise_headline(title)
-    if title_norm and any(
-        title_norm == _normalise_headline(x)
-        for x in source_titles if x
-    ):
+    if title_norm and any(title_norm == _normalise_headline(x) for x in source_titles if x):
         violations.append("title copies source headline")
-
     h1_norm = _normalise_headline(h1)
-    if h1_norm and any(
-        h1_norm == _normalise_headline(x)
-        for x in source_titles if x
-    ):
+    if h1_norm and any(h1_norm == _normalise_headline(x) for x in source_titles if x):
         violations.append("h1 copies source headline")
-
     if title_norm and h1_norm and title_norm != h1_norm:
         violations.append("title and h1 differ")
-
     return violations
 
 
-def _repair_headline(article, trend):
-    """Repair only title/H1 when the model violates the editorial headline policy."""
-    current_title = str(article.get("title", "")).strip()
-    current_h1 = str(article.get("h1", "")).strip()
-    topic = str(trend.get("title", "")).strip()
-
-    source_titles = [
-        str(x.get("title", "")).strip()
-        for x in trend.get("news", [])
-        if str(x.get("title", "")).strip()
-    ][:8]
-
-    source_block = "\n".join(f"- {x}" for x in source_titles)
-
-    repair_prompt = f"""
-You are a professional {LANGUAGE} news headline editor.
-
-You are NOT rewriting the article. You are repairing ONLY its public headline.
-The article has already been generated from source-locked evidence.
-
-MAIN TOPIC:
-{topic}
-
-CURRENT TITLE:
-{current_title}
-
-CURRENT H1:
-{current_h1}
-
-SOURCE HEADLINES FOR CONTEXT:
-{source_block}
-
-STRICT HEADLINE RULES:
-- Return exactly ONE clean editorial headline in {LANGUAGE}.
-- Maximum 10 words.
-- Maximum 65 characters.
-- Prefer 7-10 words when natural.
-- Keep only the core verified entity + core verified event/development.
-- Do NOT copy any source headline verbatim.
-- Do NOT include a publisher, website, domain, author or source name.
-- Do NOT use SEO listicle wording, keyword stuffing or filler.
-- Do NOT add any fact that is not already present in the supplied topic/headline context.
-- Preserve the factual status of the existing headline; shorten it rather than changing the claim.
-- The result must be suitable for a professional news card.
-
-Return ONLY valid JSON:
-{{"title":""}}
-"""
-
-    response = chat(
-        model=MODEL,
-        messages=[{"role": "user", "content": repair_prompt}],
-        options={
-            "temperature": 0.0,
-            "top_p": 0.85,
-            "top_k": 40,
-            "num_ctx": HEADLINE_REPAIR_CTX,
-            "num_predict": HEADLINE_REPAIR_TOKENS,
-            "num_batch": HEADLINE_REPAIR_BATCH,
-            "num_thread": HEADLINE_REPAIR_THREADS,
-        },
-        format={
-            "type": "object",
-            "properties": {"title": {"type": "string"}},
-            "required": ["title"],
-        },
-    )
-    raw = response.message.content or ""
-    try:
-        repaired = json.loads(raw)
-    except Exception as exc:
-        raise Exception(f"Headline repair returned invalid JSON: {exc}") from exc
-    if not isinstance(repaired, dict):
-        raise Exception("Headline repair did not return a JSON object")
-
-    new_title = " ".join(str(repaired.get("title", "")).split()).strip()
-    if not new_title:
-        raise Exception("Headline repair returned an empty title")
-
-    # Deterministic local fallback: never re-call Ollama for a headline
-    # that is still over the editorial limits after repair.
-    if len(new_title.split()) > HEADLINE_MAX_WORDS or len(new_title) > HEADLINE_MAX_CHARS:
-        words = new_title.split()
-        new_title = " ".join(words[:HEADLINE_MAX_WORDS]).strip()
-
-        if len(new_title) > HEADLINE_MAX_CHARS:
-            new_title = new_title[:HEADLINE_MAX_CHARS].rsplit(" ", 1)[0].strip(" -,:;")
-
-        if not new_title:
-            raise Exception("Headline repair produced no usable headline")
-
-    article["title"] = new_title
-    article["h1"] = new_title
-
-    violations = _headline_violations(article, trend)
-    if violations:
-        raise Exception("Headline repair failed: " + "; ".join(violations))
-
-    print(f"[HEADLINE GUARD] PASS -> {new_title}")
-    return article
-
-
 def enforce_headline_policy(article, trend):
-    violations = _headline_violations(article, trend)
-    if not violations:
-        print(f"[HEADLINE GUARD] PASS -> {article.get('title', '')}")
-        return article
-
-    print("[HEADLINE GUARD] REPAIR REQUIRED | " + "; ".join(violations))
-    return _repair_headline(article, trend)
+    """Deterministic headline policy only; never call the LLM for repair."""
+    title = str(article.get("title", "")).strip()
+    h1 = str(article.get("h1", "")).strip()
+    if not title or title != h1:
+        raise ValueError("Headline policy failed: title and H1 must be identical and non-empty.")
+    words = title.split()
+    if len(words) > 10 or len(title) > 65:
+        raise ValueError("Headline policy failed: title exceeds 10 words or 65 characters.")
+    return article
 
 def validate_article(article):
     if not isinstance(article, dict):
@@ -1262,212 +1170,145 @@ def _enrich_evidence_for_generation(evidence, trend):
     # newer, or more specific than the source body. The locked evidence facts are
     # the sole factual authority for generation.
     #
-    # Article length is now owned entirely by ollama_client._article_length_policy()
-    # and its deterministic body-word floor. Do not add a second fact-count-specific
-    # override here: a conflicting single-fact instruction previously encouraged
-    # extreme compression even when the density gate required a minimum body size.
-
     return enriched
 
 def _run_repetition_guard(article, generation_evidence, event_name="repetition_guard"):
-    print("[REPETITION GUARD] Checking paragraph-level information novelty...")
-    _rep_started = __import__("time").perf_counter()
-    repetition = repetition_guard_validate(article, generation_evidence)
-    _rep_elapsed = __import__("time").perf_counter() - _rep_started
-    print(f"[REPETITION GUARD TIMER] {event_name} END | elapsed={_rep_elapsed:.2f}s")
-    monitor.candidate_event(
-        event_name,
-        status=repetition.get("status"),
-        paragraph_count=repetition.get("paragraph_count"),
-        paragraphs_with_new_information=repetition.get("paragraphs_with_new_information"),
-        redundant_paragraphs=repetition.get("redundant_paragraphs"),
-        repeated_information_units=repetition.get("repeated_information_units"),
-        repeated_pairs=repetition.get("repeated_pairs"),
-        unique_information_units=repetition.get("unique_information_units"),
-        information_density=repetition.get("information_density"),
-        reason=repetition.get("reason"),
+    """Cheap deterministic post-generation repetition gate.
+
+    This gate is deterministic and blocks only obvious paragraph duplication.
+    It never calls Ollama and never repairs or regenerates the article.
+    """
+    import re
+
+    paragraphs = article.get("paragraphs", []) if isinstance(article, dict) else []
+    paragraphs = [str(p).strip() for p in paragraphs if str(p).strip()]
+    paragraph_count = len(paragraphs)
+
+    def words(text):
+        return [w for w in re.findall(r"[\w’'-]+", text.casefold()) if len(w) > 2]
+
+    def shingles(tokens, n=5):
+        return {tuple(tokens[i:i+n]) for i in range(len(tokens)-n+1)}
+
+    repeated_pairs = []
+    redundant = 0
+    for i in range(paragraph_count):
+        a = words(paragraphs[i])
+        sa = shingles(a)
+        for j in range(i + 1, paragraph_count):
+            b = words(paragraphs[j])
+            if not a or not b:
+                continue
+            sb = shingles(b)
+            if sa and sb:
+                inter = len(sa & sb)
+                union = len(sa | sb)
+                similarity = inter / union if union else 0.0
+            else:
+                aset, bset = set(a), set(b)
+                similarity = len(aset & bset) / max(1, min(len(aset), len(bset)))
+
+            # Very high phrase overlap means the later paragraph is almost certainly
+            # restating the same prose. This intentionally does not try to judge
+            # semantic paraphrase; false positives would be worse than missed nuances.
+            if similarity >= 0.72:
+                repeated_pairs.append([i + 1, j + 1])
+
+    redundant = len({pair[1] for pair in repeated_pairs})
+    status = "REJECT" if repeated_pairs else "PASS"
+    reason = (
+        "obvious paragraph duplication detected" if repeated_pairs
+        else "no obvious paragraph duplication"
     )
+
+    repetition = {
+        "status": status,
+        "reason": reason,
+        "paragraph_count": paragraph_count,
+        "paragraphs_with_new_information": paragraph_count - redundant,
+        "redundant_paragraphs": redundant,
+        "repeated_information_units": len(repeated_pairs),
+        "repeated_pairs": repeated_pairs,
+        "unique_information_units": max(0, paragraph_count - redundant),
+        "information_density": round((paragraph_count - redundant) / paragraph_count, 2) if paragraph_count else 0.0,
+    }
+
+    print(
+        f"[REPETITION GUARD] {status} | deterministic | "
+        f"paragraphs={paragraph_count} | repeated_pairs={len(repeated_pairs)}"
+    )
+    monitor.candidate_event(event_name, **repetition)
     return repetition
 
 
 def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max_attempts=1, prelocked_evidence=None):
-    last = None
+    """Generate once, validate once, publish only on PASS. No repair path exists."""
+    try:
+        generation_evidence = _enrich_evidence_for_generation(
+            prelocked_evidence,
+            trend,
+        )
+        article = generate(prompt, evidence=generation_evidence)
+        validate_article(article)
+        validate_article_structure(article, generation_evidence, label="Initial generated article")
 
-    for i in range(max_attempts):
-        try:
-            generation_evidence = _enrich_evidence_for_generation(
-                prelocked_evidence,
-                trend,
-            )
-            article = generate(prompt, evidence=generation_evidence)
-            validate_article(article)
-            validate_article_structure(article, generation_evidence, label="Initial generated article")
-
-            locked_facts = generation_evidence.get("facts", [])
-            paragraph_text = " ".join(str(p) for p in article.get("paragraphs", [])).strip()
-            if isinstance(locked_facts, list) and len(locked_facts) >= 3:
-                print(
-                    f"[EVIDENCE COVERAGE] locked_facts={len(locked_facts)} "
-                    f"| article_words={len(paragraph_text.split())}"
-                )
-
-            article = enforce_headline_policy(article, trend)
-            validate_article(article)
-            validate_language_integrity(article)
-            print("[LANGUAGE GUARD] PASS")
-
-            print("[FACT GUARD] Checking generated article...")
-            guard = fact_guard_validate(
-                fact_guard_source,
-                article,
-                reference_date=reference_date,
-            )
-            monitor.candidate_event(
-                "fact_guard",
-                status=guard.get("status"),
-                review_items=guard.get("review_items"),
-                blocking_issues=guard.get("blocking_issues"),
-                guard=guard,
+        locked_facts = generation_evidence.get("facts", [])
+        core_fact_ids = generation_evidence.get("core_fact_ids", [])
+        supporting_fact_ids = generation_evidence.get("supporting_fact_ids", [])
+        paragraph_text = " ".join(str(p) for p in article.get("paragraphs", [])).strip()
+        if isinstance(locked_facts, list) and len(locked_facts) >= 1:
+            print(
+                f"[EVIDENCE COVERAGE] locked_facts={len(locked_facts)} "
+                f"| core_facts={len(core_fact_ids)} "
+                f"| supporting_facts={len(supporting_fact_ids)} "
+                f"| article_words={len(paragraph_text.split())}"
             )
 
-            # Existing Fact Guard repair path. Its result is ALWAYS rechecked by
-            # both Fact Guard and Repetition Guard before publication.
-            if guard["status"] != "PASS":
-                print("[FACT GUARD] FLAG - article requires repair.")
-                print(json.dumps(guard, ensure_ascii=False, indent=2))
-                try:
-                    print("[FACT GUARD REPAIR] Attempting targeted repair v1.0...")
-                    _repair_started = __import__("time").perf_counter()
-                    repaired = fact_guard_repair(article, fact_guard_source, guard)
-                    _repair_elapsed = __import__("time").perf_counter() - _repair_started
-                    print(f"[FACT GUARD REPAIR TIMER] fact_guard_repair END | elapsed={_repair_elapsed:.2f}s")
-                    validate_article(repaired)
-                    validate_article_structure(repaired, generation_evidence, label="Fact Guard repaired article")
-                    repaired = enforce_headline_policy(repaired, trend)
-                    validate_article(repaired)
-                    validate_article_structure(repaired, generation_evidence, label="Fact Guard repaired article final")
-                    validate_language_integrity(repaired)
+        # Deterministic headline normalization only. No LLM repair/retry.
+        # If the model overshoots the hard display limit, remove only trailing/
+        # secondary headline wording; never invent or rewrite factual claims.
+        normalized_headline = _shorten_headline(article.get("title", ""))
+        article["title"] = normalized_headline
+        article["h1"] = normalized_headline
+        article = enforce_headline_policy(article, trend)
+        validate_article(article)
+        validate_language_integrity(article)
+        print("[LANGUAGE GUARD] PASS")
 
-                    print("[FACT GUARD REPAIR] Re-checking repaired article...")
-                    repaired_guard = fact_guard_validate(
-                        fact_guard_source, repaired, reference_date=reference_date
-                    )
-                    monitor.candidate_event(
-                        "fact_guard_repair_check",
-                        status=repaired_guard.get("status"),
-                        review_items=repaired_guard.get("review_items"),
-                        blocking_issues=repaired_guard.get("blocking_issues"),
-                        guard=repaired_guard,
-                        repaired_article=repaired,
-                    )
-                    if repaired_guard["status"] != "PASS":
-                        raise Exception(
-                            "Fact Guard repair failed re-validation "
-                            f"({repaired_guard['blocking_issues']} blocking issue(s))"
-                        )
+        print("[FACT GUARD] Checking generated article...")
+        guard = fact_guard_validate(
+            fact_guard_source,
+            article,
+            reference_date=reference_date,
+        )
+        monitor.candidate_event(
+            "fact_guard",
+            status=guard.get("status"),
+            review_items=guard.get("review_items"),
+            blocking_issues=guard.get("blocking_issues"),
+            guard=guard,
+        )
 
-                    repetition = _run_repetition_guard(
-                        repaired, generation_evidence, "repetition_guard_repaired"
-                    )
-                    if repetition.get("status") != "PASS":
-                        print("[REPETITION GUARD] REJECT - repaired article")
-                        print(json.dumps(repetition, ensure_ascii=False, indent=2))
-                        raise Exception(
-                            "Repetition Guard blocked repaired article: "
-                            f"{repetition.get('reason', 'paragraph redundancy detected')}"
-                        )
+        if guard.get("status") != "PASS":
+            print("[FACT GUARD] FAIL — article discarded; NO REPAIR")
+            print(json.dumps(guard, ensure_ascii=False, indent=2))
+            raise Exception("Fact Guard blocked article; publication blocked.")
 
-                    print("[FACT GUARD REPAIR] PASS - repaired article accepted.")
-                    print("[REPETITION GUARD] PASS - repaired article")
-                    validate_language_integrity(repaired)
-                    print("[LANGUAGE GUARD] FINAL REPAIRED ARTICLE PASS")
-                    return repaired
-                except Exception as repair_error:
-                    raise Exception(
-                        f"Fact Guard blocked article; repair failed: {repair_error}"
-                    ) from repair_error
+        print("[FACT GUARD] PASS")
 
-            print("[FACT GUARD] PASS")
+        repetition = _run_repetition_guard(article, generation_evidence)
+        if repetition.get("status") != "PASS":
+            print("[REPETITION GUARD] FAIL — article discarded; NO REPAIR")
+            print(json.dumps(repetition, ensure_ascii=False, indent=2))
+            raise Exception("Repetition Guard blocked article; publication blocked.")
 
-            repetition = _run_repetition_guard(article, generation_evidence)
-            if repetition.get("status") != "PASS":
-                print("[REPETITION GUARD] FLAG - attempting one targeted repair...")
-                print(json.dumps(repetition, ensure_ascii=False, indent=2))
+        validate_language_integrity(article)
+        print("[LANGUAGE GUARD] FINAL ARTICLE PASS")
+        return article
 
-                # IMPORTANT: do not generate a new article. Reuse the already
-                # validated article and the same locked evidence, and let the
-                # existing Fact Guard repair engine perform ONE targeted
-                # paragraph-level repair.
-                try:
-                    # Repetition repair is intentionally constrained to a
-                    # delete/restructure operation. It must never invent a new
-                    # information unit to fill a redundant paragraph.
-                    _repair_started = __import__("time").perf_counter()
-                    repaired = fact_guard_repair(
-                        article,
-                        fact_guard_source,
-                        {"issues": []},
-                        repetition_result=repetition,
-                    )
-                    _repair_elapsed = __import__("time").perf_counter() - _repair_started
-                    print(f"[FACT GUARD REPAIR TIMER] repetition_repair END | elapsed={_repair_elapsed:.2f}s")
-                    validate_article(repaired)
-                    validate_article_structure(repaired, generation_evidence, label="Repetition repaired article")
-                    repaired = enforce_headline_policy(repaired, trend)
-                    validate_article(repaired)
-                    validate_article_structure(repaired, generation_evidence, label="Repetition repaired article final")
-                    validate_language_integrity(repaired)
-
-                    print("[FACT GUARD] Re-checking repetition-repaired article...")
-                    repaired_guard = fact_guard_validate(
-                        fact_guard_source, repaired, reference_date=reference_date
-                    )
-                    monitor.candidate_event(
-                        "fact_guard_repetition_repair_check",
-                        status=repaired_guard.get("status"),
-                        review_items=repaired_guard.get("review_items"),
-                        blocking_issues=repaired_guard.get("blocking_issues"),
-                        guard=repaired_guard,
-                        repaired_article=repaired,
-                    )
-                    if repaired_guard["status"] != "PASS":
-                        raise Exception(
-                            "Fact Guard failed after repetition repair "
-                            f"({repaired_guard['blocking_issues']} blocking issue(s))"
-                        )
-
-                    final_repetition = _run_repetition_guard(
-                        repaired, generation_evidence, "repetition_guard_repair_check"
-                    )
-                    if final_repetition.get("status") != "PASS":
-                        print("[REPETITION GUARD] FINAL REJECT - repair did not remove redundancy")
-                        print(json.dumps(final_repetition, ensure_ascii=False, indent=2))
-                        raise Exception(
-                            "Repetition repair failed re-validation: "
-                            f"{final_repetition.get('reason', 'paragraph redundancy remains')}"
-                        )
-
-                    print("[REPETITION GUARD] PASS - repaired article")
-                    validate_language_integrity(repaired)
-                    print("[LANGUAGE GUARD] FINAL ARTICLE PASS")
-                    return repaired
-                except Exception as repair_error:
-                    raise Exception(
-                        f"Repetition Guard blocked article; targeted repair failed: {repair_error}"
-                    ) from repair_error
-
-            print("[REPETITION GUARD] PASS")
-            validate_language_integrity(article)
-            print("[LANGUAGE GUARD] FINAL ARTICLE PASS")
-            return article
-
-        except Exception as e:
-            last = e
-            print(f"Validation failed ({i+1}/{max_attempts}): {e}")
-            if "Fact Guard blocked article; repair failed:" in str(e) or "Repetition Guard blocked article; targeted repair failed:" in str(e):
-                break
-
-    raise Exception(last)
+    except Exception as e:
+        print(f"Validation failed: {e}")
+        raise
 
 
 def run_git(cmd):
@@ -1507,7 +1348,7 @@ def git_push():
 
 
 def main():
-    monitor.start_run(language=LANGUAGE, model=MODEL, pipeline="universal-fact-lock-v2.7.0-source-independence-fact-lineage-substantive-value", max_articles=MAX_ARTICLES_PER_RUN)
+    monitor.start_run(language=LANGUAGE, model=MODEL, pipeline="universal-fact-lock-v2.8.1-coverage-first-no-repair-fail-closed-discovery-evidence-optimized", max_articles=MAX_ARTICLES_PER_RUN)
     processed = load_processed()
     trends = fetch_trends()
     print(f"[TOPIC FILTER] Raw trends received: {len(trends)}")
@@ -1543,6 +1384,8 @@ def main():
 
         keyword = trend["title"]
 
+        # Cheap deterministic sports exclusion MUST happen before any news
+        # retrieval. Sports-only trends must not consume RSS/network capacity.
         if _is_sports_topic(keyword):
             print(f"[TrendCurrent] SKIP sports topic: {keyword}")
             continue
@@ -1557,12 +1400,6 @@ def main():
             seed = None
             if discovery_query:
                 seed = dict(trend)
-                if not seed.get("content") and seed.get("link"):
-                    try:
-                        seed["content"] = extract_article(seed["link"])
-                    except Exception:
-                        seed["content"] = ""
-
                 seed_anchor = str(seed.get("title", "")).strip() or keyword
                 entity_query = _build_related_story_query(seed_anchor)
                 if not entity_query:
@@ -1571,29 +1408,8 @@ def main():
                 print(f"[TOPIC FILTER] Related story search: {entity_query}")
                 news = fetch_news(entity_query)
 
-                seed_title_norm = _normalise_headline(seed.get("title", ""))
-                if len(str(seed.get("content", "")).strip()) < 900 and news:
-                    best = None
-                    best_overlap = 0
-                    seed_words = {
-                        w for w in re.findall(r"[a-z0-9]+", seed_title_norm.casefold())
-                        if len(w) >= 4
-                    }
-                    for candidate in news:
-                        cand_norm = _normalise_headline(candidate.get("title", ""))
-                        cand_words = {
-                            w for w in re.findall(r"[a-z0-9]+", cand_norm.casefold())
-                            if len(w) >= 4
-                        }
-                        overlap = len(seed_words & cand_words)
-                        if overlap > best_overlap:
-                            best_overlap = overlap
-                            best = candidate
-                    if best is not None and best_overlap >= 2:
-                        if not seed.get("content") and best.get("content"):
-                            seed["content"] = best.get("content")
-                        if best.get("summary"):
-                            seed["summary"] = best.get("summary")
+                # Discovery remains metadata-only. Full article extraction is deferred
+                # until a concrete story candidate has been selected.
 
                 if seed.get("title") and not any(
                     str(x.get("title", "")).strip().casefold() ==
@@ -1608,8 +1424,14 @@ def main():
                     found = fetch_news(search_query)
                     if found:
                         news.extend(found)
-                    if filter_relevant_news(trend, news):
-                        break
+                    # Keep the targeted-query ladder cheap: stop once a query
+                    # produces a relevant pool, but carry that already-filtered
+                    # pool forward so the relevance gate is not executed twice.
+                    if found:
+                        candidate_relevant = filter_relevant_news(trend, news)
+                        if candidate_relevant:
+                            news = candidate_relevant
+                            break
 
             if not news:
                 print(
@@ -1618,14 +1440,17 @@ def main():
                 )
                 continue
 
-            relevant_news = filter_relevant_news(trend, news)
-            if not relevant_news:
+            # Apply relevance once for discovery_query flows. Targeted-query
+            # flows may already have a filtered pool from the early-stop ladder.
+            if discovery_query:
+                news = filter_relevant_news(trend, news)
+
+            if not news:
                 print(
                     f"[TOPIC FILTER] DROP AFTER NEWS | {keyword} | "
                     f"no topic-relevant news result(s)"
                 )
                 continue
-            news = relevant_news
 
             if _is_sports_topic(keyword, news):
                 print(f"[TrendCurrent] SKIP sports topic after relevance: {keyword}")
@@ -1663,7 +1488,43 @@ def main():
 
                 try:
                     generation_prompt = build_prompt(trend)
-                    selected_news = _selected_story_news(news, story_selection)
+
+                    # STAGED SOURCE ACQUISITION:
+                    # story discovery uses RSS metadata only; full publisher extraction
+                    # is performed only for the already selected concrete story sources.
+                    #
+                    # A MIXED_RESIDUAL candidate must contain at least two sources.
+                    # Singleton residuals are filtered during discovery; this second
+                    # invariant protects the downstream boundary if candidate data
+                    # changes or is malformed.
+                    if (
+                        str(story_selection.get("semantic_status", "")).upper()
+                        == "MIXED_RESIDUAL"
+                        and int(story_selection.get("selected_count", 0) or 0) < 2
+                    ):
+                        raise ValueError(
+                            "Mixed residual story requires at least two independent sources."
+                        )
+
+                    selected_news = hydrate_story_sources(
+                        news,
+                        story_selection,
+                        include_images=False,
+                    )
+                    if not selected_news:
+                        raise ValueError("Selected story has no usable hydrated sources.")
+
+                    # A selected source with no body and no usable summary is not usable
+                    # evidence and must never reach Ollama generation.
+                    usable_selected_news = [
+                        item for item in selected_news
+                        if len(str(item.get("content", "")).strip()) >= 120
+                        or len(str(item.get("summary", "")).strip()) >= 120
+                    ]
+                    if not usable_selected_news:
+                        raise ValueError("Selected story sources have no usable factual text.")
+                    selected_news = usable_selected_news
+
                     fact_guard_source = _build_fact_guard_source(selected_news)
 
                     print(
@@ -1677,7 +1538,7 @@ def main():
                         f"story={story_number}/{len(story_candidates)}"
                     )
 
-                    evidence_source = _build_evidence_source(news, story_selection)
+                    evidence_source = _build_evidence_source(selected_news, story_selection)
                     print(
                         f"[TOPIC FILTER] Evidence source prepared | "
                         f"source_chars={len(evidence_source)}"
@@ -1694,30 +1555,45 @@ def main():
                         if isinstance(locked_facts, list)
                         else 0
                     )
+                    lineage = (
+                        evidence_lock.get("fact_lineage", {})
+                        if isinstance(evidence_lock, dict)
+                        else {}
+                    )
+                    unique_information_units = (
+                        int(lineage.get("unique_information_units", evidence_fact_count))
+                        if isinstance(lineage, dict)
+                        else evidence_fact_count
+                    )
 
-                    if evidence_fact_count < EVIDENCE_MIN_FACTS_FOR_GENERATION:
+                    # Hard article-eligibility gate: a standalone TrendCurrent
+                    # article must have at least three distinct verified
+                    # information units. This is NOT a word floor, NOT a retry,
+                    # and NOT a ranking rule. It prevents thin 1-2 fact evidence
+                    # from reaching generation and producing non-articles.
+                    if unique_information_units < EVIDENCE_MIN_FACTS_FOR_GENERATION:
                         trend["_production_status"] = "REJECT"
                         trend["_production_reject_reason"] = (
-                            f"insufficient evidence facts "
-                            f"({evidence_fact_count} < "
+                            f"insufficient unique evidence facts "
+                            f"({unique_information_units} < "
                             f"{EVIDENCE_MIN_FACTS_FOR_GENERATION})"
                         )
                         print(
                             f"[TOPIC FILTER] EVIDENCE SUFFICIENCY REJECT | "
-                            f"facts={evidence_fact_count} | "
+                            f"unique_information_units={unique_information_units} | "
                             f"minimum={EVIDENCE_MIN_FACTS_FOR_GENERATION} | "
                             f"{keyword} | story={story_number} | "
-                            f"reason=insufficient evidence for meaningful article"
+                            f"reason=insufficient distinct evidence for meaningful article"
                         )
                         monitor.candidate_event(
                             "evidence_sufficiency",
                             status="REJECT",
-                            reason="insufficient evidence for meaningful article",
                             news_count=len(news),
                             selected_source_indices=story_selection.get("selected_indices", []),
                             selected_source_count=story_selection.get("selected_count"),
                             evidence_source_chars=len(evidence_source),
                             evidence_fact_count=evidence_fact_count,
+                            unique_information_units=unique_information_units,
                             evidence_facts=locked_facts,
                             minimum_facts=EVIDENCE_MIN_FACTS_FOR_GENERATION,
                         )
@@ -1762,6 +1638,7 @@ def main():
                         evidence_source_chars=len(evidence_source),
                         evidence_facts=locked_facts,
                         evidence_fact_count=evidence_fact_count,
+                        unique_information_units=unique_information_units,
                     )
 
                     evidence_lock = _enrich_evidence_for_generation(
@@ -1817,6 +1694,10 @@ def main():
 
                     slug = slugify(keyword)
                     article["slug"] = slug
+
+                    # Images are presentation metadata, not discovery/evidence data.
+                    # Extract them only after the article has passed every quality gate.
+                    selected_news = hydrate_news_items(selected_news, include_images=True)
                     save_article(slug, render_article(article, news=selected_news))
 
                     new_keywords.append(keyword)
