@@ -1241,8 +1241,116 @@ def _run_repetition_guard(article, generation_evidence, event_name="repetition_g
     return repetition
 
 
+def _is_fact_guard_infrastructure_error(exc):
+    """Return True only for validator transport/serialization failures.
+
+    A malformed/incomplete Fact Guard response is an infrastructure failure, not
+    a factual verdict. It is safe to retry the SAME already-generated article
+    because this does not regenerate, repair, or alter the article.
+    """
+    message = str(exc or "").casefold()
+    infrastructure_markers = (
+        "incomplete json object",
+        "json decode error",
+        "jsondecodeerror",
+        "malformed json",
+        "invalid json",
+        "unterminated json",
+        "unexpected end of json",
+        "unexpected end of input",
+        "truncated json",
+    )
+    return any(marker in message for marker in infrastructure_markers)
+
+
+def _run_fact_guard_with_bounded_infrastructure_retry(
+    fact_guard_source,
+    article,
+    reference_date,
+    max_attempts=2,
+):
+    """Run Fact Guard with bounded retry ONLY for malformed validator output.
+
+    Important invariants:
+      - The generated article is never changed.
+      - The evidence lock is never changed.
+      - No article regeneration occurs.
+      - A real Fact Guard PASS/FAIL is returned immediately.
+      - Only a validator serialization/parsing failure may be retried.
+      - If the validator remains unavailable, fail closed with a distinct error.
+    """
+    attempts = max(1, int(max_attempts or 1))
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            guard = fact_guard_validate(
+                fact_guard_source,
+                article,
+                reference_date=reference_date,
+            )
+
+            if not isinstance(guard, dict):
+                raise ValueError(
+                    f"Fact Guard returned invalid result type: {type(guard).__name__}"
+                )
+
+            monitor.candidate_event(
+                "fact_guard",
+                status=guard.get("status"),
+                review_items=guard.get("review_items"),
+                blocking_issues=guard.get("blocking_issues"),
+                guard=guard,
+                attempt=attempt,
+                max_attempts=attempts,
+            )
+            return guard
+
+        except Exception as exc:
+            last_error = exc
+
+            if not _is_fact_guard_infrastructure_error(exc):
+                # A factual/semantic failure is NOT retryable. Preserve the
+                # existing fail-closed behaviour and never confuse it with
+                # infrastructure recovery.
+                raise
+
+            if attempt < attempts:
+                print(
+                    f"[FACT GUARD] INFRASTRUCTURE RETRY | "
+                    f"attempt={attempt}/{attempts} | "
+                    f"reason={exc}"
+                )
+                monitor.candidate_event(
+                    "fact_guard_infrastructure",
+                    status="RETRY",
+                    attempt=attempt,
+                    max_attempts=attempts,
+                    reason=str(exc),
+                )
+                continue
+
+            monitor.candidate_event(
+                "fact_guard_infrastructure",
+                status="UNAVAILABLE",
+                attempt=attempt,
+                max_attempts=attempts,
+                reason=str(exc),
+            )
+            raise RuntimeError(
+                f"Fact Guard infrastructure failure after {attempts} attempts: "
+                f"{last_error}"
+            ) from last_error
+
+
 def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max_attempts=1, prelocked_evidence=None):
-    """Generate once, validate once, publish only on PASS. No repair path exists."""
+    """Generate once, validate once, publish only on PASS.
+
+    There is NO article repair or generation retry. Fact Guard alone has a
+    bounded infrastructure retry when its validator response is malformed or
+    incomplete; this retries the audit of the identical article and does not
+    alter the evidence or article.
+    """
     try:
         generation_evidence = _enrich_evidence_for_generation(
             prelocked_evidence,
@@ -1276,17 +1384,11 @@ def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max
         print("[LANGUAGE GUARD] PASS")
 
         print("[FACT GUARD] Checking generated article...")
-        guard = fact_guard_validate(
+        guard = _run_fact_guard_with_bounded_infrastructure_retry(
             fact_guard_source,
             article,
-            reference_date=reference_date,
-        )
-        monitor.candidate_event(
-            "fact_guard",
-            status=guard.get("status"),
-            review_items=guard.get("review_items"),
-            blocking_issues=guard.get("blocking_issues"),
-            guard=guard,
+            reference_date,
+            max_attempts=2,
         )
 
         if guard.get("status") != "PASS":
