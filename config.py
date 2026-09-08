@@ -2,28 +2,26 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 
-# Google Trends France
+# ===== Fixed language identity (do not inherit process environment) =====
+LANGUAGE = 'fr'
+LANGUAGE_NAME = 'Français'
+COUNTRY = 'France'
+
+# ===== Permanent discovery mode =====
+SOURCE_FIRST = True
 RSS_URL = "https://trends.google.com/trending/rss?geo=FR"
 
-# AI Article Generation
-COUNTRY = "France"
-LANGUAGE = "French"
+# ===== Ollama / site =====
+MODEL = "ministral-3:14b-instruct-2512-q4_K_M"
+SITE_NAME = 'TrendCurrent'
+SITE_URL = 'https://trendcurrent.today'
 
-# Ollama Model
-MODEL = "qwen2.5:14b"
-
-# Website
-SITE_NAME = "Tendances en France"
-SITE_URL = "https://fr.trendcurrent.today"
-
-# Directories
+# ===== Storage =====
 TREND_DIR = ROOT / "trends"
 TEMPLATE_FILE = ROOT / "template.html"
 PROCESSED_FILE = ROOT / "processed.json"
 
-# Generator Settings
+# ===== Runner =====
 CHECK_INTERVAL = 600
 MAX_ARTICLES_PER_RUN = 1
-
-# Number of articles displayed on each index page
 ARTICLES_PER_PAGE = 18

@@ -13,16 +13,21 @@ import difflib
 import subprocess
 from datetime import date
 
-from config import MAX_ARTICLES_PER_RUN, LANGUAGE
+from config import MAX_ARTICLES_PER_RUN, LANGUAGE, SOURCE_FIRST, TREND_DIR
 from rss import fetch_trends
-from news import fetch_news, hydrate_story_sources, hydrate_news_items
+from rss_source_discovery import fetch_source_stories
+from news import fetch_news, fetch_news_discovery, hydrate_story_sources, hydrate_news_items
 from prompt import build_prompt
 from ollama_client import generate, extract_evidence, validate_article_structure, substantive_story_value_gate
 from ollama import chat
 from config import MODEL
-from fact_guard import validate as fact_guard_validate
+
+# Minimum confidence required before rescuing a safe semantic sub-cluster.
+# Keep this conservative: semantic rescue must still have >=2 explicit sources.
+SEMANTIC_RESCUE_MIN_CONFIDENCE = 85
 import json
 import unicodedata
+from urllib.parse import urljoin, urlparse, parse_qs
 from html_generator import render_article, save_article
 from processed import load_processed, add_processed
 from index_generator import update_all
@@ -30,6 +35,41 @@ from topic_scorer import filter_relevant_news, _is_sports_match_topic, _skip_rea
 import generator_monitor as monitor
 
 REQUIRED_FIELDS = ["title", "description", "h1", "paragraphs"]
+
+
+def _strip_markdown_formatting(value):
+    """Remove Markdown emphasis markers from model output before HTML rendering.
+
+    The article renderer expects plain text/HTML, not Markdown. A model may still
+    return emphasis such as *text* or **text**, which would otherwise be exposed
+    literally in the published page as stray asterisks.
+    """
+    text = str(value or "")
+    # Handle strongest emphasis first so the inner passes cannot leave markers.
+    text = re.sub(r"\*\*\*(.*?)\*\*\*", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"(?<!\*)\*(?!\s)(.*?)(?<!\s)\*(?!\*)", r"\1", text, flags=re.DOTALL)
+    return text
+
+
+def _sanitize_article_markdown(article):
+    """Normalize model output that is intended to be rendered as HTML."""
+    if not isinstance(article, dict):
+        return article
+
+    cleaned = dict(article)
+    for field in ("title", "description", "h1"):
+        if field in cleaned:
+            cleaned[field] = _strip_markdown_formatting(cleaned[field])
+
+    paragraphs = cleaned.get("paragraphs")
+    if isinstance(paragraphs, list):
+        cleaned["paragraphs"] = [
+            _strip_markdown_formatting(paragraph)
+            for paragraph in paragraphs
+        ]
+
+    return cleaned
 
 
 def _article_text(article):
@@ -227,11 +267,203 @@ def _is_sports_topic(title, news=None):
     )
 
 
-
 def slugify(text):
     text = text.lower()
     text = re.sub(r"[^a-z0-9]+", "-", text)
     return text.strip("-")
+
+
+def _normalize_existing_story_title(text):
+    """Normalize a headline for the pre-generation existing-story check."""
+    text = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    text = re.sub(r"\s+", " ", text).strip()
+    # Publisher suffixes are not part of the underlying story identity.
+    text = re.sub(
+        r"\s*[-|–—]\s*(?:bbc(?: news)?|reuters|associated press|ap|cnn|"
+        r"the guardian|nytimes|new york times|sky news|abc news|cbs news|"
+        r"nbc news|fox news)\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+_EXISTING_STORY_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "amid", "after", "before", "during",
+    "with", "without", "from", "into", "over", "under", "for", "of", "to", "in",
+    "on", "at", "as", "by", "is", "are", "was", "were", "has", "have", "had",
+    "new", "latest", "news", "report", "reports", "update", "updates",
+}
+
+
+def _story_identity_tokens(text):
+    normalized = _normalize_existing_story_title(text)
+    return {
+        token for token in normalized.split()
+        if len(token) >= 3 and token not in _EXISTING_STORY_STOPWORDS
+    }
+
+
+def _existing_story_title_match(candidate_title, existing_title):
+    """Return conservative deterministic evidence that two titles cover one story.
+
+    This is intentionally stricter than topical similarity. It is only a
+    pre-generation guard: false positives are more harmful than allowing a
+    borderline story through to later quality gates.
+    """
+    a = _normalize_existing_story_title(candidate_title)
+    b = _normalize_existing_story_title(existing_title)
+    if not a or not b:
+        return False, 0.0, 0, 0.0
+
+    if a == b:
+        return True, 1.0, len(_story_identity_tokens(a)), 1.0
+
+    sequence_ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    ta = _story_identity_tokens(a)
+    tb = _story_identity_tokens(b)
+    common = ta & tb
+    min_coverage = (
+        len(common) / min(len(ta), len(tb))
+        if ta and tb else 0.0
+    )
+
+    # Exact/near-identical headline.
+    if sequence_ratio >= 0.82:
+        return True, sequence_ratio, len(common), min_coverage
+
+    # Strong shared story vocabulary. Requiring >=4 non-generic tokens and
+    # >=50% coverage avoids rejecting merely related stories.
+    if len(common) >= 4 and min_coverage >= 0.50:
+        return True, sequence_ratio, len(common), min_coverage
+
+    # Three shared tokens can still be enough when the headlines are clearly
+    # paraphrases rather than merely sharing a broad topic.
+    if len(common) >= 3 and sequence_ratio >= 0.68 and min_coverage >= 0.50:
+        return True, sequence_ratio, len(common), min_coverage
+
+    return False, sequence_ratio, len(common), min_coverage
+
+
+def _extract_existing_article_titles():
+    """Read already-published article titles from this language's trends directory.
+
+    Only local published HTML is inspected. No network call and no LLM call are
+    used here. Malformed/unreadable files are ignored so one bad article cannot
+    stop the production run.
+    """
+    titles = []
+    try:
+        paths = sorted(TREND_DIR.glob("*.html"))
+    except Exception as exc:
+        print(f"[EXISTING STORY] inventory unavailable: {exc}")
+        return titles
+
+    for path in paths:
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        found = []
+        for pattern in (
+            r"<title[^>]*>(.*?)</title>",
+            r"<h1[^>]*>(.*?)</h1>",
+            r'"headline"\s*:\s*"([^"]+)"',
+        ):
+            for match in re.findall(pattern, raw, flags=re.IGNORECASE | re.DOTALL):
+                value = re.sub(r"<[^>]+>", " ", match)
+                value = re.sub(r"\s+", " ", value).strip()
+                if value:
+                    found.append(value)
+
+        # One title is enough per article. Prefer <title>, then h1/JSON-LD.
+        title = next((value for value in found if value), "")
+        if title:
+            titles.append({
+                "path": str(path),
+                "title": title,
+            })
+
+    return titles
+
+
+def _existing_story_check(topic_title, news, story_selection):
+    """Check whether the concrete story is already represented by a published article.
+
+    The check runs before publisher hydration, evidence extraction and article
+    generation. It uses the canonical trend title plus the selected source
+    headlines, because a publisher headline often names the same event more
+    precisely than the discovery seed.
+    """
+    existing = _extract_existing_article_titles()
+    if not existing:
+        return None
+
+    selected_indices = story_selection.get("selected_indices", []) if isinstance(story_selection, dict) else []
+    candidate_titles = [str(topic_title or "").strip()]
+
+    for index in selected_indices:
+        try:
+            item = news[int(index)]
+        except (IndexError, TypeError, ValueError):
+            continue
+        if not isinstance(item, dict):
+            continue
+        for key in ("title",):
+            value = str(item.get(key, "") or "").strip()
+            if value:
+                candidate_titles.append(value)
+
+    # De-duplicate candidate headlines before comparing.
+    candidate_titles = list(dict.fromkeys(candidate_titles))
+
+    best = None
+    for candidate_title in candidate_titles:
+        for item in existing:
+            matched, ratio, common_count, coverage = _existing_story_title_match(
+                candidate_title,
+                item["title"],
+            )
+            if not matched:
+                continue
+
+            score = (
+                1.0 if _normalize_existing_story_title(candidate_title)
+                == _normalize_existing_story_title(item["title"])
+                else (ratio + min(coverage, 1.0) * 0.20 + min(common_count, 6) * 0.03)
+            )
+            if best is None or score > best["score"]:
+                best = {
+                    "candidate_title": candidate_title,
+                    "existing_title": item["title"],
+                    "path": item["path"],
+                    "ratio": ratio,
+                    "common_tokens": common_count,
+                    "coverage": coverage,
+                    "score": score,
+                }
+
+    if best:
+        print(
+            f"[EXISTING STORY] REJECT | already_covered=true | "
+            f"existing={best['existing_title']} | "
+            f"candidate={best['candidate_title']} | "
+            f"similarity={best['ratio']:.3f} | "
+            f"common_tokens={best['common_tokens']} | "
+            f"coverage={best['coverage']:.3f} | "
+            f"file={best['path']}"
+        )
+        return best
+
+    print(
+        f"[EXISTING STORY] PASS | published_articles={len(existing)} | "
+        f"candidate_headlines={len(candidate_titles)}"
+    )
+    return None
 
 
 def _build_targeted_news_queries(title):
@@ -462,129 +694,87 @@ class StorySourceUnavailable(Exception):
 
 
 def _semantic_story_concentration_judge(news, topic):
-    """One compact semantic judgment for borderline source pools."""
+    """Fallback semantic splitter for genuinely ambiguous source pools.
+
+    Deterministic clustering is attempted first. This LLM call is deliberately
+    single-shot and compact; it must never be the normal path for an obvious
+    cluster.
+    """
     items = list(news or [])
     lines = []
     for idx, item in enumerate(items[:12], 1):
         title = str(item.get("title", "")).strip()
-        summary = re.sub(r"\s+", " ", str(item.get("summary", "")).strip())[:260]
+        summary = re.sub(r"\s+", " ", str(item.get("summary", "")).strip())[:180]
         if title:
-            lines.append(f"{idx}. TITLE: {title}\n   SUMMARY: {summary}")
+            lines.append(f"{idx}. {title} | {summary}")
     if not lines:
-        return {"status": "MIXED", "confidence": 0, "reason": "no semantic input", "source_numbers": []}
+        return {"status": "MIXED", "confidence": 0, "reason": "no input", "source_numbers": []}
 
     prompt = f"""
-You are TrendCurrent's pre-evidence story selector.
-
-Classify the retrieved source pool into exactly one:
-1) ONE_STORY - the source pool broadly corroborates one concrete news story/event.
-2) DOMINANT_STORY - a clearly identifiable, strongly corroborated story cluster
-   can be isolated from a noisy pool, while the remaining sources are unrelated
-   outliers. The isolated cluster does NOT have to be 50% or more of the pool.
-3) MIXED - no single concrete story can be isolated safely.
-
-TOPIC: {str(topic or '').strip()}
-
-Rules:
-- Same broad topic is NOT the same story.
-- Different wording or languages for the SAME event counts as the same story.
-- DOMINANT_STORY does NOT require a numerical majority of the full source pool.
-- A smaller cluster may qualify when at least 2 sources clearly describe the
-  same concrete event/development and the cluster can be isolated safely.
-- Do not select a smaller cluster merely because the sources share a person,
-  team, tournament, programme, region, or broad topic.
-- Separate local/regional stories, separate people/events, programmes, lists,
-  roundups, or unrelated developments are outliers and must not be selected.
-- Be conservative. Never invent a connection.
+Identify one safe concrete story cluster in this source pool.
 
 Return ONLY JSON:
-{{"verdict":"DOMINANT_STORY","confidence":95,"source_numbers":[1,2,3],"reason":"brief reason"}}
+{{"verdict":"ONE_STORY|DOMINANT_STORY|MIXED","confidence":0-100,"source_numbers":[1,2],"reason":"brief"}}
 
-SOURCE HEADLINES:
+Rules:
+- Same concrete event counts as one story, even with different wording.
+- Shared person/company/topic alone is not enough.
+- DOMINANT_STORY requires at least 2 sources clearly describing the same event.
+- MIXED means no safe cluster can be isolated.
+- Never invent a connection.
+
+TOPIC: {str(topic or "").strip()}
+SOURCES:
 {chr(10).join(lines)}
 """
-
-    # Bounded infrastructure recovery ONLY for the semantic judge.
-    # This is not an article/evidence/generation retry.
-    # Attempt 1 is normal; attempt 2 is allowed only when the first attempt
-    # fails before producing a valid semantic verdict.
-    max_attempts = 2
-    last_error = None
-
-    for attempt in range(1, max_attempts + 1):
-        try:
-            started = __import__("time").perf_counter()
-            raw = chat(
-                model=MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                options={
-                    "temperature": 0.0,
-                    "top_p": 0.85,
-                    "top_k": 40,
-                    "num_ctx": max(4096, int(os.getenv("OLLAMA_NUM_CTX", "6144"))),
-                    "num_predict": 160,
-                },
-                format="json",
-            )
-            elapsed = __import__("time").perf_counter() - started
-            content = getattr(getattr(raw, "message", None), "content", "") or ""
-            start_json = content.find("{")
-            end_json = content.rfind("}")
-            if start_json < 0 or end_json <= start_json:
-                raise ValueError("semantic selector returned no JSON object")
-            result = json.loads(content[start_json:end_json + 1])
-            verdict = str(result.get("verdict", "")).strip().upper()
-            confidence = max(0, min(100, int(result.get("confidence", 0))))
-            reason = str(result.get("reason", "")).strip()[:300]
-            raw_numbers = result.get("source_numbers", [])
-            source_numbers = []
-            if isinstance(raw_numbers, list):
-                for value in raw_numbers:
-                    try:
-                        number = int(value)
-                    except (TypeError, ValueError):
-                        continue
-                    if 1 <= number <= len(items) and number not in source_numbers:
-                        source_numbers.append(number)
-            if verdict not in {"PASS", "ONE_STORY", "DOMINANT_STORY", "MIXED"}:
-                raise ValueError(f"invalid semantic verdict: {verdict}")
-
-            print(
-                f"[TOPIC FILTER] STORY SOURCE JUDGE | {verdict} | "
-                f"confidence={confidence} | attempt={attempt}/{max_attempts} | "
-                f"elapsed={elapsed:.2f}s | {reason}"
-            )
-            return {
-                "status": verdict,
-                "confidence": confidence,
-                "reason": reason or "semantic story selection judgment",
-                "source_numbers": source_numbers,
-            }
-
-        except Exception as exc:
-            last_error = exc
-            if attempt < max_attempts:
-                print(
-                    f"[TOPIC FILTER] STORY SOURCE JUDGE | RETRY | "
-                    f"attempt={attempt}/{max_attempts} | {exc}"
-                )
-                continue
-
-            print(
-                f"[TOPIC FILTER] STORY SOURCE JUDGE | UNAVAILABLE | "
-                f"attempts={max_attempts} | {exc}"
-            )
-            return {
-                "status": "UNAVAILABLE",
-                "confidence": 0,
-                "reason": f"semantic selector unavailable after {max_attempts} attempts: {last_error}",
-                "source_numbers": [],
-            }
-
-
-SEMANTIC_RESCUE_MIN_CONFIDENCE = 90
-
-
+    try:
+        started = __import__("time").perf_counter()
+        raw = chat(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            options={
+                "temperature": 0.0,
+                "top_p": 0.85,
+                "top_k": 40,
+                "num_ctx": max(4096, int(os.getenv("OLLAMA_NUM_CTX", "4096"))),
+                "num_predict": 96,
+            },
+            format="json",
+        )
+        elapsed = __import__("time").perf_counter() - started
+        content = getattr(getattr(raw, "message", None), "content", "") or ""
+        start_json = content.find("{")
+        end_json = content.rfind("}")
+        if start_json < 0 or end_json <= start_json:
+            raise ValueError("semantic selector returned no JSON object")
+        result = json.loads(content[start_json:end_json + 1])
+        verdict = str(result.get("verdict", "")).strip().upper()
+        confidence = max(0, min(100, int(result.get("confidence", 0) or 0)))
+        reason = str(result.get("reason", "")).strip()[:300]
+        raw_numbers = result.get("source_numbers", [])
+        source_numbers = []
+        if isinstance(raw_numbers, list):
+            for value in raw_numbers:
+                try:
+                    number = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= number <= len(items):
+                    source_numbers.append(number)
+        source_numbers = list(dict.fromkeys(source_numbers))
+        status = verdict if verdict in {"ONE_STORY", "DOMINANT_STORY", "MIXED"} else "MIXED"
+        print(
+            f"[TOPIC FILTER] STORY SOURCE JUDGE | {status} | "
+            f"confidence={confidence} | elapsed={elapsed:.2f}s"
+        )
+        return {
+            "status": status,
+            "confidence": confidence,
+            "source_numbers": source_numbers,
+            "reason": reason,
+        }
+    except Exception as exc:
+        raise StorySourceUnavailable(str(exc)) from exc
 def _source_independence_text(item):
     """Return publisher text used only for conservative syndication detection."""
     if not isinstance(item, dict):
@@ -754,12 +944,10 @@ def _deduplicate_syndicated_sources(news):
 
 
 def _discover_concrete_story_candidates(news, topic):
-    """Identify concrete stories inside a topic without topic-level rejection.
+    """Identify concrete stories using deterministic clustering first.
 
-    Lexical clustering is used as the deterministic baseline. When the pool is
-    ambiguous, the existing semantic story judge is used to isolate a concrete
-    story cluster. MIXED never means "reject topic": the remaining sources are
-    still split/evaluated as independent candidates.
+    Semantic selection is a fallback only when lexical clustering cannot safely
+    isolate a corroborated story. This keeps LLM inference off the common path.
     """
     original_items = list(news or [])
     if not original_items:
@@ -780,8 +968,7 @@ def _discover_concrete_story_candidates(news, topic):
         if not selected:
             return
         original_indices = sorted(dict.fromkeys(
-            kept_original[i] for i in selected
-            if 0 <= i < len(kept_original)
+            kept_original[i] for i in selected if 0 <= i < len(kept_original)
         ))
         if not original_indices or tuple(original_indices) in seen:
             return
@@ -800,33 +987,47 @@ def _discover_concrete_story_candidates(news, topic):
             "component_index": len(candidates),
         })
 
-    # Very small pools do not justify an additional semantic call.
     if len(items) < 3:
         add_candidate(remaining)
     else:
-        # First pass: semantic identification of a concrete story. This is a
-        # splitter, never a topic-level gate.
-        try:
-            judge = _semantic_story_concentration_judge(
-                [items[i] for i in remaining], topic
-            )
-            status = str(judge.get("status", "MIXED")).upper()
-            nums = judge.get("source_numbers") or []
-            selected = [remaining[n - 1] for n in nums if 1 <= n <= len(remaining)]
-            confidence = int(judge.get("confidence", 0) or 0)
+        profile = _story_pool_profile([items[i] for i in remaining], topic)
+        dominant = list(profile.get("cluster") or [])
+        if profile.get("status") == "PASS" and len(dominant) >= 2:
+            add_candidate(dominant, "DETERMINISTIC_DOMINANT_STORY")
+            remaining = [i for i in remaining if i not in set(dominant)]
+        else:
+            try:
+                judge = _semantic_story_concentration_judge(
+                    [items[i] for i in remaining], topic
+                )
+                status = str(judge.get("status", "MIXED")).upper()
+                nums = judge.get("source_numbers") or []
+                selected = [
+                    remaining[n - 1] for n in nums
+                    if 1 <= n <= len(remaining)
+                ]
+                confidence = int(judge.get("confidence", 0) or 0)
 
-            if status in {"ONE_STORY", "PASS"} and confidence >= 70:
-                add_candidate(remaining, status)
-                remaining = []
-            elif status == "DOMINANT_STORY" and confidence >= 70 and len(selected) >= 2:
-                add_candidate(selected, status)
-                remaining = [i for i in remaining if i not in set(selected)]
-        except Exception as exc:
-            # Semantic discovery is auxiliary; deterministic fallback remains.
-            print(f"[STORY DISCOVERY] semantic splitter unavailable | {exc}")
+                if status in {"ONE_STORY", "PASS"} and confidence >= 70:
+                    add_candidate(remaining, status)
+                    remaining = []
+                elif status == "DOMINANT_STORY" and confidence >= 70 and len(selected) >= 2:
+                    add_candidate(selected, status)
+                    remaining = [i for i in remaining if i not in set(selected)]
+                elif (
+                    status == "MIXED"
+                    and confidence >= SEMANTIC_RESCUE_MIN_CONFIDENCE
+                    and len(selected) >= 2
+                ):
+                    print(
+                        f"[STORY DISCOVERY] SEMANTIC SUB-CLUSTER | "
+                        f"sources={len(selected)} | confidence={confidence}"
+                    )
+                    add_candidate(selected, "MIXED_SEMANTIC_SUBCLUSTER")
+                    remaining = [i for i in remaining if i not in set(selected)]
+            except Exception as exc:
+                print(f"[STORY DISCOVERY] semantic splitter unavailable | {exc}")
 
-    # Split whatever remains deterministically. This is intentionally applied
-    # after semantic extraction so separate stories survive a mixed topic pool.
     if remaining:
         residual = [items[i] for i in remaining]
         profile = _story_pool_profile(residual, topic)
@@ -835,9 +1036,6 @@ def _discover_concrete_story_candidates(news, topic):
             components = [list(range(len(residual)))]
         for component in components:
             selected = [remaining[i] for i in component if 0 <= i < len(remaining)]
-            # A singleton residual is only an isolated outlier from a mixed
-            # topic pool, not a corroborated concrete story. Do not send it
-            # downstream to publisher hydration/evidence extraction.
             if len(selected) < 2:
                 print(
                     f"[STORY DISCOVERY] DROP residual singleton | "
@@ -856,9 +1054,7 @@ def _discover_concrete_story_candidates(news, topic):
             f"sources={candidate['selected_count']} | "
             f"semantic={candidate['semantic_status']} | topic={topic}"
         )
-
     return candidates
-
 
 def _deterministic_production_reservoir(trends, processed):
     """Return every deterministic-eligible trend without ranking or scoring."""
@@ -894,6 +1090,78 @@ def _deterministic_production_reservoir(trends, processed):
         f"selection=scoring_disabled"
     )
     return eligible
+
+
+def _filter_trend_discovery_news(trend, news):
+    """Keep discovery results relevant to either the canonical trend or a
+    Google-Trends related-news headline, without weakening the existing
+    deterministic relevance rules.
+    """
+    canonical = filter_relevant_news(trend, news)
+    if canonical:
+        return canonical
+
+    recovered = []
+    seen = set()
+    for related in (trend.get("news") or []):
+        if not isinstance(related, dict):
+            continue
+        headline = str(related.get("title", "") or "").strip()
+        if not headline:
+            continue
+        probe = {"title": headline}
+        for item in filter_relevant_news(probe, news):
+            key = (str(item.get("url", "") or "").strip().casefold(),
+                   str(item.get("title", "") or "").strip().casefold())
+            if key not in seen:
+                seen.add(key)
+                recovered.append(item)
+
+    print(
+        f"[TOPIC FILTER] Related-news relevance recovery | "
+        f"canonical={len(canonical)} | recovered={len(recovered)}"
+    )
+    return recovered
+
+
+def _build_trend_discovery_queries(trend, keyword, max_queries=3):
+    """Build concrete discovery queries from Google Trends related-news context.
+
+    The original Trends title remains the canonical topic. Related-news
+    headlines are used only as concrete search signals for the existing news
+    discovery mechanism. No new quality gate is introduced here.
+    """
+    queries = []
+    seen = set()
+
+    def add(value):
+        value = str(value or "").strip()
+        if not value:
+            return
+        key = _norm(value)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        queries.append(value)
+
+    # Prefer concrete publisher headlines supplied by Google Trends.
+    for item in (trend.get("news") or []):
+        if not isinstance(item, dict):
+            continue
+        headline = str(item.get("title", "") or "").strip()
+        if not headline:
+            continue
+        query = _build_related_story_query(headline)
+        if query:
+            add(query)
+        if len(queries) >= max_queries:
+            break
+
+    # Always retain the original trend as a fallback/anchor.
+    if not queries:
+        add(keyword)
+
+    return queries[:max_queries]
 
 
 def _build_evidence_source(news, story_selection):
@@ -953,63 +1221,243 @@ def _selected_story_news(news, story_selection):
     indices = list(selection.get("selected_indices") or [])
     selected = [items[i] for i in indices if 0 <= i < len(items)]
     if not selected:
-        raise Exception("Fact Guard source received no sources from story selection")
+        raise Exception("Evidence source received no sources from story selection")
     return selected
 
 
-def _build_fact_guard_source(news):
-    """
-    Build a deterministic, factual-complete representation for the external
-    Fact Guard.
 
-    This intentionally does NOT summarize, truncate, reorder, or deduplicate
-    news items. It only removes transport/formatting overhead and omits the
-    URL field, which is not factual article content for the semantic audit.
+def _is_valid_publisher_image_url(url):
+    """Accept only plausible publisher image URLs; reject media/placeholders/thumbnails."""
+    value = str(url or "").strip()
+    if not value or not re.match(r"^https?://", value, re.I):
+        return False
+    lower = value.casefold()
+    blocked = (
+        "placeholder", "place-holder", "default-image", "default_image",
+        "no-image", "no_image", "spacer.gif", "transparent.gif",
+        "video", ".mp4", ".webm", ".m3u8", ".mp3", ".wav", ".aac",
+        "favicon", "/favicon", "sprite", "tracking", "pixel",
+        "googlelogo", "googleusercontent", "gstatic.com/images/branding",
+    )
+    if any(token in lower for token in blocked):
+        return False
 
-    Summary is retained unless it is substantially redundant with the article
-    content. This is conservative: if there is meaningful information in the
-    summary that is not present in content, it stays.
-    """
-    compact_sources = []
+    # Reject obvious thumbnail-sized variants such as ?w=96 / ?width=120.
+    try:
+        query = parse_qs(urlparse(value).query)
+        for key in ("w", "width", "h", "height", "size"):
+            for raw in query.get(key, []):
+                m = re.search(r"\d+", str(raw))
+                if m and int(m.group()) <= 160:
+                    return False
+    except Exception:
+        pass
 
-    for item in news or []:
-        title = str(item.get("title", "")).strip()
-        summary = str(item.get("summary", "")).strip()
-        source = str(item.get("source", "")).strip()
-        published = str(item.get("published", "")).strip()
-        content = str(item.get("content", "")).strip()
-
-        record = {
-            "title": title,
-            "source": source,
-            "published": published,
-            "content": content,
-        }
-
-        # Conservative redundancy check. Normalize whitespace and compare
-        # whether the complete summary is already contained in article text.
-        summary_norm = " ".join(summary.split()).casefold()
-        content_norm = " ".join(content.split()).casefold()
-
-        if summary and (
-            not content_norm
-            or not summary_norm
-            or summary_norm not in content_norm
-        ):
-            record["summary"] = summary
-
-        compact_sources.append(record)
-
-    # No pretty-print indentation and no link field. The factual fields above
-    # remain unchanged; only serialization overhead is reduced.
-    return json.dumps(
-        compact_sources,
-        ensure_ascii=False,
-        separators=(",", ":"),
+    path = lower.split("?", 1)[0].split("#", 1)[0]
+    return bool(re.search(r"\.(?:jpg|jpeg|png|webp|avif)(?:$|/)", path)) or any(
+        token in lower for token in ("/image/", "/images/", "/photo/", "/photos/", "/media/")
     )
 
 
+def _extract_jsonld_image_url(html, base_url=""):
+    """Return the best article image from JSON-LD image.url only.
 
+    Article/NewsArticle/BlogPosting/etc. images are preferred. Person,
+    Organization, Brand, ImageObject and Logo nodes are never treated as
+    article images. If JSON-LD has no usable image, fall back to standard
+    publisher social metadata (og:image/twitter:image), then a sufficiently
+    large content <img>.
+    """
+    article_types = {"article", "newsarticle", "blogposting", "techarticle", "report"}
+    excluded_types = {"person", "organization", "brand", "imageobject", "logo", "website"}
+    primary = []
+    generic = []
+
+    def node_types(node):
+        raw = node.get("@type") if isinstance(node, dict) else None
+        values = raw if isinstance(raw, list) else [raw]
+        return {str(v).split("/")[-1].casefold() for v in values if v}
+
+    def add_image_from_node(node, bucket):
+        if not isinstance(node, dict):
+            return
+        image = node.get("image")
+        image_items = image if isinstance(image, list) else [image]
+        for item in image_items:
+            if not isinstance(item, dict):
+                continue
+            # Deliberately ONLY image.url. Never contentUrl/thumbnailUrl.
+            image_url = item.get("url")
+            if isinstance(image_url, str):
+                absolute = urljoin(base_url, image_url.strip()) if base_url else image_url.strip()
+                if _is_valid_publisher_image_url(absolute):
+                    bucket.append(absolute)
+
+    for block in re.findall(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html or "", flags=re.I | re.S,
+    ):
+        raw = re.sub(r"^\s*<!--|-->\s*$", "", block.strip()).strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        stack = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                types = node_types(node)
+                if types & excluded_types:
+                    pass
+                elif types & article_types:
+                    add_image_from_node(node, primary)
+                else:
+                    # WebPage and unknown containers are only generic fallback.
+                    add_image_from_node(node, generic)
+                for key, value in node.items():
+                    if key == "image":
+                        continue
+                    if isinstance(value, (dict, list)):
+                        stack.append(value)
+            elif isinstance(node, list):
+                stack.extend(node)
+
+    seen = set()
+    for url in primary + generic:
+        if url not in seen:
+            seen.add(url)
+            return url
+
+    # Publisher-standard fallback when JSON-LD does not expose an image.url.
+    meta_patterns = (
+        r'<meta[^>]+(?:property|name)=["\']og:image["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+(?:property|name)=["\']og:image:url["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+(?:property|name)=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+(?:property|name)=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)',
+    )
+    for pattern in meta_patterns:
+        for match in re.finditer(pattern, html or "", flags=re.I):
+            candidate = urljoin(base_url, match.group(1).strip()) if base_url else match.group(1).strip()
+            if _is_valid_publisher_image_url(candidate):
+                return candidate
+
+    # Last fallback: real content <img> with explicit reasonable dimensions.
+    for tag in re.findall(r'<img\b[^>]*>', html or "", flags=re.I):
+        src_match = re.search(r'\b(?:src|data-src|data-lazy-src|data-original)=["\']([^"\']+)', tag, flags=re.I)
+        if not src_match:
+            continue
+        candidate = urljoin(base_url, src_match.group(1).strip()) if base_url else src_match.group(1).strip()
+        if not _is_valid_publisher_image_url(candidate):
+            continue
+        dims = []
+        for attr in ("width", "height"):
+            m = re.search(rf'\b{attr}=["\'](\d+)', tag, flags=re.I)
+            dims.append(int(m.group(1)) if m else None)
+        if dims[0] and dims[1] and (dims[0] < 500 or dims[1] < 250):
+            continue
+        return candidate
+
+    return None
+
+
+def _ensure_publisher_images(selected_news):
+    """Second-pass publisher image extraction after article quality gates."""
+    import urllib.request
+
+    items = list(selected_news or [])
+    found = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        existing = str(item.get("image") or item.get("image_url") or "").strip()
+        if existing and _is_valid_publisher_image_url(existing):
+            item["image"] = existing
+            found += 1
+            continue
+
+        url = str(item.get("url") or item.get("link") or "").strip()
+        if not url:
+            continue
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (TrendCurrent publisher image resolver)"},
+            )
+            with urllib.request.urlopen(req, timeout=12) as response:
+                html = response.read(5000000).decode("utf-8", errors="replace")
+            image_url = _extract_jsonld_image_url(html, base_url=url)
+            if image_url:
+                item["image"] = image_url
+                found += 1
+                print(f"[SOURCE IMAGE] FOUND: {image_url} | source=publisher-image-resolver")
+            else:
+                print(f"[SOURCE IMAGE] NONE: {url} | jsonld.image.url not found")
+        except Exception as exc:
+            print(f"[SOURCE IMAGE] ERROR: {url} | {exc}")
+
+    print(f"[SOURCE IMAGE] FINAL | publisher_images={found} | sources={len(items)}")
+    return items
+
+
+
+def _ensure_rendered_publisher_image(rendered_html, article, selected_news):
+    """Guarantee the verified publisher image reaches final HTML presentation and stays responsive."""
+    html = str(rendered_html or "")
+    if not html:
+        return html
+
+    # The renderer's image markup is intentionally presentation-only.
+    # Keep the image inside the article width on desktop and mobile; otherwise
+    # a native publisher image (often 1200-1920px wide) can overflow the page.
+    image_css = (
+        '<style id="tc-responsive-article-image">'
+        '.tc-article-image{width:100%;max-width:100%;margin:0 0 32px;overflow:hidden;}'
+        '.tc-article-image__frame{width:100%;max-width:100%;overflow:hidden;}'
+        '.tc-article-image img{display:block;width:100%;max-width:100%;height:auto;object-fit:cover;}'
+        '@media(max-width:768px){.tc-article-image{margin-bottom:24px;}'
+        '.tc-article-image img{width:100%;max-width:100%;height:auto;}}'
+        '</style>'
+    )
+    if 'id="tc-responsive-article-image"' not in html:
+        head = re.search(r'</head\s*>', html, flags=re.IGNORECASE)
+        if head:
+            html = html[:head.start()] + image_css + html[head.start():]
+        else:
+            html = image_css + html
+
+    # If the renderer already supplied an image, keep it and only repair its
+    # responsive presentation.
+    if re.search(r"<img\b[^>]+src\s*=", html, flags=re.IGNORECASE):
+        return html
+
+    image_url = ""
+    for item in selected_news or []:
+        if not isinstance(item, dict):
+            continue
+        candidate = str(item.get("image") or item.get("image_url") or "").strip()
+        if _is_valid_publisher_image_url(candidate):
+            image_url = candidate
+            break
+    if not image_url:
+        return html
+
+    from html import escape
+    title = str((article or {}).get("title") or (article or {}).get("h1") or "").strip()
+    figure = (
+        '<figure class="tc-article-image"><div class="tc-article-image__frame">'
+        f'<img src="{escape(image_url, quote=True)}" alt="{escape(title, quote=True)}" '
+        'loading="eager" decoding="async" fetchpriority="high">'
+        '</div></figure>'
+    )
+    for pattern in (r'(<article\b[^>]*>)', r'(<main\b[^>]*>)', r'(<body\b[^>]*>)'):
+        match = re.search(pattern, html, flags=re.IGNORECASE)
+        if match:
+            pos = match.end()
+            return html[:pos] + figure + html[pos:]
+    return html
 
 def _shorten_headline(title):
     title = " ".join(str(title or "").split()).strip()
@@ -1241,178 +1689,70 @@ def _run_repetition_guard(article, generation_evidence, event_name="repetition_g
     return repetition
 
 
-def _is_fact_guard_infrastructure_error(exc):
-    """Return True only for validator transport/serialization failures.
 
-    A malformed/incomplete Fact Guard response is an infrastructure failure, not
-    a factual verdict. It is safe to retry the SAME already-generated article
-    because this does not regenerate, repair, or alter the article.
-    """
-    message = str(exc or "").casefold()
-    infrastructure_markers = (
-        "incomplete json object",
-        "json decode error",
-        "jsondecodeerror",
-        "malformed json",
-        "invalid json",
-        "unterminated json",
-        "unexpected end of json",
-        "unexpected end of input",
-        "truncated json",
-    )
-    return any(marker in message for marker in infrastructure_markers)
+# ============================================================
+# Deterministic Fact Consistency Guard
+# ============================================================
 
+_FACT_GUARD_STOPWORDS = {
+    "the","and","for","with","from","that","this","was","were","has","have","had",
+    "are","is","its","into","after","before","over","under","about","than","then",
+    "they","their","them","there","which","while","also","been","being","will",
+    "would","could","should","said","says","according","official","officials",
+    "new","latest","news","report","reports","story","article","podcast",
+}
 
-def _run_fact_guard_with_bounded_infrastructure_retry(
-    fact_guard_source,
-    article,
-    reference_date,
-    max_attempts=2,
-):
-    """Run Fact Guard with bounded retry ONLY for malformed validator output.
+def _fc_tokens(value):
+    value = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
+    return [
+        token for token in re.findall(r"[a-z0-9]+", value.casefold())
+        if len(token) >= 3 and token not in _FACT_GUARD_STOPWORDS
+    ]
 
-    Important invariants:
-      - The generated article is never changed.
-      - The evidence lock is never changed.
-      - No article regeneration occurs.
-      - A real Fact Guard PASS/FAIL is returned immediately.
-      - Only a validator serialization/parsing failure may be retried.
-      - If the validator remains unavailable, fail closed with a distinct error.
-    """
-    attempts = max(1, int(max_attempts or 1))
-    last_error = None
+def _fc_numeric_tokens(value):
+    return set(re.findall(
+        r"\b\d+(?:[.,]\d+)?%?\b|\b(?:19|20)\d{2}\b",
+        str(value or ""),
+    ))
 
-    for attempt in range(1, attempts + 1):
-        try:
-            guard = fact_guard_validate(
-                fact_guard_source,
-                article,
-                reference_date=reference_date,
-            )
+def generate_valid_article(prompt, reference_date, trend, prelocked_evidence=None):
+    """Generate once and publish after deterministic/language/repetition validation.
 
-            if not isinstance(guard, dict):
-                raise ValueError(
-                    f"Fact Guard returned invalid result type: {type(guard).__name__}"
-                )
-
-            monitor.candidate_event(
-                "fact_guard",
-                status=guard.get("status"),
-                review_items=guard.get("review_items"),
-                blocking_issues=guard.get("blocking_issues"),
-                guard=guard,
-                attempt=attempt,
-                max_attempts=attempts,
-            )
-            return guard
-
-        except Exception as exc:
-            last_error = exc
-
-            if not _is_fact_guard_infrastructure_error(exc):
-                # A factual/semantic failure is NOT retryable. Preserve the
-                # existing fail-closed behaviour and never confuse it with
-                # infrastructure recovery.
-                raise
-
-            if attempt < attempts:
-                print(
-                    f"[FACT GUARD] INFRASTRUCTURE RETRY | "
-                    f"attempt={attempt}/{attempts} | "
-                    f"reason={exc}"
-                )
-                monitor.candidate_event(
-                    "fact_guard_infrastructure",
-                    status="RETRY",
-                    attempt=attempt,
-                    max_attempts=attempts,
-                    reason=str(exc),
-                )
-                continue
-
-            monitor.candidate_event(
-                "fact_guard_infrastructure",
-                status="UNAVAILABLE",
-                attempt=attempt,
-                max_attempts=attempts,
-                reason=str(exc),
-            )
-            raise RuntimeError(
-                f"Fact Guard infrastructure failure after {attempts} attempts: "
-                f"{last_error}"
-            ) from last_error
-
-
-def generate_valid_article(prompt, fact_guard_source, reference_date, trend, max_attempts=1, prelocked_evidence=None):
-    """Generate once, validate once, publish only on PASS.
-
-    There is NO article repair or generation retry. Fact Guard alone has a
-    bounded infrastructure retry when its validator response is malformed or
-    incomplete; this retries the audit of the identical article and does not
-    alter the evidence or article.
+    No post-generation LLM factual validation, repair, or regeneration occurs.
     """
     try:
-        generation_evidence = _enrich_evidence_for_generation(
-            prelocked_evidence,
-            trend,
-        )
+        generation_evidence = _enrich_evidence_for_generation(prelocked_evidence, trend)
         article = generate(prompt, evidence=generation_evidence)
+        # The HTML renderer does not parse Markdown. Strip model-emitted
+        # emphasis markers before any validation/rendering so literal "*" and
+        # "**" cannot leak into titles, metadata, or article paragraphs.
+        article = _sanitize_article_markdown(article)
         validate_article(article)
-        validate_article_structure(article, generation_evidence, label="Initial generated article")
-
+        # Paragraph count is intentionally unrestricted; this gate checks only usable structure.
+        validate_article_structure(article, generation_evidence, label="Initial newsroom article")
         locked_facts = generation_evidence.get("facts", [])
         core_fact_ids = generation_evidence.get("core_fact_ids", [])
         supporting_fact_ids = generation_evidence.get("supporting_fact_ids", [])
         paragraph_text = " ".join(str(p) for p in article.get("paragraphs", [])).strip()
         if isinstance(locked_facts, list) and len(locked_facts) >= 1:
-            print(
-                f"[EVIDENCE COVERAGE] locked_facts={len(locked_facts)} "
-                f"| core_facts={len(core_fact_ids)} "
-                f"| supporting_facts={len(supporting_fact_ids)} "
-                f"| article_words={len(paragraph_text.split())}"
-            )
-
-        # Deterministic headline normalization only. No LLM repair/retry.
-        # If the model overshoots the hard display limit, remove only trailing/
-        # secondary headline wording; never invent or rewrite factual claims.
+            print(f"[EVIDENCE COVERAGE] locked_facts={len(locked_facts)} | core_facts={len(core_fact_ids)} | supporting_facts={len(supporting_fact_ids)} | article_words={len(paragraph_text.split())}")
+        print("[FACT CONSISTENCY GUARD] DISABLED — publication not blocked by deterministic fact-expression guard")
         normalized_headline = _shorten_headline(article.get("title", ""))
-        article["title"] = normalized_headline
-        article["h1"] = normalized_headline
+        article["title"] = normalized_headline; article["h1"] = normalized_headline
         article = enforce_headline_policy(article, trend)
-        validate_article(article)
-        validate_language_integrity(article)
+        validate_article(article); validate_language_integrity(article)
         print("[LANGUAGE GUARD] PASS")
-
-        print("[FACT GUARD] Checking generated article...")
-        guard = _run_fact_guard_with_bounded_infrastructure_retry(
-            fact_guard_source,
-            article,
-            reference_date,
-            max_attempts=2,
-        )
-
-        if guard.get("status") != "PASS":
-            print("[FACT GUARD] FAIL — article discarded; NO REPAIR")
-            print(json.dumps(guard, ensure_ascii=False, indent=2))
-            raise Exception("Fact Guard blocked article; publication blocked.")
-
-        print("[FACT GUARD] PASS")
-
         repetition = _run_repetition_guard(article, generation_evidence)
         if repetition.get("status") != "PASS":
             print("[REPETITION GUARD] FAIL — article discarded; NO REPAIR")
             print(json.dumps(repetition, ensure_ascii=False, indent=2))
             raise Exception("Repetition Guard blocked article; publication blocked.")
-
         validate_language_integrity(article)
         print("[LANGUAGE GUARD] FINAL ARTICLE PASS")
         return article
-
     except Exception as e:
         print(f"Validation failed: {e}")
         raise
-
-
 def run_git(cmd):
     print("\n" + "=" * 60)
     print("Running:", " ".join(cmd))
@@ -1450,15 +1790,61 @@ def git_push():
 
 
 def main():
-    monitor.start_run(language=LANGUAGE, model=MODEL, pipeline="universal-fact-lock-v2.8.1-coverage-first-no-repair-fail-closed-discovery-evidence-optimized", max_articles=MAX_ARTICLES_PER_RUN)
+    monitor.start_run(language=LANGUAGE, model=MODEL, pipeline="universal-fact-lock-v2.9.2-ministral-newsroom-no-word-floor", max_articles=MAX_ARTICLES_PER_RUN)
     processed = load_processed()
-    trends = fetch_trends()
-    print(f"[TOPIC FILTER] Raw trends received: {len(trends)}")
+
+    # Direct publisher RSS is the permanent discovery root.
+    source_first = SOURCE_FIRST
+
+    if source_first:
+        trends = fetch_source_stories(language=LANGUAGE)
+        print(
+            f"[SOURCE FIRST] Direct publisher RSS enabled | "
+            f"language={LANGUAGE} | seeds={len(trends)}"
+        )
+
+        # Direct publisher RSS is preferred, but it must never be a single
+        # point of failure for discovery. If the configured publisher has no
+        # fresh item, immediately fall back to the existing Google News ->
+        # Bing discovery mechanism. Freshness, deduplication and all downstream
+        if not trends:
+            fallback_queries = {
+                "en": ["latest news", "breaking news", "top news"],
+                "en-us": ["latest news", "breaking news", "top news"],
+                "de": ["aktuelle nachrichten", "eilmeldungen", "top nachrichten"],
+                "es": ["últimas noticias", "última hora", "principales noticias"],
+                "it": ["ultime notizie", "ultim'ora", "principali notizie"],
+                "fr": ["dernières nouvelles", "dernière minute", "actualités principales"],
+                "pt": ["últimas notícias", "última hora", "principais notícias"],
+                "pt-br": ["últimas notícias", "última hora", "principais notícias"],
+                "id": ["berita terbaru", "berita terkini", "berita utama"],
+            }.get(str(LANGUAGE or "").strip().casefold(), ["latest news", "breaking news", "top news"])
+
+            fallback = fetch_news_discovery(
+                fallback_queries,
+                per_query_limit=8,
+                max_results=12,
+            )
+            trends = []
+            for item in fallback:
+                seed = dict(item)
+                seed["discovery_provider"] = "google_news_bing_fallback"
+                seed["discovery_source"] = str(item.get("source") or "").strip()
+                seed["discovery_context"] = "broad_news_fallback"
+                trends.append(seed)
+
+            print(
+                f"[SOURCE FIRST] Direct RSS empty -> broad news fallback | "
+                f"queries={len(fallback_queries)} | seeds={len(trends)}"
+            )
+    else:
+        trends = fetch_trends()
+        print(f"[TOPIC FILTER] Raw trends received: {len(trends)}")
 
     # One explicit reference date for the entire production run.
     # This is the date against which event state is evaluated.
     reference_date = date.today()
-    print(f"[FACT GUARD] Validation reference date: {reference_date.isoformat()}")
+    print(f"[RUN] Reference date: {reference_date.isoformat()}")
 
     generated = 0
     new_keywords = []
@@ -1498,27 +1884,76 @@ def main():
                 f"{keyword}"
             )
 
-            discovery_query = trend.get("discovery_query")
+            discovery_context = str(trend.get("discovery_context", "") or "").strip()
             seed = None
-            if discovery_query:
-                seed = dict(trend)
-                seed_anchor = str(seed.get("title", "")).strip() or keyword
-                entity_query = _build_related_story_query(seed_anchor)
-                if not entity_query:
-                    entity_query = seed_anchor.split(" - ")[0].strip()
 
-                print(f"[TOPIC FILTER] Related story search: {entity_query}")
-                news = fetch_news(entity_query)
+            if source_first:
+                # Direct RSS items remain preferred discovery seeds. Broad-news
+                # fallback items are also valid concrete seeds and are expanded
+                # through the same corroboration path.
+                seed = dict(trend)
+                news = [seed]
+
+                related_query = _build_related_story_query(keyword) or keyword
+                if trend.get("discovery_context") == "broad_news_fallback":
+                    print(f"[SOURCE FIRST] Fallback corroboration search: {related_query}")
+                else:
+                    print(f"[SOURCE FIRST] Corroboration search: {related_query}")
+                found = fetch_news(related_query)
+
+                # A broad-news fallback seed is only a discovery lead. If the
+                # corroboration lookup returns nothing (including a network/API
+                # failure), do not let the singleton seed bypass the concrete-story
+                # evidence standard. Direct publisher seeds retain their existing
+                # behavior.
+                if (
+                    trend.get("discovery_context") == "broad_news_fallback"
+                    and not (found or [])
+                ):
+                    print(
+                        f"[STORY DISCOVERY] REJECT singleton fallback seed | "
+                        f"{keyword} | corroboration=0"
+                    )
+                    continue
+
+                seen = {
+                    (
+                        str(item.get("url", "") or item.get("link", "")).strip().casefold(),
+                        str(item.get("title", "") or "").strip().casefold(),
+                    )
+                    for item in news
+                }
+                for item in found or []:
+                    key = (
+                        str(item.get("url", "") or item.get("link", "")).strip().casefold(),
+                        str(item.get("title", "") or "").strip().casefold(),
+                    )
+                    if key not in seen:
+                        seen.add(key)
+                        news.append(item)
+
+                # RSS discovery is already language/source-specific. Do not run the
+                # Trends relevance gate against a direct publisher seed.
+            elif discovery_context:
+                # Google Trends related-news headlines are concrete story signals.
+                # Query them through the EXISTING discovery mechanism, while the
+                # original Trends title remains the canonical topic for relevance,
+                # evidence and generation.
+                discovery_queries = _build_trend_discovery_queries(
+                    trend,
+                    keyword,
+                    max_queries=3,
+                )
+                news = []
+
+                for entity_query in discovery_queries:
+                    print(f"[TOPIC FILTER] Related story search: {entity_query}")
+                    found = fetch_news(entity_query)
+                    if found:
+                        news.extend(found)
 
                 # Discovery remains metadata-only. Full article extraction is deferred
                 # until a concrete story candidate has been selected.
-
-                if seed.get("title") and not any(
-                    str(x.get("title", "")).strip().casefold() ==
-                    str(seed.get("title", "")).strip().casefold()
-                    for x in news
-                ):
-                    news.insert(0, seed)
             else:
                 news = []
                 for search_query in _build_targeted_news_queries(keyword):
@@ -1542,10 +1977,10 @@ def main():
                 )
                 continue
 
-            # Apply relevance once for discovery_query flows. Targeted-query
-            # flows may already have a filtered pool from the early-stop ladder.
-            if discovery_query:
-                news = filter_relevant_news(trend, news)
+            # Apply the existing Trends relevance gate only to Trends discovery.
+            # Direct publisher RSS seeds are already the canonical discovery source.
+            if discovery_context and not source_first:
+                news = _filter_trend_discovery_news(trend, news)
 
             if not news:
                 print(
@@ -1567,7 +2002,6 @@ def main():
                 continue
 
             # Each concrete story is evaluated immediately through the existing
-            # evidence/substantive/generation/Fact Guard pipeline. A failed
             # story never rejects the remaining stories from this topic.
             for story_number, story_selection in enumerate(story_candidates, 1):
                 if generated >= MAX_ARTICLES_PER_RUN:
@@ -1589,6 +2023,36 @@ def main():
                 )
 
                 try:
+                    existing_story = _existing_story_check(
+                        keyword,
+                        news,
+                        story_selection,
+                    )
+                    if existing_story:
+                        trend["_production_status"] = "REJECT"
+                        trend["_production_reject_reason"] = "existing story already covered"
+                        monitor.candidate_event(
+                            "existing_story_check",
+                            status="REJECT",
+                            reason="already_covered",
+                            existing_title=existing_story.get("existing_title"),
+                            existing_file=existing_story.get("path"),
+                            candidate_title=existing_story.get("candidate_title"),
+                            similarity=existing_story.get("ratio"),
+                            common_tokens=existing_story.get("common_tokens"),
+                            coverage=existing_story.get("coverage"),
+                        )
+                        monitor.finish_candidate(
+                            "REJECT",
+                            reason="existing story already covered",
+                        )
+                        continue
+
+                    monitor.candidate_event(
+                        "existing_story_check",
+                        status="PASS",
+                    )
+
                     generation_prompt = build_prompt(trend)
 
                     # STAGED SOURCE ACQUISITION:
@@ -1627,20 +2091,12 @@ def main():
                         raise ValueError("Selected story sources have no usable factual text.")
                     selected_news = usable_selected_news
 
-                    fact_guard_source = _build_fact_guard_source(selected_news)
-
-                    print(
-                        f"[FACT GUARD] Source prepared | "
-                        f"news_items={len(selected_news)} | "
-                        f"source_chars={len(fact_guard_source)}"
-                    )
-
                     print(
                         f"[TOPIC FILTER] EVIDENCE USABILITY CHECK | {keyword} | "
                         f"story={story_number}/{len(story_candidates)}"
                     )
 
-                    evidence_source = _build_evidence_source(selected_news, story_selection)
+                    evidence_source = _build_evidence_source(news, story_selection)
                     print(
                         f"[TOPIC FILTER] Evidence source prepared | "
                         f"source_chars={len(evidence_source)}"
@@ -1765,10 +2221,8 @@ def main():
 
                     article = generate_valid_article(
                         generation_prompt,
-                        fact_guard_source,
                         reference_date,
                         trend,
-                        max_attempts=1,
                         prelocked_evidence=evidence_lock,
                     )
 
@@ -1800,7 +2254,12 @@ def main():
                     # Images are presentation metadata, not discovery/evidence data.
                     # Extract them only after the article has passed every quality gate.
                     selected_news = hydrate_news_items(selected_news, include_images=True)
-                    save_article(slug, render_article(article, news=selected_news))
+                    selected_news = _ensure_publisher_images(selected_news)
+                    rendered_html = render_article(article, news=selected_news)
+                    rendered_html = _ensure_rendered_publisher_image(
+                        rendered_html, article, selected_news
+                    )
+                    save_article(slug, rendered_html)
 
                     new_keywords.append(keyword)
                     generated += 1

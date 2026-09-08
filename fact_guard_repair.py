@@ -12,8 +12,8 @@ FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.6.4-safe-coverage-stage-delete
 NUM_THREADS = max(1, int(os.getenv("FACT_GUARD_NUM_THREADS", "16")))
 NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
 NUM_BATCH = max(64, int(os.getenv("FACT_GUARD_NUM_BATCH", "512")))
-REPAIR_CTX = max(8192, int(os.getenv("FACT_GUARD_REPAIR_CTX", "8192")))
-REPAIR_TOKENS = max(280, int(os.getenv("FACT_GUARD_REPAIR_TOKENS", "420")))
+REPAIR_CTX = max(4096, int(os.getenv("FACT_GUARD_REPAIR_CTX", "4096")))
+REPAIR_TOKENS = max(220, int(os.getenv("FACT_GUARD_REPAIR_TOKENS", "300")))
 
 
 _ARTICLE_FORMAT = {

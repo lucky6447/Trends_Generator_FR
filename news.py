@@ -1,5 +1,6 @@
 import re
 import json
+import os
 import feedparser
 import requests
 import trafilatura
@@ -8,6 +9,11 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus, urljoin
 from html.parser import HTMLParser
+
+try:
+    from config import LANGUAGE
+except Exception:
+    LANGUAGE = "english"
 
 try:
     from googlenewsdecoder import gnewsdecoder
@@ -58,71 +64,110 @@ _GOOGLE_NEWS_DECODE_LOCK = __import__("threading").Lock()
 
 
 class _SourceImageParser(HTMLParser):
+    """Extract JSON-LD article images with type-aware priority.
+
+    Many publishers expose several image.url values in the same JSON-LD payload:
+    the article image, author/employee portraits, organization logos, thumbnails,
+    etc.  The old recursive collector treated all of them equally and returned
+    whichever appeared first.  Keep article-type images separate so the article
+    image wins deterministically.
+    """
+
+    ARTICLE_TYPES = {
+        "article",
+        "newsarticle",
+        "blogposting",
+        "techarticle",
+        "report",
+    }
+
+    NON_ARTICLE_TYPES = {
+        "person",
+        "organization",
+        "brand",
+        "website",
+        "webpage",
+        "imageobject",
+        "logo",
+    }
+
     def __init__(self):
         super().__init__()
-        self.candidates = []
-        self._in_jsonld = False
-        self._jsonld_buffer = []
+        self.primary_candidates = []
+        self.generic_candidates = []
+        self._jsonld_buffer = None
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
+        if tag.lower() != "script":
+            return
 
-        if tag.lower() == "script":
-            self._in_jsonld = (
-                (attrs.get("type") or "").strip().lower()
-                == "application/ld+json"
-            )
-            if self._in_jsonld:
-                self._jsonld_buffer = []
-
-    def handle_endtag(self, tag):
-        if tag.lower() == "script" and self._in_jsonld:
-            # Parse the complete JSON-LD script rather than individual
-            # HTMLParser data chunks. This avoids missing image.url when
-            # the JSON-LD payload is split across multiple chunks.
-            raw = "".join(self._jsonld_buffer).strip()
-            self._in_jsonld = False
+        script_type = (attrs.get("type") or "").strip().lower()
+        # Accept normal JSON-LD content types, including harmless parameters such
+        # as charset. Do not broaden this to meta/OG/Twitter image sources.
+        if script_type.split(";", 1)[0].strip() == "application/ld+json":
             self._jsonld_buffer = []
 
-            if not raw:
-                return
+    def handle_endtag(self, tag):
+        if tag.lower() != "script" or self._jsonld_buffer is None:
+            return
 
-            try:
-                payload = json.loads(raw)
-            except Exception:
-                return
+        raw = "".join(self._jsonld_buffer).strip()
+        self._jsonld_buffer = None
+        if not raw:
+            return
 
-            def collect_image_urls(value):
-                if isinstance(value, dict):
-                    image_value = value.get("image")
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return
 
-                    if isinstance(image_value, dict):
-                        image_url = image_value.get("url")
-                        if isinstance(image_url, str) and image_url.strip():
-                            self.candidates.append(image_url.strip())
-                        # Intentionally do not inspect image.contentUrl.
+        def type_names(value):
+            raw_types = value.get("@type") if isinstance(value, dict) else None
+            if isinstance(raw_types, str):
+                raw_types = [raw_types]
+            if not isinstance(raw_types, list):
+                return set()
+            return {
+                str(item).strip().casefold().split("/")[-1]
+                for item in raw_types
+                if str(item).strip()
+            }
 
-                    elif isinstance(image_value, list):
-                        for image_item in image_value:
-                            if isinstance(image_item, dict):
-                                image_url = image_item.get("url")
-                                if isinstance(image_url, str) and image_url.strip():
-                                    self.candidates.append(image_url.strip())
-                            # Intentionally do not inspect image.contentUrl.
+        def add_image_value(image, target):
+            values = image if isinstance(image, list) else [image]
+            for item in values:
+                if isinstance(item, dict):
+                    image_url = item.get("url")
+                    if isinstance(image_url, str) and image_url.strip():
+                        target.append(image_url.strip())
 
-                    # Also inspect nested JSON-LD objects such as @graph.
-                    for nested in value.values():
-                        if nested is not image_value:
-                            collect_image_urls(nested)
+        def walk(value, article_context=False, excluded_context=False):
+            if isinstance(value, dict):
+                types = type_names(value)
+                is_article = bool(types & self.ARTICLE_TYPES)
+                is_excluded = bool(types & self.NON_ARTICLE_TYPES)
+                current_article_context = article_context or is_article
+                current_excluded_context = excluded_context or (is_excluded and not is_article)
 
-                elif isinstance(value, list):
-                    for item in value:
-                        collect_image_urls(item)
+                if "image" in value:
+                    if current_article_context and not current_excluded_context:
+                        add_image_value(value.get("image"), self.primary_candidates)
+                    elif not current_excluded_context:
+                        add_image_value(value.get("image"), self.generic_candidates)
 
-            collect_image_urls(payload)
+                for child in value.values():
+                    if isinstance(child, (dict, list)):
+                        walk(child, current_article_context, current_excluded_context)
+
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child, article_context, excluded_context)
+
+        walk(payload)
 
     def handle_data(self, data):
-        if self._in_jsonld:
+        if self._jsonld_buffer is not None:
             self._jsonld_buffer.append(data)
 
 
@@ -194,6 +239,15 @@ def _is_usable_source_image(url):
     value = value.replace("\\/\\/", "//").replace("\\/", "/").strip()
     low = value.casefold()
 
+    # Reject obvious tiny thumbnail variants. Article pages frequently expose
+    # author/profile images with URLs such as ?w=96; these are technically valid
+    # images but are not suitable as the article hero image.
+    query = low.split("?", 1)[1].split("#", 1)[0] if "?" in low else ""
+    if query:
+        for match in re.finditer(r"(?:^|&)(?:w|width|h|height|size)=([0-9]{1,4})(?:&|$)", query):
+            if int(match.group(1)) <= 160:
+                return False
+
     if low.startswith(("data:", "javascript:")):
         return False
 
@@ -256,8 +310,9 @@ def extract_source_image(url):
         pass
 
     seen = set()
+    candidates = list(parser.primary_candidates) + list(parser.generic_candidates)
 
-    for candidate in parser.candidates:
+    for candidate in candidates:
         candidate = str(candidate).strip().replace("\\/\\/", "//").replace("\\/", "/")
         image_url = urljoin(
             final_url or publisher_url,
@@ -283,8 +338,9 @@ def extract_source_image(url):
             }
 
     print(
-        f"[SOURCE IMAGE] NONE: {final_url or publisher_url} | "
-        f"jsonld_candidates={len(parser.candidates)}"
+        f"[SOURCE IMAGE] NONE | publisher={final_url or publisher_url} "
+        f"| article_jsonld_candidates={len(parser.primary_candidates)} "
+        f"| generic_jsonld_candidates={len(parser.generic_candidates)}"
     )
     return {
         "image": "",
@@ -414,12 +470,42 @@ def _feed_candidates(feed):
     return candidates
 
 
+def _news_locale():
+    """Return Google/Bing locale settings for the active TrendCurrent language."""
+    language = str(LANGUAGE or "").strip().casefold()
+    mapping = {
+        "english": ("en-GB", "GB", "en-GB"),
+        "en": ("en-GB", "GB", "en-GB"),
+        "english (us)": ("en-US", "US", "en-US"),
+        "en-us": ("en-US", "US", "en-US"),
+        "en_us": ("en-US", "US", "en-US"),
+        "german": ("de-DE", "DE", "de-DE"),
+        "de": ("de-DE", "DE", "de-DE"),
+        "italian": ("it-IT", "IT", "it-IT"),
+        "it": ("it-IT", "IT", "it-IT"),
+        "french": ("fr-FR", "FR", "fr-FR"),
+        "fr": ("fr-FR", "FR", "fr-FR"),
+        "spanish": ("es-ES", "ES", "es-ES"),
+        "es": ("es-ES", "ES", "es-ES"),
+        "portuguese": ("pt-PT", "PT", "pt-PT"),
+        "pt": ("pt-PT", "PT", "pt-PT"),
+        "brazilian portuguese": ("pt-BR", "BR", "pt-BR"),
+        "pt-br": ("pt-BR", "BR", "pt-BR"),
+        "indonesian": ("id-ID", "ID", "id-ID"),
+        "id": ("id-ID", "ID", "id-ID"),
+        "bulgarian": ("bg-BG", "BG", "bg-BG"),
+        "bg": ("bg-BG", "BG", "bg-BG"),
+    }
+    return mapping.get(language, ("en-US", "US", "en-US"))
+
+
 def _fetch_topic_feed(query):
     """Google first, then supplement/fallback with Bing when Google is weak."""
+    hl, gl, bing_lang = _news_locale()
     google_url = (
         "https://news.google.com/rss/search?"
         f"q={quote_plus(query + ' when:24h')}"
-        "&hl=fr&gl=FR&ceid=FR:fr"
+        f"&hl={quote_plus(hl)}&gl={quote_plus(gl)}&ceid={quote_plus(f'{gl}:{bing_lang.split("-")[0]}')}"
     )
     response, google_feed = _parse_news_rss(google_url)
     google_candidates = _feed_candidates(google_feed)
@@ -434,7 +520,7 @@ def _fetch_topic_feed(query):
 
     bing_url = (
         "https://www.bing.com/news/search?"
-        f"q={quote_plus(query)}&format=rss&setlang=fr-FR&cc=FR"
+        f"q={quote_plus(query)}&format=rss&setlang={quote_plus(bing_lang)}&cc={quote_plus(gl)}"
     )
     response, bing_feed = _parse_news_rss(bing_url)
     bing_candidates = _feed_candidates(bing_feed)
@@ -506,7 +592,7 @@ def hydrate_news_items(items, include_images=False, max_content_chars=DEFAULT_FU
         for article, image_data in zip(hydrated, images):
             article["image"] = image_data.get("image", "")
             article["image_source_url"] = image_data.get("source_url", "")
-            article["image_source"] = image_data.get("source", "")
+            article["image_source"] = ""
 
     print(f"[NEWS HYDRATE] sources={len(hydrated)} | images={include_images}")
     return hydrated

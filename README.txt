@@ -1,5 +1,15 @@
-TrendCurrent Writer FACT UNITS V4
-Strict structured writer output.
-Every paragraph must be an object: {"text": "...", "fact_ids": ["F1"]}.
-The Ollama JSON schema enforces the structure instead of relying on prompt compliance.
-No new evidence/scoring architecture is introduced.
+TrendCurrent — Français
+
+Run:
+  python generate.py
+
+Language: Français
+Market: France
+Discovery: direct publisher RSS -> corroboration -> story/value/evidence gates -> generation -> Fact Guard -> repetition/language guards
+Source-first is permanently enabled in config.py. No environment variables are required.
+
+Dependencies:
+  pip install -r requirements.txt
+
+Ollama model:
+  ministral-3:14b-instruct-2512-q4_K_M

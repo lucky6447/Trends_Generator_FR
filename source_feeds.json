@@ -1,0 +1,11 @@
+{
+  "fr": [
+    {
+      "name": "Le Monde",
+      "url": "https://www.lemonde.fr/rss/tag/actualite.xml",
+      "enabled": true,
+      "priority": 1,
+      "usage_status": "needs_permission"
+    }
+  ]
+}

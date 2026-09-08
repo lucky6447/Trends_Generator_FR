@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Any, Dict, List
 
-from ollama import chat
+from ollama import Client
 from config import MODEL
 
 
@@ -30,7 +30,7 @@ from config import MODEL
 #   3) no automatic article rewriting
 # ============================================================
 
-FACT_GUARD_VERSION = "fact-guard-v1.2.0-single-audit-compact-evidence"
+FACT_GUARD_VERSION = "fact-guard-v1.2.0-single-audit-production"
 
 # Performance configuration:
 # Threads and batch are intentionally left to Ollama by default.
@@ -38,6 +38,12 @@ FACT_GUARD_VERSION = "fact-guard-v1.2.0-single-audit-compact-evidence"
 # Explicit environment overrides remain supported for controlled testing.
 FACT_GUARD_NUM_THREADS = os.getenv("FACT_GUARD_NUM_THREADS", "").strip()
 FACT_GUARD_NUM_BATCH = os.getenv("FACT_GUARD_NUM_BATCH", "").strip()
+FACT_GUARD_TIMEOUT_SECONDS = max(30, float(os.getenv("FACT_GUARD_TIMEOUT_SECONDS", "120")))
+
+# Use a dedicated Ollama client so every Fact Guard request has a hard HTTP
+# timeout. The previous global chat() call could wait indefinitely when
+# Ollama stalled or became unavailable between runs.
+FACT_GUARD_OLLAMA = Client(timeout=FACT_GUARD_TIMEOUT_SECONDS)
 
 # Benchmark only: when enabled, independent focused audits run concurrently.
 # Default is OFF so the normal production behavior remains unchanged.
@@ -47,7 +53,7 @@ FACT_GUARD_PARALLEL_AUDITS = (
 )
 
 NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
-AUDIT_TOKENS = max(120, int(os.getenv("FACT_GUARD_AUDIT_TOKENS", "180")))
+AUDIT_TOKENS = max(180, int(os.getenv("FACT_GUARD_AUDIT_TOKENS", "260")))
 
 print(f"[FACT GUARD] {FACT_GUARD_VERSION}")
 
@@ -961,7 +967,8 @@ def _downgrade_publication_date_only_event_issues(
 
 def _ollama_event_date_audit(source: str, article: Dict[str, Any], reference_date: date | None = None) -> Dict[str, Any]:
     _fact_guard_started = time.perf_counter()
-    response = chat(
+    print(f"[FACT GUARD TIMER] Ollama START | timeout={FACT_GUARD_TIMEOUT_SECONDS:.0f}s")
+    response = FACT_GUARD_OLLAMA.chat(
         model=MODEL,
         messages=[{"role": "user", "content": _event_date_audit_prompt(source, article, reference_date)}],
         options=_fact_guard_ollama_options(
@@ -1127,7 +1134,8 @@ ARTICLE:
 
 def _ollama_entity_attribution_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
     _fact_guard_started = time.perf_counter()
-    response = chat(
+    print(f"[FACT GUARD TIMER] Ollama START | timeout={FACT_GUARD_TIMEOUT_SECONDS:.0f}s")
+    response = FACT_GUARD_OLLAMA.chat(
         model=MODEL,
         messages=[{"role": "user", "content": _entity_attribution_audit_prompt(source, article)}],
         options=_fact_guard_ollama_options(
@@ -1201,102 +1209,56 @@ _AUDIT_FORMAT = {
 
 def _audit_prompt(source: str, article: Dict[str, Any]) -> str:
     return f"""
-You are an independent factual validator for TrendCurrent.
-
-Your job is NOT to rewrite the article.
-Your job is to determine whether the ARTICLE contains material factual
-claims that are unsupported or contradicted by the SOURCE MATERIAL.
+You are TrendCurrent's final independent factual validator.
 
 SOURCE MATERIAL is the ONLY factual authority.
+Check the ARTICLE for material factual errors. Do NOT rewrite it.
 
-STRICT RULES:
+CHECK ONLY:
+- wrong names, roles, teams, organisations or attribution
+- wrong dates, event status, current/recent/upcoming framing
+- wrong numbers, amounts, locations or platforms
+- unsupported quotations
+- unsupported causal/motive claims
+- unsupported superlatives/record claims
+- exaggerated scope
+- reported/planned/expected information presented as confirmed
+- facts from different rounds, matches, days or event instances incorrectly connected
+
+RULES:
+- Normal paraphrasing is allowed.
 - Do not use outside knowledge.
-- Do not assume that a claim is true because it sounds plausible.
-- Do not require identical wording.
-- Normal journalistic paraphrasing is allowed.
-- Flag a claim when the source does not support it.
-- Flag wrong names, roles, dates, numbers, locations, event status,
-  attribution, quotations, causal claims and exaggerated scope.
-- Reconstruct the chronology of important events before judging them.
-- When two or more factual claims are linked by "while", "in contrast",
-  "compared with", "versus", "whereas", "meanwhile", or similar wording,
-  verify the RELATION between the facts, not only each fact in isolation.
-- For time-bound results/statistics, bind each fact to its relevant event,
-  round, matchday, week, date, or status whenever the source provides it.
-  Do not combine a true fact from one temporal state with a true fact from
-  another temporal state as if they occurred in the same state.
-- A fact such as "Player A scored 61" and "Player B scored 74" can both be
-  source-supported while the sentence connecting them is still materially
-  wrong if 61 belongs to Round 2 and 74 belongs to Round 1.
-- Treat cross-round/cross-day/cross-match/cross-week conflation as HIGH when
-  the source explicitly establishes the conflicting temporal assignments.
-  Use REVIEW when the source does not contain enough temporal information.
-- For every person mentioned with a job/team role, verify the ROLE itself,
-  not merely that the person is associated with the club/company/entity.
-- Treat PLAYER vs MANAGER/COACH and similar role substitutions as material
-  factual errors when the source establishes the person's actual role.
-- For transfers, appointments, departures, signings and debuts, determine
-  the event date and the person's state at the article's claimed time.
-  An old/historical transfer must NOT be accepted as a new/current transfer
-  merely because the same person and destination still appear in the source.
-- Be especially careful with:
-  * "record", "lowest/highest ever", "unprecedented", "first-ever"
-  * "nationwide", "all cinemas", "everywhere"
-  * causes, motives or connections inferred from chronology
-  * people whose job title/role may have been changed
-  * old information presented as current
-  * historical transfers/events presented as newly announced
-   * results/statistics from different rounds, dates, matchdays or weeks
-     accidentally combined into one comparison or same-day narrative
-  * reported/expected/planned information presented as confirmed
-- A contextual sentence is NOT automatically wrong merely because it is
-  not word-for-word in the source. Flag it only when it makes a factual
-  claim that the source cannot reasonably support.
-- If a claim is uncertain, prefer severity REVIEW rather than HIGH.
-- HIGH means a clear material factual error or unsupported concrete claim.
-- A clearly wrong person-role attribution is HIGH.
-- A clearly wrong event chronology, such as an old transfer presented as a
-  new/current transfer, is HIGH.
-- REVIEW means the wording requires human/secondary verification.
-- Ignore style, grammar and harmless editorial wording.
-- ENTITY/ROLE LOCK: For every named person/entity, verify that each action, role,
-  relationship and attribution belongs to the correct entity. A wrong person-role
-  or wrong person-action attribution is HIGH.
-- TEMPORAL LOCK: Bind dates, results, statuses and developments to the exact event
-  represented by the source evidence. Do not combine facts from different events,
-  rounds, dates or states as though they were one.
-- EVENT-STATUS LOCK: scheduled/expected/proposed/reported is not completed or confirmed
-  unless the source explicitly says so.
-- NUMBER/RESULT LOCK: verify every number, score, percentage and result attribution.
+- Do not flag style or harmless wording.
+- A claim is HIGH only when the source clearly contradicts it or clearly does not support a concrete material claim.
+- Use REVIEW when the source is genuinely ambiguous.
+- For dates, distinguish event date from publication/update date.
+- For transfers, signings, appointments and releases, verify the person's state at the claimed time.
+- For connected facts, verify their relationship, not just each fact separately.
+- Do not infer a negative event status from silence.
+- Every reported issue MUST have a short exact source excerpt. If none exists, do not report HIGH.
+- Return at most 3 issues.
+- Keep claim <= 18 words, reason <= 24 words, source_excerpt <= 12 words.
+- Return ONLY the JSON object.
 
-For every issue, provide a short source excerpt that directly supports
-your conclusion. If no source excerpt can be identified, leave it empty
-and explain why.
-
-Return ONLY JSON.
-
-Format:
+JSON:
 {{
   "passed": true,
   "issues": []
 }}
 
 or:
-
 {{
   "passed": false,
-  "issues": [
-    {{
-      "severity": "HIGH",
-      "type": "wrong_role",
-      "claim": "example claim",
-      "reason": "The source identifies the person differently.",
-      "source_excerpt": "short exact excerpt"
-    }}
-  ]
+  "issues": [{{
+    "severity": "HIGH",
+    "type": "wrong_fact",
+    "claim": "short claim",
+    "reason": "short source-grounded reason",
+    "source_excerpt": "short exact excerpt"
+  }}]
 }}
 
-SOURCE MATERIAL:
+SOURCE:
 {source}
 
 ARTICLE:
@@ -1402,7 +1364,8 @@ ARTICLE:
 
 def _ollama_temporal_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
     _fact_guard_started = time.perf_counter()
-    response = chat(
+    print(f"[FACT GUARD TIMER] Ollama START | timeout={FACT_GUARD_TIMEOUT_SECONDS:.0f}s")
+    response = FACT_GUARD_OLLAMA.chat(
         model=MODEL,
         messages=[{"role": "user", "content": _temporal_audit_prompt(source, article)}],
         options=_fact_guard_ollama_options(
@@ -1457,7 +1420,8 @@ def _ollama_temporal_audit(source: str, article: Dict[str, Any]) -> Dict[str, An
 
 def _ollama_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
     _fact_guard_started = time.perf_counter()
-    response = chat(
+    print(f"[FACT GUARD TIMER] Ollama START | timeout={FACT_GUARD_TIMEOUT_SECONDS:.0f}s")
+    response = FACT_GUARD_OLLAMA.chat(
         model=MODEL,
         messages=[{"role": "user", "content": _audit_prompt(source, article)}],
         options=_fact_guard_ollama_options(
@@ -1643,105 +1607,57 @@ def validate(
     article: Dict[str, Any],
     reference_date: date | None = None,
 ) -> Dict[str, Any]:
-    _fact_guard_total_started = time.perf_counter()
+    """
+    Production Fact Guard path.
+
+    Exactly ONE Ollama audit is used after deterministic checks. The previous
+    sequential semantic + temporal + event-date + entity audits multiplied
+    inference time without improving the publication contract enough to justify
+    the cost: the broad audit already covers all four domains.
+
+    Fail closed on infrastructure/JSON errors. REVIEW does not block; HIGH and
+    MEDIUM do.
+    """
+    started = time.perf_counter()
+
     if not isinstance(article, dict):
         raise ValueError("Article must be a JSON object.")
 
-    # Production callers pass the run's explicit validation date.
-    # CLI/manual callers may still use FACT_GUARD_REFERENCE_DATE.
     if reference_date is None:
         reference_date = _parse_reference_date()
 
     deterministic = _deterministic_checks(source, article)
     deterministic += _deterministic_current_state_checks(article, reference_date)
 
-    temporal_signals = _temporal_consistency_signals(article)
-
-    event_date_signals = _event_date_consistency_signals(article)
-
-    # Existing focused temporal trigger remains unchanged.
-    #
-    # Additional narrow trigger:
-    # If the article contains an explicit event date and event language, and
-    # the supplied source contains multiple distinct dates that are each near
-    # explicit event language, run the temporal audit even when the article has
-    # no score/comparison wording. Publication/update dates alone do not trigger
-    # this path.
-    #
-    # This specifically covers adjacent-event conflation, where two individually
-    # true facts about the same person/team can belong to different event
-    # instances (for example, separate games on consecutive days).
-    #
-    # The helper is ONLY a trigger. The focused temporal audit remains the
-    # authority for deciding whether the facts were actually conflated.
-    run_temporal = (
-        (
-            temporal_signals["temporal"]
-            and temporal_signals["score"]
-            and temporal_signals["relation"]
-        )
-        or
-        (
-            event_date_signals["event_language"]
-            and event_date_signals["explicit_date"]
-            and _source_has_multiple_event_dates(source)
-        )
-    )
-
-    run_event_date = (
-        (
-            event_date_signals["event_language"]
-            and (
-                event_date_signals["explicit_date"]
-                or event_date_signals["freshness_language"]
-            )
-        )
-        or event_date_signals.get("event_status_language", False)
-    )
-
-    run_entity = _entity_attribution_signals(article)
-
-    # ONE production semantic audit. It explicitly covers entity attribution,
-    # chronology, event status and numbers, so independent focused audits do not
-    # re-run the same long source/article context on the CPU.
     semantic = _ollama_audit(source, article)
-    temporal = {"issues": []}
-    event_date = {"issues": []}
-    entity_attribution = {"issues": []}
-
-    all_issues = (
-        deterministic
-        + semantic.get("issues", [])
-        + temporal.get("issues", [])
-        + event_date.get("issues", [])
-        + entity_attribution.get("issues", [])
-    )
-
-    # Normalize only correlated duplicate reports before counting blockers.
-    # Detection remains independent; this step only makes one underlying
-    # repairable incident count as one blocking issue.
+    all_issues = deterministic + semantic.get("issues", [])
     all_issues = _deduplicate_correlated_blockers(all_issues)
 
-    # REVIEW alone does not automatically reject an article.
-    # HIGH / MEDIUM are publication blockers.
     blocking = [
         issue for issue in all_issues
-        if issue.get("severity") in {"HIGH", "MEDIUM"}
+        if str(issue.get("severity", "")).upper() in {"HIGH", "MEDIUM"}
+    ]
+    reviews = [
+        issue for issue in all_issues
+        if str(issue.get("severity", "")).upper() == "REVIEW"
     ]
 
     status = "FLAG" if blocking else "PASS"
+    print(
+        f"[FACT GUARD] FINAL | status={status} | "
+        f"blocking={len(blocking)} | review={len(reviews)} | "
+        f"elapsed={time.perf_counter() - started:.2f}s | audits=1"
+    )
 
-    _fact_guard_timer_label("TOTAL", _fact_guard_total_started)
     return {
-        "fact_guard_version": FACT_GUARD_VERSION,
+        "fact_guard_version": FACT_GUARD_VERSION + "-single-audit",
         "status": status,
         "passed": status == "PASS",
         "blocking_issues": len(blocking),
-        "review_items": len([
-            x for x in all_issues if x.get("severity") == "REVIEW"
-        ]),
+        "review_items": len(reviews),
         "issues": all_issues,
     }
+
 
 
 # ============================================================

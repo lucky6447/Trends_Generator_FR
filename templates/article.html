@@ -16,24 +16,16 @@
 <title>{{ article.title }}</title>
 <meta name="description" content="{{ article.description }}">
 
-<link rel="canonical" href="{{ site_url }}/trends/{{ article.slug }}">
+<link rel="canonical" href="{{ site_url }}/trends/{{ article.slug }}.html">
 
 <meta property="og:type" content="article">
 <meta property="og:title" content="{{ article.title }}">
 <meta property="og:description" content="{{ article.description }}">
-<meta property="og:url" content="{{ site_url }}/trends/{{ article.slug }}">
-{% if article.image_data and article.image_data.image %}
-<meta property="og:image" content="{{ article.image_data.image }}">
-<meta property="og:image:width" content="1200">
-<meta property="og:image:height" content="675">
-{% endif %}
+<meta property="og:url" content="{{ site_url }}/trends/{{ article.slug }}.html">
 
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="{{ article.title }}">
 <meta name="twitter:description" content="{{ article.description }}">
-{% if article.image_data and article.image_data.image %}
-<meta name="twitter:image" content="{{ article.image_data.image }}">
-{% endif %}
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -190,55 +182,6 @@ color:#d9e5ff;
 
 }
 
-/* TrendCurrent remote article image */
-
-.tc-article-image{
-    width:100%;
-    margin:0 0 30px;
-    padding:0;
-}
-
-.tc-article-image__frame{
-    width:100%;
-    max-width:1200px;
-    margin:0 auto;
-    overflow:hidden;
-    border-radius:14px;
-    background:#eef2f7;
-    line-height:0;
-}
-
-.tc-article-image img{
-    display:block;
-    width:100%;
-    max-width:100%;
-    height:auto;
-    min-width:0;
-    margin:0;
-    padding:0;
-    border:0;
-    object-fit:contain;
-}
-
-@media(max-width:768px){
-
-    .tc-article-image{
-        width:100%;
-        margin-bottom:24px;
-    }
-
-    .tc-article-image__frame{
-        width:100%;
-        border-radius:10px;
-    }
-
-    .tc-article-image img{
-        width:100%;
-        height:auto;
-    }
-
-}
-
 
 .meta{
 
@@ -375,10 +318,7 @@ margin-bottom:20px;
 "@type":"Article",
 "headline":"{{ article.title }}",
 "description":"{{ article.description }}",
-"url":"{{ site_url }}/trends/{{ article.slug }}",
-{% if article.image_data and article.image_data.image %}
-"image":"{{ article.image_data.image }}",
-{% endif %}
+"url":"{{ site_url }}/trends/{{ article.slug }}.html",
 "inLanguage":"{{ language }}"
 }
 </script>
@@ -420,25 +360,6 @@ margin-bottom:20px;
 <div class="container">
 
 <article class="article">
-{% if article.image_data and article.image_data.image %}
-
-<figure class="tc-article-image">
-
-    <div class="tc-article-image__frame">
-
-        <img src="{{ article.image_data.image }}"
-             alt="{{ article.h1 }}"
-             width="1200"
-             height="675"
-             loading="eager"
-             decoding="async"
-             fetchpriority="high">
-
-    </div>
-
-</figure>
-
-{% endif %}
 {% for paragraph in article.paragraphs %}
 <p>{{ paragraph }}</p>
 {% endfor %}

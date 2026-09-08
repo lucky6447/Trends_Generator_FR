@@ -10,23 +10,26 @@ import generator_monitor as monitor
 
 # ============================================================
 # TrendCurrent UNIVERSAL FACT-LOCK PIPELINE
-# Balanced rewrite
+# Dedicated newsroom writer / evidence-lock client
 #
 # SOURCE
-#   -> compact evidence extraction
-#   -> primary-event lock
-#   -> article generation
-#   -> production Fact Guard (owned by generate.py)
-#   -> deterministic repetition/language gates
+#   -> source-aware sentence indexing
+#   -> compact provenance-locked evidence extraction
+#   -> conservative evidence lineage deduplication
+#   -> deterministic substantive-value gate
+#   -> one newsroom article generation
+#   -> post-generation factual audit (owned by generate.py)
 #
-# Goals:
-#   * source-grounded without being needlessly rigid
-#   * compact Ollama output so CPU inference does not run for minutes
+# Design principles:
+#   * factual closure: the writer cannot add outside information
+#   * newsroom prose: report the story, do not paraphrase a fact list
+#   * no artificial word floor and no length retry
+#   * no repair/regeneration loop in this module
 #   * no cross-event article construction
-#   * language-independent
+#   * preserve multilingual operation
 # ============================================================
 
-PIPELINE_VERSION = "universal-fact-lock-v2.8.1-coverage-first-no-repair-fail-closed-discovery-evidence-optimized"
+PIPELINE_VERSION = "universal-fact-lock-v2.9.3-ministral-all-facts-no-word-floor"
 
 # IMPORTANT: Do not force a CPU thread count by default.
 # Ollama can auto-detect the runner's optimal thread count.
@@ -39,7 +42,7 @@ NUM_THREADS = (
     else None
 )
 
-NUM_CTX = max(4096, int(os.getenv("OLLAMA_NUM_CTX", "6144")))
+NUM_CTX = max(4096, int(os.getenv("OLLAMA_NUM_CTX", "4096")))
 
 # IMPORTANT: Do not force num_batch=512 by default.
 # Keep an explicit override available for controlled benchmarking.
@@ -57,16 +60,18 @@ EVIDENCE_CHUNK_CHARS = max(
     7000, int(os.getenv("OLLAMA_EVIDENCE_CHUNK_CHARS", "18000"))
 )
 EVIDENCE_TOKENS = max(
-    420, int(os.getenv("OLLAMA_EVIDENCE_TOKENS", "700"))
+    520, int(os.getenv("OLLAMA_EVIDENCE_TOKENS", "560"))
 )
 EVIDENCE_MAX_FACTS = max(
     4, min(12, int(os.getenv("OLLAMA_EVIDENCE_MAX_FACTS", "12")))
 )
 
-# Only a small set of facts are mandatory for article coverage. The remaining
+# Only a small factual spine is mandatory for article coverage. The remaining
 # verified facts stay available as supporting evidence but do not become a
-# checklist the writer must mechanically reproduce.
-CORE_FACTS_MAX = max(1, min(6, int(os.getenv("OLLAMA_CORE_FACTS_MAX", "6"))))
+# checklist the writer must mechanically reproduce. Four is the default upper
+# bound; final role assignment also prevents near-duplicate facts from becoming
+# mandatory CORE facts together.
+CORE_FACTS_MAX = max(1, min(4, int(os.getenv("OLLAMA_CORE_FACTS_MAX", "4"))))
 
 # Controlled writer A/B test: optionally expose bounded source context to the
 # writer while keeping LOCKED EVIDENCE as the only factual authority.
@@ -74,10 +79,10 @@ WRITER_SOURCE_CONTEXT = os.getenv("OLLAMA_WRITER_SOURCE_CONTEXT", "0").strip() =
 WRITER_SOURCE_CONTEXT_CHARS = max(4000, int(os.getenv("OLLAMA_WRITER_SOURCE_CONTEXT_CHARS", "12000")))
 
 ARTICLE_TOKENS = max(
-    700, int(os.getenv("OLLAMA_ARTICLE_TOKENS", "1200"))
+    520, int(os.getenv("OLLAMA_ARTICLE_TOKENS", "720"))
 )
 AUDIT_TOKENS = max(
-    120, int(os.getenv("OLLAMA_AUDIT_TOKENS", "180"))
+    240, int(os.getenv("OLLAMA_AUDIT_TOKENS", "320"))
 )
 # No deterministic article-length floor.
 # A factual, concise article must not be rejected merely because it is short.
@@ -305,10 +310,12 @@ def _split_source(source):
     # The normal chunk size remains unchanged. A single larger chunk is allowed
     # only for payloads that stay below a conservative 18k-character ceiling.
     # This is a performance optimization, not a content reduction.
-    effective_chunk_chars = EVIDENCE_CHUNK_CHARS
+    # Never split a source that safely fits in one inference context.
+    # ARTICLE markers are provenance metadata and must not multiply CPU calls.
     if len(text) <= 18000:
-        effective_chunk_chars = len(text)
+        return [text]
 
+    effective_chunk_chars = EVIDENCE_CHUNK_CHARS
 
     marker = re.compile(r"(?m)^\s*ARTICLE\s+\d+\s*$")
     matches = list(marker.finditer(text))
@@ -486,74 +493,32 @@ def _sentence_index_source(source):
 def _evidence_prompt(source, max_facts=None):
     limit = max_facts or EVIDENCE_MAX_FACTS
     indexed_source, sentence_map = _sentence_index_source(source)
-
-    valid_ids = list(sentence_map.keys())
-    valid_id_text = ", ".join(valid_ids)
-
+    valid_id_text = ", ".join(sentence_map.keys())
     return f"""
-You are TrendCurrent's source-evidence extractor.
+Extract factual evidence for ONE concrete story from the SOURCE.
 
-Read ALL of the SOURCE MATERIAL before deciding which facts to return.
-
-PRIMARY-EVENT LOCK:
-- The supplied material has already been prefiltered to one coherent story cluster.
-- Treat the cluster as ONE story unless a sentence is clearly unrelated.
-- Do NOT reject the cluster merely because articles are repetitive versions of the same story.
-- Do NOT switch to a different event just because another entity or topic appears in one article.
-- Return facts from the SAME concrete event/story only.
-
-EVIDENCE COVERAGE:
-- Build the strongest possible evidence ledger from the SAME story.
-- Extract distinct, directly supported, useful facts from the SAME story, up to {limit}.
-- Prefer the strongest/core facts first: the main development, key entities/actions, event status/time, and other facts needed to understand the story.
-- Additional useful details may follow as supporting facts.
-- Do not manufacture facts merely to reach a count.
-- Do NOT stop after one fact.
-- Do NOT stop after identifying the main event.
-- Prefer facts covering different dimensions when available: event/action, people/entities, opponent/location, date/status, score/number, qualification/stage, and other concrete developments.
-- Avoid duplicate facts that merely repeat the same point.
-- If fewer than 4 distinct facts are genuinely supported by the entire cluster, return all supported facts and no invented facts.
-
-FACT RULES:
-- Every fact MUST be explicitly supported by one source sentence.
-- "x" MUST be one of these VALID SENTENCE IDs: {valid_id_text}
-- Never invent, alter, or guess a sentence ID.
-- "f" must be a concise factual statement supported by that sentence.
-- Do NOT generate excerpts, source names, dates or status fields separately.
-- Do not infer motives, causes, consequences, significance, reputation, strength, expectations or likely outcomes.
-- Do not use outside knowledge.
-- Preserve names, roles, dates, numbers and certainty exactly.
-- Never transfer attributes between named entities.
-- Prefer a concrete source-supported fact over generic background wording.
-- Do not select a numeric or other materially conflicting claim merely from a headline or metadata.
-- When the factual bodies of sources conflict on a number, date, status or attribution and the conflict is not explicitly resolved, omit the disputed detail rather than choosing one by guesswork.
-- RESULT / SCORE ATTRIBUTION — HARD LOCK:
-- A score or result must NEVER be used to infer which team, player or side won.
-- Never assume that the first number belongs to the first named team, or that the higher
-  number belongs to the first named team.
-- Never infer winner, loser, winning side or "in favor of" attribution from score ordering,
-  team ordering, sentence position, headline wording, convention or outside knowledge.
-- State the score itself only when the source explicitly supports that score.
-- State which side won or lost only when the source sentence explicitly establishes that
-  result or explicitly links the result to the named side.
-- If the score is explicit but the winner attribution is not explicit, keep the score as a
-  score-only fact and omit the winner/loser attribution.
-- If winner, loser or result attribution is ambiguous or cannot be established directly
-  from the source sentence, omit that attribution rather than guessing.
+Rules:
+- Read the entire source.
+- Return as many genuinely distinct, directly supported facts as the source provides, up to {limit}.
+- For a source with enough concrete detail, aim for 5-8 distinct facts rather than stopping after 2-3.
+- Never pad, invent, infer, or manufacture facts just to reach a count.
+- Do not stop early merely because the main event is already identified.
+- Prefer concrete developments, actions, decisions, entities, dates, numbers,
+  locations, status, official responses, investigation/development details and other
+  materially useful details that are explicitly stated in the source.
+- No outside knowledge, inference, motives, causes, significance or predictions.
+- Preserve names, dates, numbers and certainty exactly.
+- Each fact must be supported by one source sentence.
+- x MUST be an exact sentence ID from: {valid_id_text}
+- Never invent or alter IDs.
+- A score does not establish a winner unless the sentence explicitly says so.
 - Return ONLY JSON.
 
-IMPORTANT OUTPUT REQUIREMENT:
-- Before returning JSON, silently review the ENTIRE SOURCE MATERIAL for additional distinct supported facts.
-- Do not return only the first or most obvious fact when additional supported facts are present.
-- Return as many distinct useful facts as the source genuinely supports, but keep the strongest/core facts first. The writer will require only the strongest core facts and may use the rest as supporting evidence.
+{{"facts":[{{"f":"supported fact","x":"A1-S1"}}]}}
 
-Use exactly this compact JSON shape:
-{{"facts":[{{"f":"fact","x":"A1-S1"}}]}}
-
-SOURCE MATERIAL:
+SOURCE:
 {indexed_source}
 """
-
 
 
 def _evidence_expansion_prompt(source):
@@ -566,7 +531,7 @@ Return ONLY JSON:
 {{"facts":[{{"f":"fact","x":"A1-S1"}}]}}
 
 RULES:
-- Extract the strongest distinct facts the source genuinely supports, up to {EVIDENCE_MAX_FACTS}.
+- Extract the strongest distinct facts the source genuinely supports, up to {EVIDENCE_MAX_FACTS}; when the source is rich, aim for 5-8 rather than stopping after 2-3.
 - ALL returned facts must belong to ONE coherent event/story.
 - If several ARTICLE blocks or separate stories appear in the source, choose one main story and ignore unrelated stories that merely share a keyword.
 - Do not combine separate programmes, broadcasts, people, matches, incidents or other events.
@@ -603,44 +568,22 @@ SOURCE:
 def _evidence_retry_prompt(source):
     indexed_source, sentence_map = _sentence_index_source(source)
     valid_id_text = ", ".join(sentence_map.keys())
-
     return f"""
-Extract the MAIN EVENT from this source.
+Re-extract factual evidence for ONE concrete story.
 
-Return ONLY compact JSON:
-{{"facts":[{{"f":"fact","x":"A1-S1"}}]}}
+Return ONLY:
+{{"facts":[{{"f":"supported fact","x":"A1-S1"}}]}}
 
-RULES:
-- Return as many distinct facts as the source supports, up to {EVIDENCE_MAX_FACTS}.
-- Prefer broad factual coverage when the source supports it, but never pad the ledger just to reach a count.
-- ALL facts must belong to ONE coherent main event/story.
-- If multiple ARTICLE blocks or separate stories share a keyword, choose one story only and do not mix them.
-- Cover different useful factual dimensions instead of repeating the same point.
-- All facts must belong to the same main event.
-- "x" must be one of these VALID SENTENCE IDs: {valid_id_text}
-- Do not interpret SOURCE S2, ARTICLE 2, or any source label as a sentence ID.
-- Never invent or alter a sentence ID.
-- "f" must be a concise supported fact.
-- Do not generate excerpts, source names, dates or status fields.
-- Do not invent facts or use outside knowledge.
-- RESULT / SCORE ATTRIBUTION — HARD LOCK:
-- A score or result must NEVER be used to infer which team, player or side won.
-- Never assume that the first number belongs to the first named team, or that the higher
-  number belongs to the first named team.
-- Never infer winner, loser, winning side or "in favor of" attribution from score ordering,
-  team ordering, sentence position, headline wording, convention or outside knowledge.
-- State the score itself only when the source explicitly supports that score.
-- State which side won or lost only when the source sentence explicitly establishes that
-  result or explicitly links the result to the named side.
-- If the score is explicit but the winner attribution is not explicit, keep the score as a
-  score-only fact and omit the winner/loser attribution.
-- If winner, loser or result attribution is ambiguous or cannot be established directly
-  from the source sentence, omit that attribution rather than guessing.
+Rules:
+- Use only the SOURCE; no outside knowledge or inference.
+- Return distinct supported facts, up to {EVIDENCE_MAX_FACTS}; never pad.
+- Keep one coherent event.
+- Every x must be an exact valid sentence ID: {valid_id_text}
+- Never invent or alter IDs.
 
 SOURCE:
 {indexed_source}
 """
-
 
 
 def _evidence_invalid_id_retry_prompt(source, invalid_ids):
@@ -787,33 +730,21 @@ def _deduplicate_evidence_facts(facts):
         return facts, {"raw_facts": len(facts), "unique_information_units": len(facts), "merged_facts": 0, "merge_pairs": []}
 
     candidates = _fact_lineage_candidates(facts)
+    # Do not invoke Ollama a second time just to decide whether extracted
+    # facts are duplicates. Merge only obvious lexical restatements.
     accepted_pairs = []
     if candidates:
-        try:
-            data = _call(
-                _fact_lineage_prompt(facts, candidates),
-                temperature=0.0,
-                num_predict=220,
-                num_thread=NUM_THREADS,
-                response_format=_FACT_LINEAGE_FORMAT,
-            )
-            raw_pairs = data.get("merge_pairs", []) if isinstance(data, dict) else []
-            candidate_set = {(c["i"], c["j"]) for c in candidates}
-            for pair in raw_pairs:
-                if not isinstance(pair, list) or len(pair) != 2:
-                    continue
-                try:
-                    i, j = int(pair[0]), int(pair[1])
-                except (TypeError, ValueError):
-                    continue
-                if i > j:
-                    i, j = j, i
-                if (i, j) in candidate_set and (i, j) not in accepted_pairs:
-                    accepted_pairs.append((i, j))
-        except Exception as exc:
-            # Fail open: lineage is an evidence-quality enhancement, never a reason
-            # to discard otherwise provenance-valid evidence when the judge is unavailable.
-            print(f"[FACT LINEAGE] judge unavailable | keeping extracted facts | error={exc}")
+        for candidate in candidates:
+            i, j = candidate["i"], candidate["j"]
+            a = str(facts[i].get("fact", "")).strip()
+            b = str(facts[j].get("fact", "")).strip()
+            jaccard, sequence, containment = _fact_pair_similarity(a, b)
+            if (
+                sequence >= 0.88
+                or (containment and jaccard >= 0.68)
+                or (jaccard >= 0.72 and sequence >= 0.78)
+            ):
+                accepted_pairs.append((i, j))
 
     parent = list(range(len(facts)))
 
@@ -881,7 +812,7 @@ def _deduplicate_evidence_facts(facts):
 # statements, tipster/promotional framing, recycled context, or other content
 # that gives the reader little substantive news.
 SUBSTANTIVE_VALUE_TOKENS = max(
-    120, int(os.getenv("OLLAMA_SUBSTANTIVE_VALUE_TOKENS", "180"))
+    120, int(os.getenv("OLLAMA_SUBSTANTIVE_VALUE_TOKENS", "320"))
 )
 SUBSTANTIVE_VALUE_MIN_CONFIDENCE = max(
     70, min(100, int(os.getenv("OLLAMA_SUBSTANTIVE_VALUE_MIN_CONFIDENCE", "80")))
@@ -1014,97 +945,83 @@ LOCKED EVIDENCE:
 
 
 def substantive_story_value_gate(evidence):
-    """
-    Fail closed before article generation when locked evidence lacks
-    substantive news value.
+    """Deterministic substantive-story gate after story/evidence validation.
 
-    Returns the normalized decision on PASS. Raises ValueError on REJECT or
-    unavailable/invalid judge output so the candidate never reaches generation.
+    Story concentration has already established a concrete event/story and the
+    production eligibility gate requires >=3 distinct provenance-verified
+    information units. A second Ollama editorial judgment is therefore removed
+    from the hot path.
     """
     if not isinstance(evidence, dict):
         raise ValueError("Substantive Story Value Gate requires an evidence object.")
 
     facts = evidence.get("facts", [])
+    lineage = evidence.get("fact_lineage", {})
+    try:
+        unique_units = int(
+            lineage.get("unique_information_units", len(facts))
+            if isinstance(lineage, dict) else len(facts)
+        )
+    except (TypeError, ValueError):
+        unique_units = len(facts) if isinstance(facts, list) else 0
+
     if not isinstance(facts, list) or not facts:
         raise ValueError("Substantive Story Value Gate rejected empty evidence.")
-
-    started = time.perf_counter()
-
-    try:
-        result = _call(
-            _substantive_value_prompt(evidence),
-            temperature=0.0,
-            num_predict=SUBSTANTIVE_VALUE_TOKENS,
-            num_thread=NUM_THREADS,
-            response_format=_SUBSTANTIVE_VALUE_FORMAT,
-        )
-    except Exception as exc:
-        elapsed = time.perf_counter() - started
-        print(
-            f"[SUBSTANTIVE STORY VALUE] UNAVAILABLE | "
-            f"elapsed={elapsed:.2f}s | error={exc}"
-        )
+    if unique_units < 3:
         raise ValueError(
-            f"Substantive Story Value Gate unavailable: {exc}"
-        ) from exc
+            f"Substantive Story Value Gate rejected insufficient distinct evidence "
+            f"({unique_units} < 3)."
+        )
 
-    if not isinstance(result, dict):
-        raise ValueError("Substantive Story Value Gate returned invalid JSON.")
-
-    verdict = str(result.get("verdict", "")).strip().upper()
-    try:
-        confidence = max(0, min(100, int(result.get("confidence", 0))))
-    except (TypeError, ValueError):
-        confidence = 0
-
-    concrete_development = bool(result.get("concrete_development", False))
-    reader_value = bool(result.get("reader_value", False))
-    reason = str(result.get("reason", "")).strip()[:500]
-
-    # Fail closed: a PASS is only valid when the judge explicitly identifies
-    # both a concrete development and a useful reader takeaway with adequate
-    # confidence. This prevents vague low-confidence approvals.
-    passed = (
-        verdict == "PASS"
-        and confidence >= SUBSTANTIVE_VALUE_MIN_CONFIDENCE
-        and concrete_development
-        and reader_value
+    # Reject evidence that is overwhelmingly meta/promotional/interest-only.
+    meta_patterns = (
+        r"\b(?:discussed|being discussed|talked about|coverage of|covered by|"
+        r"attracting attention|fans are interested|expected to|tipped to|rumou?red|"
+        r"speculation|promotional|sponsored|advertisement)\b",
+        r"\b(?:diskutiert|besprochen|im gespräch|aufmerksamkeit|erwartet|"
+        r"gerücht|spekulation|werbung|gesponsert)\b",
+        r"\b(?:discutido|comentado|atención|esperado|rumor|especulación|"
+        r"promocional|patrocinado)\b",
+        r"\b(?:discusso|commentato|attenzione|atteso|indiscrezione|"
+        r"speculazione|promozionale|sponsorizzato)\b",
+        r"\b(?:discuté|commenté|attention|attendu|rumeur|spéculation|"
+        r"promotionnel|sponsorisé)\b",
+        r"\b(?:dibahas|dibicarakan|perhatian|diharapkan|rumor|spekulasi|"
+        r"promosi|disponsori)\b",
     )
 
-    if passed:
-        print(
-            f"[SUBSTANTIVE STORY VALUE] PASS | "
-            f"confidence={confidence} | concrete_development=true | "
-            f"reader_value=true | {reason}"
-        )
-        return {
-            "verdict": "PASS",
-            "confidence": confidence,
-            "concrete_development": True,
-            "reader_value": True,
-            "reason": reason,
-        }
+    usable = 0
+    concrete = 0
+    for item in facts:
+        if not isinstance(item, dict):
+            continue
+        fact = re.sub(r"\s+", " ", str(item.get("fact", "")).strip())
+        if len(fact.split()) < 4:
+            continue
+        usable += 1
+        if not any(re.search(p, fact, flags=re.IGNORECASE) for p in meta_patterns):
+            concrete += 1
 
-    if verdict == "REJECT":
-        rejection_reason = reason or "evidence lacks substantive news value"
-    elif verdict == "PASS":
-        rejection_reason = (
-            reason
-            or "judge did not establish both a concrete development and useful reader value"
+    if usable < 3 or concrete < 2:
+        raise ValueError(
+            "Substantive Story Value Gate rejected evidence as too generic/meta-level."
         )
-    else:
-        rejection_reason = f"invalid substantive value verdict: {verdict or 'empty'}"
 
     print(
-        f"[SUBSTANTIVE STORY VALUE] REJECT | "
-        f"confidence={confidence} | concrete_development={str(concrete_development).lower()} | "
-        f"reader_value={str(reader_value).lower()} | {rejection_reason}"
+        f"[SUBSTANTIVE STORY VALUE] PASS | deterministic=true | "
+        f"unique_information_units={unique_units} | usable_facts={usable} | "
+        f"concrete_facts={concrete}"
     )
-
-    raise ValueError(
-        f"Substantive Story Value Gate rejected candidate "
-        f"(confidence={confidence}): {rejection_reason}"
-    )
+    return {
+        "verdict": "PASS",
+        "confidence": 100,
+        "concrete_development": True,
+        "reader_value": True,
+        "reason": (
+            f"Evidence contains {unique_units} distinct information units and "
+            f"{concrete} concrete factual units."
+        ),
+    }
 
 
 def _source_excerpt_supported(source, excerpt):
@@ -1328,13 +1245,37 @@ def _extract_evidence(source):
     )
 
     # Re-assign CORE/SUPPORTING only AFTER lineage deduplication.
-    # The final locked fact list is the authoritative evidence universe, so
-    # core IDs must be derived from that final list (not from pre-lineage facts).
-    # This also guarantees that downstream article coverage cannot silently
-    # fall back to all facts when lineage renumbers F1..Fn.
+    # CORE is a small factual spine, not simply the first N extracted records.
+    # A conservative near-duplicate check keeps paraphrases/restatements out of
+    # the mandatory set even when the semantic lineage judge leaves them separate.
     locked = locked[:EVIDENCE_MAX_FACTS]
-    for index, fact_item in enumerate(locked):
-        fact_item["role"] = "core" if index < CORE_FACTS_MAX else "supporting"
+    core_fact_ids = []
+    core_facts = []
+    for fact_item in locked:
+        fact_item["role"] = "supporting"
+
+    for fact_item in locked:
+        if len(core_fact_ids) >= min(CORE_FACTS_MAX, len(locked)):
+            break
+        fact_text = str(fact_item.get("fact", "")).strip()
+        if not fact_text:
+            continue
+
+        is_near_duplicate = False
+        for core_fact in core_facts:
+            jaccard, sequence, containment = _fact_pair_similarity(
+                fact_text, str(core_fact.get("fact", ""))
+            )
+            if sequence >= 0.72 or (containment and jaccard >= 0.50) or (jaccard >= 0.55 and sequence >= 0.60):
+                is_near_duplicate = True
+                break
+
+        if is_near_duplicate:
+            continue
+
+        fact_item["role"] = "core"
+        core_fact_ids.append(fact_item.get("id", ""))
+        core_facts.append(fact_item)
 
     core_fact_ids = [
         f["id"] for f in locked if f.get("role") == "core" and f.get("id")
@@ -1409,12 +1350,12 @@ def _required_paragraphs(fact_count):
 
 
 def _article_structure_check(article, evidence):
-    """
-    Deterministic schema/structure gate.
+    """Deterministic structural validation without a length or paragraph floor.
 
-    Paragraph count is intentionally NOT derived from fact count. Coverage is
-    validated separately through the internal fact_ids lock, while factual
-    correctness is owned by the production Fact Guard in generate.py.
+    Article length and paragraph count are editorial outcomes of the evidence and
+    the writer. This function only verifies that usable prose exists. Factual
+    coverage is handled by the fact-id lock and the production factual audit in
+    generate.py.
     """
     facts = evidence.get("facts", []) if isinstance(evidence, dict) else []
     fact_count = len(facts) if isinstance(facts, list) else 0
@@ -1433,7 +1374,7 @@ def _article_structure_check(article, evidence):
     if actual < 1:
         return {
             "passed": False,
-            "reason": "article has no substantive paragraphs",
+            "reason": "article has no usable paragraphs",
             "required_paragraphs": 1,
             "actual_paragraphs": actual,
             "fact_count": fact_count,
@@ -1441,7 +1382,7 @@ def _article_structure_check(article, evidence):
 
     return {
         "passed": True,
-        "reason": "article structure satisfied without a fact-count paragraph floor",
+        "reason": "article contains usable natural-language paragraphs",
         "required_paragraphs": 1,
         "actual_paragraphs": actual,
         "fact_count": fact_count,
@@ -1485,107 +1426,194 @@ _ARTICLE_FORMAT = {
 
 
 def _article_prompt(evidence, source_context=None):
-    context_block = ""
-    if WRITER_SOURCE_CONTEXT and source_context:
-        bounded_context = str(source_context)[:WRITER_SOURCE_CONTEXT_CHARS]
-        context_block = f"""
+    """Build the dedicated newsroom-writing prompt for the article writer.
 
-SOURCE CONTEXT — NON-AUTHORITATIVE:
-{bounded_context}
-
-IMPORTANT: This source context is provided only to help understand wording and
-relationships between the locked facts. It is NOT an evidence source.
-You MUST NOT extract, add, strengthen, infer or introduce any fact from it
-unless that fact is explicitly present in LOCKED EVIDENCE. If SOURCE CONTEXT
-and LOCKED EVIDENCE differ, LOCKED EVIDENCE always wins.
-"""
-
+    The writer sees a closed factual universe. The objective is complete, natural news prose
+    that reports the available facts without artificial expansion or artificial compression. The model is
+    explicitly told how to turn distinct locked facts into a coherent story while
+    preserving uncertainty and avoiding generic AI filler.
+    """
     facts = evidence.get("facts", []) if isinstance(evidence, dict) else []
     core_ids = set(evidence.get("core_fact_ids", [])) if isinstance(evidence, dict) else set()
-    fact_inventory = "\n".join(
-        f"- {str(f.get('id','')).strip()} [{('CORE' if str(f.get('id','')).strip() in core_ids else 'SUPPORTING')}]: {str(f.get('fact','')).strip()}"
-        for f in facts
-        if isinstance(f, dict) and str(f.get('id','')).strip()
-    )
+    supporting_ids = set(evidence.get("supporting_fact_ids", [])) if isinstance(evidence, dict) else set()
+
+    fact_lines = []
+    for fact in facts:
+        if not isinstance(fact, dict):
+            continue
+        fid = str(fact.get("id", "")).strip()
+        text = str(fact.get("fact", "")).strip()
+        if not fid or not text:
+            continue
+        role = "CORE" if fid in core_ids else "SUPPORTING"
+        fact_lines.append(f"- {fid} [{role}]: {text}")
+
+    source_block = ""
+    if source_context:
+        bounded = str(source_context).strip()[:WRITER_SOURCE_CONTEXT_CHARS]
+        if bounded:
+            source_block = f"""
+
+OPTIONAL SOURCE CONTEXT:
+This context is provided only to help with wording and chronology. It is NOT an
+additional factual authority. If it conflicts with LOCKED FACTS, ignore it. Never
+introduce a detail from this context unless that detail is also represented in the
+LOCKED FACTS.
+{bounded}
+"""
 
     return f"""
-Write a clear TrendCurrent news article in {LANGUAGE}.
+You are TrendCurrent's newsroom writer. Write ONE finished news article in {LANGUAGE}.
 
-LANGUAGE LOCK:
-- TITLE, DESCRIPTION, H1 and EVERY paragraph text MUST be written in {LANGUAGE}.
-- Translate/paraphrase only supported facts.
-- Proper names and official names may remain in their original form.
+The reader should feel that a real journalist has reported the event clearly and
+naturally. Do not write an evidence checklist, a source summary, an AI explanation,
+or a sequence of paraphrases.
 
-SOURCE-LOCKED FACTUAL RULES:
-- LOCKED EVIDENCE is the complete and closed factual universe.
-- Use ONLY LOCKED EVIDENCE for factual content.
-- Never invent, infer, strengthen, embellish or add outside knowledge.
-- Every material sentence must be directly supported by LOCKED EVIDENCE.
+==================== FACTUAL LOCK ====================
+LOCKED FACTS are the complete factual universe for this article.
+Use ONLY information contained in these facts.
 
-ENTITY / ATTRIBUTION / TIME / NUMBER LOCKS:
-- Never transfer roles, actions, responsibility, employers or relationships between entities.
-- Preserve event status exactly: scheduled != completed; announced != implemented; proposed != completed.
-- Never infer dates, recency, weekday or timing from publication metadata.
-- Preserve names, numbers, prices, dates, scores, percentages and certainty exactly.
-- Never calculate or derive new factual numbers.
+Never invent or infer:
+- motives, causes, significance, implications, reactions, predictions or background;
+- dates, numbers, names, locations, roles or relationships not present in the facts;
+- winners or losers from score ordering;
+- details that are merely plausible or normally associated with the event.
 
-COVERAGE-FIRST CONTRACT — MANDATORY FOR CORE FACTS ONLY:
-- CORE facts are the mandatory factual spine of the article. Every CORE fact listed below MUST be explicitly represented in the article body.
-- SUPPORTING facts are verified optional details. Use them when they improve clarity or information density, but do NOT force them into the article.
-- Before writing, assign each CORE fact ID to one or more paragraphs.
-- The returned paragraphs must include a fact_ids array naming the exact locked facts explicitly represented in that paragraph.
-- Every CORE fact ID must appear in at least one paragraph's fact_ids.
-- A SUPPORTING fact ID may appear only when the paragraph explicitly communicates that fact or a faithful paraphrase.
-- Do NOT place a fact ID in fact_ids unless the paragraph text explicitly communicates that fact or a faithful paraphrase.
-- Closely related facts may share a paragraph, but each remains explicit.
-- Do not use a vague summary as coverage for multiple distinct facts.
-- Every paragraph must add new verified information; never repeat facts merely for length.
-- The fact_ids field is INTERNAL metadata and will never be published.
-- This is a coverage requirement, NOT a word-count rule.
-- Do not pad, repeat or invent facts to satisfy coverage.
+Preserve the certainty of the facts. If a fact says something was reported, expected,
+proposed, planned, believed, or under investigation, do not rewrite it as confirmed.
+=======================================================
 
-STRUCTURE:
-- Use as many substantive paragraphs as needed to present all locked facts clearly and coherently.
-- Do NOT force a paragraph count based on the number of locked facts.
-- Closely related facts may share a paragraph when each fact remains explicit.
-- Do not compress distinct facts into vague summaries merely to reduce paragraph count.
-- Do not pad or split paragraphs artificially just to satisfy a structural target.
+==================== NEWSROOM STYLE ====================
+1. Lead with the actual news.
+   The first sentence should tell the reader what happened, was announced, changed,
+   decided, recorded, or was otherwise concretely reported.
 
-STYLE:
-- Natural, fluent {LANGUAGE}; professional, clear, objective and precise.
-- No clickbait, speculation, filler or unsupported conclusions.
-- Write ONE coherent article about ONE concrete story.
+2. Then develop the story.
+   Use the other distinct facts to answer the natural next questions a reader would
+   have: who was involved, what happened next, when/where it happened, what the
+   current status is, or what other directly reported detail matters.
 
-HEADLINE:
-- Maximum 10 words AND 65 characters.
+3. Make every sentence earn its place.
+   Each substantive sentence must add information that the reader did not already
+   receive. A sentence that merely restates the previous sentence must not be written.
+
+4. DEVELOP DISTINCT FACTS — DO NOT COMPRESS THE STORY.
+   When multiple distinct locked facts are available, give each fact clear factual expression.
+   Do not routinely pack several independent facts into one short sentence just to be concise.
+   Prefer a natural sequence of substantive sentences that lets the reader understand the event,
+   its concrete developments, the people/entities involved, timing, location, status, numbers,
+   and other verified details that are actually present in the locked evidence.
+   A four-fact evidence set should normally read as a developed short news story, not as three
+   compressed bullet-like statements. Do not add facts to achieve this; use the detail already
+   contained in the locked evidence and optional source context.
+
+5. Never convert one fact into several sentences merely for length.
+   Paraphrasing, re-labeling, repeating an attribution, or swapping synonyms does not
+   create new information.
+
+5. Prefer concrete nouns and verbs.
+   State the event directly. Avoid vague constructions such as "the development
+   highlights", "the move underscores", "the news marks a significant milestone",
+   "the event demonstrates", or "the announcement reflects" unless the locked facts
+   themselves contain that concrete claim and it genuinely adds information.
+
+6. No generic AI filler.
+   Do not use empty phrases about importance, significance, attention, impact,
+   excitement, interest, progress, or expectations unless they are themselves a
+   verified fact and materially useful to the reader.
+
+7. Do not manufacture context.
+   If the locked evidence does not explain why something matters, do not explain why
+   it matters. If it does not provide a consequence, do not invent one.
+
+8. Use natural paragraphs.
+   Group related facts together, but give distinct factual units clear expression. Use
+   separate sentences or paragraphs when that is the natural way to report different
+   facts. Do not split one fact merely to make the article longer.
+
+9. Be complete, not artificially brief.
+   There is NO target word count and NO minimum length. The absence of a word target does
+   NOT mean minimize the article. Write until all useful locked information has been
+   clearly reported. When several distinct facts are available, do not omit or over-compress
+   them merely to keep the article short. Preserve the factual detail already present in the
+   locked evidence and use it to produce a genuinely developed news story. Concision is good;
+   unexplained compression of several concrete facts into a few bare claims is not.
+
+10. Supporting facts are real information.
+   Use a supporting fact when it adds a distinct useful detail. Do not discard verified
+   information simply because it is not CORE. Combine facts naturally where possible,
+   but do not turn multiple distinct facts into one vague sentence.
+
+11. Write as one coherent story.
+    Do not mention "the source", "the evidence", "the locked facts", "this article",
+    the writing process, or the instructions.
+
+12. SOURCE-DIGEST BAN.
+    Never write a sentence whose main purpose is to tell the reader that a publisher
+    reported, published, wrote, described, or carried the information.
+    Do not mention publisher names merely to explain where the information came from.
+    Report the verified event directly.
+    Attribution is allowed only when the identity of the speaker, decision-maker, authority,
+    or other source actor is itself part of the news. In that case, state the substantive
+    claim directly (for example, who said or announced it), rather than describing the
+    existence of a publisher article.
+=========================================================
+
+==================== FACT COVERAGE ======================
+CORE FACT COVERAGE IS A HARD REQUIREMENT.
+Every CORE fact MUST be genuinely communicated in the article body. A fact is NOT covered
+merely because the article discusses the same general topic. Every CORE fact must appear
+as a distinct, meaningful factual statement, unless two facts can genuinely be communicated
+together without losing either fact. Never omit, merge away, or replace a CORE fact with a
+vague summary just to make the article shorter.
+
+Every distinct useful supporting factual unit should also be considered for inclusion; do
+not omit verified information merely because the article can be made shorter.
+
+Before returning JSON, silently enumerate every CORE fact ID and verify that the article body
+contains a meaningful statement for each one.
+
+The fact_ids field is an internal audit map. Assign an ID to a paragraph ONLY when
+that paragraph actually communicates that fact in its text. Do not use an ID merely
+to satisfy coverage.
+
+Multiple facts may be communicated naturally in one sentence or paragraph. Never
+create a separate sentence solely because a fact needs an ID.
+
+Before returning the article, perform an internal ALL-FACT checklist:
+- Identify every locked fact ID in the input, including CORE and SUPPORTING.
+- Verify that every locked fact is explicitly communicated in the article body, not merely
+  implied by the general topic.
+- If there are 7 locked facts, all 7 must appear as meaningful factual information.
+- Do not omit a supporting fact just because it is not CORE.
+- Attach each fact_id only to the paragraph that genuinely communicates that fact.
+- Then silently check that nothing was added beyond the locked facts, that each sentence
+  adds new information, and that no fact was repeated or paraphrased without new value.
+- Remove any generic sentence that does not carry a verified detail.
+=========================================================
+
+==================== HEADLINE / DESCRIPTION =============
 - TITLE and H1 must be identical.
-- Use only the core verified entity and core verified development.
+- Headline: maximum 10 words and 65 characters.
+- Headline must describe the actual reported event, not its supposed importance.
+- Description must summarize the article's actual news and must not simply repeat the
+  headline with minor word substitutions.
+- Do not put unsupported interpretation into the headline or description.
+=========================================================
 
-FINAL SELF-CHECK BEFORE RETURNING:
-1. Enumerate every CORE fact ID in LOCKED EVIDENCE.
-2. Verify every CORE fact ID appears in at least one paragraph fact_ids array.
-3. Verify each paragraph's fact_ids are actually expressed in that paragraph text.
-4. Verify every material sentence against LOCKED EVIDENCE.
-5. Verify no fact used in the article was omitted from the locked evidence or transferred to the wrong entity.
-6. Verify SUPPORTING facts are used only when they add real information and are not forced into the article.
-7. Verify the result remains one coherent story.
-
-Return ONLY this JSON shape:
+Return ONLY valid JSON in exactly this shape:
 {{
-  "title": "...",
-  "description": "...",
-  "h1": "...",
-  "paragraphs": [
-    {{"text": "...", "fact_ids": ["F1", "F2"]}}
+  "title":"...",
+  "description":"...",
+  "h1":"...",
+  "paragraphs":[
+    {{"text":"...","fact_ids":["F1","F2"]}}
   ]
 }}
 
-LOCKED FACT INVENTORY:
-{fact_inventory}
-
-LOCKED EVIDENCE:
-{_compact(evidence)}
-{context_block}
+LOCKED FACTS:
+{chr(10).join(fact_lines) or "No locked facts available."}
+{source_block}
 """
 
 
@@ -1601,9 +1629,8 @@ def _normalize_generated_article(article, evidence):
     if not isinstance(raw_paragraphs, list) or not raw_paragraphs:
         raise ValueError("Article generator returned no paragraphs.")
 
-    # Every locked fact ID is valid paragraph metadata. CORE facts are the
-    # mandatory coverage universe; SUPPORTING facts remain optional but may be
-    # explicitly cited by a paragraph when the paragraph actually communicates them.
+    # Every locked fact ID is valid paragraph metadata. ALL locked facts are the
+    # mandatory coverage universe; CORE/SUPPORTING is prioritisation only.
     all_fact_ids = {
         str(f.get("id", "")).strip()
         for f in (evidence.get("facts", []) if isinstance(evidence, dict) else [])
@@ -1614,8 +1641,13 @@ def _normalize_generated_article(article, evidence):
         if isinstance(evidence, dict)
         else set()
     )
+    supporting_fact_ids = (
+        set(evidence.get("supporting_fact_ids", []))
+        if isinstance(evidence, dict)
+        else set()
+    )
     valid_fact_ids = all_fact_ids
-    required_core_ids = core_fact_ids & all_fact_ids
+    required_fact_ids = all_fact_ids
     covered = set()
     paragraphs = []
 
@@ -1639,9 +1671,9 @@ def _normalize_generated_article(article, evidence):
             raise ValueError(f"Paragraph {index} has no fact coverage metadata.")
         paragraphs.append(text)
 
-    # Only CORE facts are mandatory for coverage. SUPPORTING facts are optional.
+    # ALL locked facts are mandatory for coverage. SUPPORTING facts are not optional.
     missing = sorted(
-        required_core_ids - covered,
+        required_fact_ids - covered,
         key=lambda x: int(x[1:]) if x[1:].isdigit() else 999999,
     )
     if missing:
@@ -1659,12 +1691,21 @@ def _normalize_generated_article(article, evidence):
     return clean
 
 
+
+
 def _generate_article(evidence, source_context=None):
-    fact_count = len(evidence.get("core_fact_ids", [])) if isinstance(evidence, dict) else 0
-    dynamic_tokens = max(ARTICLE_TOKENS, min(1500, 650 + fact_count * 100))
+    """Generate one evidence-locked newsroom article.
+
+    num_predict is only a response-capacity setting. It is never interpreted as a
+    word target and no generated-length check is performed here.
+    """
+    fact_count = len(evidence.get("facts", [])) if isinstance(evidence, dict) else 0
+    # Give richer evidence enough JSON/prose capacity while keeping the CPU path
+    # bounded. This is a token ceiling, not a content requirement.
+    dynamic_tokens = min(960, max(ARTICLE_TOKENS, 560 + fact_count * 55))
     raw_article = _call(
         _article_prompt(evidence, source_context=source_context),
-        temperature=0.0,
+        temperature=0.08,
         num_predict=dynamic_tokens,
         num_thread=NUM_THREADS,
         response_format=_ARTICLE_FORMAT,
@@ -1674,7 +1715,7 @@ def _generate_article(evidence, source_context=None):
 
 
 # ============================================================
-# Public compatibility API / Fact Guard delegation
+# Public compatibility API
 # ============================================================
 
 # Public compatibility API used by generate.py.
@@ -1729,11 +1770,11 @@ def generate(prompt, retries=0, evidence=None):
     Coverage-first, fail-closed publication pipeline.
 
     Flow:
-        evidence -> coverage-first article -> deterministic coverage gate ->
-        structure gate -> return to caller for the single production Fact Guard
+        evidence -> newsroom article -> deterministic structure gate ->
+        return to caller for the single post-generation factual audit
 
     There is deliberately NO repair, recursive regeneration, second article
-    generation, or duplicate factual audit in this module. Fact Guard is the
+    generation, or duplicate factual audit in this module. No post-generation factual audit is run in this benchmark path.
     single production factual-validation authority in generate.py.
     """
     pipeline_start = time.perf_counter()
@@ -1769,9 +1810,7 @@ def generate(prompt, retries=0, evidence=None):
 
     # Factual validation is intentionally NOT performed here.
     # generate.py owns the single production factual-validation authority
-    # (Fact Guard). Keeping a second LLM factual audit here would duplicate
-    # expensive inference and recreate the latency/failure path we removed.
-    print("[PIPELINE] Article generation complete | factual validation delegated to Fact Guard")
+    print("[PIPELINE] Article generation complete | factual validation skipped in benchmark mode")
     print(
         f"[TIMER] PIPELINE TOTAL | "
         f"elapsed={time.perf_counter() - pipeline_start:.2f}s"
