@@ -87,22 +87,27 @@ def _article_text(article):
 
 
 def validate_language_integrity(article):
-    """Fail closed on obvious language/script leakage or prompt/instruction output."""
+    """Fail closed on obvious script leakage, instruction leakage, or clear wrong-language output."""
     text = _article_text(article)
     if not text:
         raise ValueError("Language integrity check failed: empty article text.")
 
-    # Current TrendCurrent production languages are Latin-script except Bulgarian.
-    # Detecting foreign scripts is deterministic and directly catches the Ceuta-type
-    # Chinese leakage without asking another model to judge its own output.
     language = str(LANGUAGE or "").strip().casefold()
     cyrillic_allowed = language in {"bulgarian", "bg", "български"}
-    latin_languages = {
-        "english", "en", "german", "de", "deutsch", "french", "fr", "français",
-        "italian", "it", "italiano", "spanish", "es", "español",
-        "indonesian", "id", "bahasa indonesia",
+    language_aliases = {
+        "english": "en", "en": "en", "en-us": "en", "en-gb": "en",
+        "german": "de", "de": "de", "deutsch": "de",
+        "french": "fr", "fr": "fr", "français": "fr",
+        "italian": "it", "it": "it", "italiano": "it",
+        "spanish": "es", "es": "es", "español": "es",
+        "indonesian": "id", "id": "id", "bahasa indonesia": "id",
+        "bulgarian": "bg", "bg": "bg", "български": "bg",
     }
+    target_lang = language_aliases.get(language, language)
 
+    latin_languages = {"en", "de", "fr", "it", "es", "id"}
+
+    # Deterministic script leakage detection remains unchanged in purpose.
     forbidden_scripts = []
     for ch in text:
         if not ch.isalpha():
@@ -118,10 +123,9 @@ def validate_language_integrity(article):
             forbidden_scripts.append("Devanagari")
         elif "THAI" in name:
             forbidden_scripts.append("Thai")
-        elif "CYRILLIC" in name and language in latin_languages:
+        elif "CYRILLIC" in name and target_lang in latin_languages:
             forbidden_scripts.append("Cyrillic")
 
-    # Obvious generator/instruction leakage is never valid article prose.
     lower = text.casefold()
     leakage_markers = (
         "return only the required json",
@@ -140,14 +144,99 @@ def validate_language_integrity(article):
     if matched:
         raise ValueError("Language integrity check failed: generator/instruction leakage detected.")
 
-    # For known non-Bulgarian production languages, a tiny Latin share is expected
-    # for names/official terms, so this gate intentionally does not require a
-    # particular percentage of Latin letters. It only blocks clearly foreign scripts.
-    if not cyrillic_allowed and language not in latin_languages:
-        # Unknown future language: keep the deterministic leakage markers above,
-        # but do not guess its valid writing system.
-        return True
+    if target_lang in latin_languages:
+        # The previous guard only checked Unicode script. That cannot distinguish
+        # English from Italian/German/French/Spanish/Indonesian because all use Latin.
+        # This is a deterministic target-language check: common function/content
+        # words and language-specific morphology are scored against the full article.
+        #
+        # Proper names, publisher names and internationally used terms are not enough
+        # to fail the article. We reject only a clear competing-language signal.
+        tokens = re.findall(r"[a-zà-ÿ]+", unicodedata.normalize("NFKC", text).casefold())
+        if len(tokens) >= 18:
+            signatures = {
+                "en": {
+                    "the","and","of","to","in","for","on","with","from","that","this",
+                    "was","were","has","have","had","are","is","as","by","at","after",
+                    "before","will","said","about","into","over","their","they","which",
+                    "also","more","than","its","who","what","when","how","new","news",
+                },
+                "de": {
+                    "der","die","das","und","von","zu","den","dem","des","ein","eine",
+                    "einer","einem","einen","ist","sind","war","wurde","wurden","mit",
+                    "auf","für","im","in","aus","nach","über","auch","nicht","sich",
+                    "als","bei","hat","haben","wie","dass","durch","werden","wird",
+                },
+                "fr": {
+                    "le","la","les","des","du","de","un","une","et","en","dans","pour",
+                    "sur","avec","par","est","sont","était","ont","a","au","aux","ce",
+                    "cette","ces","qui","que","pas","plus","mais","comme","après",
+                    "avant","leur","leurs","dans","entre","vers","selon",
+                },
+                "it": {
+                    "il","lo","la","i","gli","le","di","del","della","dei","degli",
+                    "delle","un","uno","una","e","che","in","con","per","su","da",
+                    "al","alla","agli","alle","è","sono","era","sono","ha","hanno",
+                    "non","anche","come","dopo","prima","nel","nella","nelle","degli",
+                    "questa","questo","quello","secondo",
+                },
+                "es": {
+                    "el","la","los","las","del","de","un","una","unos","unas","y",
+                    "que","en","con","por","para","sobre","desde","entre","al","es",
+                    "son","era","fue","han","ha","no","también","como","más","menos",
+                    "después","antes","esta","este","estos","estas","según",
+                },
+                "id": {
+                    "yang","dan","di","ke","dari","untuk","dengan","pada","dalam",
+                    "ini","itu","akan","telah","adalah","sebagai","oleh","lebih",
+                    "juga","tidak","dapat","bisa","setelah","sebelum","tentang",
+                    "dengan","menjadi","sudah","masih","mereka","para","karena",
+                    "hingga","tersebut","bahwa","atau","serta","terhadap",
+                },
+            }
 
+            # Extra morphology/orthography signals help distinguish closely related
+            # Latin languages when function-word evidence is sparse.
+            morphology = {
+                "en": (r"\b\w+(?:ing|ed|ly)\b",),
+                "de": (r"\b\w+(?:ung|keit|heit|lich|ischen|isch)\b",),
+                "fr": (r"\b\w+(?:ment|tion|ique|eur|euse|aient|ées|és)\b",),
+                "it": (r"\b\w+(?:zione|zioni|mente|ità|ismo|are|ere|ire)\b",),
+                "es": (r"\b\w+(?:ción|ciones|mente|ando|iendo|ado|ido|ación)\b",),
+                "id": (r"\b\w+(?:kan|nya|lah|kah|pun|per|ber|ter|meng|mem|men)\b",),
+            }
+
+            scores = {lang: 0.0 for lang in signatures}
+            token_set = set(tokens)
+            for lang, words in signatures.items():
+                # Function/content words are strong signals. Cap contribution per
+                # repeated word so names or repeated phrasing cannot dominate.
+                hits = sum(1 for word in words if word in token_set)
+                freq_hits = sum(1 for token in tokens if token in words)
+                scores[lang] += hits * 1.0 + min(freq_hits, 10) * 0.35
+
+                for pattern in morphology.get(lang, ()):
+                    scores[lang] += min(len(re.findall(pattern, lower)), 6) * 0.45
+
+            ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+            best_lang, best_score = ranked[0]
+            target_score = scores.get(target_lang, 0.0)
+            second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+
+            # Only fail on a strong and materially separated competing-language
+            # signal. This deliberately favors false negatives over false positives.
+            if (
+                best_lang != target_lang
+                and best_score >= 4.5
+                and best_score >= target_score + 2.5
+                and best_score >= second_score + 0.75
+            ):
+                raise ValueError(
+                    f"Language integrity check failed: target={target_lang} "
+                    f"detected={best_lang} score={best_score:.2f} target_score={target_score:.2f}."
+                )
+
+    # Unknown future languages keep the existing conservative script/leakage behavior.
     return True
 
 # Article length is determined by the amount of usable verified evidence.
@@ -1790,7 +1879,7 @@ def git_push():
 
 
 def main():
-    monitor.start_run(language=LANGUAGE, model=MODEL, pipeline="universal-fact-lock-v2.9.2-ministral-newsroom-no-word-floor", max_articles=MAX_ARTICLES_PER_RUN)
+    monitor.start_run(language=LANGUAGE, model=MODEL, pipeline="universal-fact-lock-v2.9.5-ministral-all-facts-no-word-floor", max_articles=MAX_ARTICLES_PER_RUN)
     processed = load_processed()
 
     # Direct publisher RSS is the permanent discovery root.

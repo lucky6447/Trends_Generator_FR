@@ -2,9 +2,15 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
     <loc>https://trendcurrent.today/</loc>
-    <lastmod>2026-09-08</lastmod>
+    <lastmod>2026-09-09</lastmod>
     <changefreq>hourly</changefreq>
     <priority>1.0</priority>
+  </url>
+  <url>
+    <loc>https://trendcurrent.today/date/2026-09-09/</loc>
+    <lastmod>2026-09-09</lastmod>
+    <changefreq>daily</changefreq>
+    <priority>0.6</priority>
   </url>
   <url>
     <loc>https://trendcurrent.today/date/2026-09-08/</loc>
@@ -53,6 +59,12 @@
     <lastmod>2026-09-01</lastmod>
     <changefreq>daily</changefreq>
     <priority>0.6</priority>
+  </url>
+  <url>
+    <loc>https://trendcurrent.today/trends/video-isra-l-le-discours-d-ed-miliband-sur-les-sanctions-britanniques-westminster</loc>
+    <lastmod>2026-09-09</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
   </url>
   <url>
     <loc>https://trendcurrent.today/trends/allemagne-ulrich-siegmund-la-t-te-de-liste-du-parti-d-extr-me-droite-afd-remporte-les-lections-r-gionales-en-saxe-anhalt</loc>

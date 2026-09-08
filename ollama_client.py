@@ -29,7 +29,7 @@ import generator_monitor as monitor
 #   * preserve multilingual operation
 # ============================================================
 
-PIPELINE_VERSION = "universal-fact-lock-v2.9.3-ministral-all-facts-no-word-floor"
+PIPELINE_VERSION = "universal-fact-lock-v2.9.5-ministral-all-facts-no-word-floor"
 
 # IMPORTANT: Do not force a CPU thread count by default.
 # Ollama can auto-detect the runner's optimal thread count.
@@ -1506,6 +1506,21 @@ proposed, planned, believed, or under investigation, do not rewrite it as confir
    A four-fact evidence set should normally read as a developed short news story, not as three
    compressed bullet-like statements. Do not add facts to achieve this; use the detail already
    contained in the locked evidence and optional source context.
+   4A. COVERAGE DEPTH FOR RICH EVIDENCE.
+   When there are 4 or more distinct locked facts, do not default to a 2-3 sentence summary.
+   As a practical newsroom heuristic, a 4-fact story will usually need about 3-4 substantive
+   sentences, and a 5-6 fact story will usually need about 4-6 substantive sentences, unless
+   two facts genuinely belong together and can be communicated completely in one sentence.
+   This is NOT a word-count target, NOT a minimum word floor, and NOT a requirement to force
+   one sentence per fact. It is a safeguard against losing concrete information through
+   over-compression.
+
+   If several facts contain useful details such as different actions, people, locations, dates,
+   numbers, decisions, responses, or status changes, preserve those details in the prose.
+   Do not replace several concrete facts with one broad sentence that merely summarizes them.
+   Before returning the article, ask silently: "If I removed this sentence, would a distinct
+   locked fact or a materially useful detail disappear?" If yes, keep it. If no, remove it.
+
 
 5. Never convert one fact into several sentences merely for length.
    Paraphrasing, re-labeling, repeating an attribution, or swapping synonyms does not
@@ -1539,6 +1554,12 @@ proposed, planned, believed, or under investigation, do not rewrite it as confir
    locked evidence and use it to produce a genuinely developed news story. Concision is good;
    unexplained compression of several concrete facts into a few bare claims is not.
 
+   9A. DO NOT SAVE WORDS BY DELETING FACTUAL DETAIL.
+   Shorter is not automatically better. If the locked evidence contains a concrete detail that
+   materially improves the reader's understanding of the story, include it even when the main
+   event could technically be stated in fewer words. Do not use generic framing, source mentions,
+   or repeated attribution as substitutes for that detail.
+
 10. Supporting facts are real information.
    Use a supporting fact when it adds a distinct useful detail. Do not discard verified
    information simply because it is not CORE. Combine facts naturally where possible,
@@ -1548,15 +1569,29 @@ proposed, planned, believed, or under investigation, do not rewrite it as confir
     Do not mention "the source", "the evidence", "the locked facts", "this article",
     the writing process, or the instructions.
 
-12. SOURCE-DIGEST BAN.
-    Never write a sentence whose main purpose is to tell the reader that a publisher
-    reported, published, wrote, described, or carried the information.
-    Do not mention publisher names merely to explain where the information came from.
-    Report the verified event directly.
+12. SOURCE-DIGEST BAN — HARD WRITING RULE.
+    Never write a sentence whose purpose is to tell the reader where the information came from.
+    Never mention a publisher, news outlet, website, article, report, or publication merely as
+    provenance. Report the verified event directly.
+
+    NEVER write source-digest or source-listing sentences such as:
+    - "The news was first reported by X."
+    - "X first reported the development."
+    - "The report was published by X."
+    - "X also confirmed the story."
+    - "X reported the development in an article titled ..."
+    - "X and Y reported independently."
+    - "The report appeared on X."
+    These sentences are NOT news content and must not appear anywhere in the article.
+
+    NEVER end the article with a source-listing, publisher attribution, or provenance sentence.
+    The final paragraph must contain actual verified news information, not information about
+    who reported it.
+
     Attribution is allowed only when the identity of the speaker, decision-maker, authority,
-    or other source actor is itself part of the news. In that case, state the substantive
-    claim directly (for example, who said or announced it), rather than describing the
-    existence of a publisher article.
+    or other source actor is itself part of the news. In that case, state the substantive claim
+    directly (for example, who said or announced it), rather than describing the existence of
+    a publisher article.
 =========================================================
 
 ==================== FACT COVERAGE ======================
