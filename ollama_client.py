@@ -29,7 +29,7 @@ import generator_monitor as monitor
 #   * preserve multilingual operation
 # ============================================================
 
-PIPELINE_VERSION = "universal-fact-lock-v2.9.5-ministral-all-facts-no-word-floor"
+PIPELINE_VERSION = "universal-fact-lock-v2.9.6-ministral-compact-evidence-no-word-floor"
 
 # IMPORTANT: Do not force a CPU thread count by default.
 # Ollama can auto-detect the runner's optimal thread count.
@@ -63,7 +63,7 @@ EVIDENCE_TOKENS = max(
     520, int(os.getenv("OLLAMA_EVIDENCE_TOKENS", "560"))
 )
 EVIDENCE_MAX_FACTS = max(
-    4, min(12, int(os.getenv("OLLAMA_EVIDENCE_MAX_FACTS", "12")))
+    4, min(8, int(os.getenv("OLLAMA_EVIDENCE_MAX_FACTS", "8")))
 )
 
 # Only a small factual spine is mandatory for article coverage. The remaining
@@ -100,9 +100,12 @@ EVIDENCE_EXPANSION = os.getenv(
 ).lower() not in {"0", "false", "no", "off"}
 
 # One retry is allowed only for malformed/truncated evidence JSON.
-# The retry uses a smaller output contract, not another huge prompt.
+# The retry uses a smaller output contract and a bounded output ceiling.
 EVIDENCE_RETRY_TOKENS = max(
-    EVIDENCE_TOKENS, int(os.getenv("OLLAMA_EVIDENCE_RETRY_TOKENS", "360"))
+    256, min(
+        EVIDENCE_TOKENS,
+        int(os.getenv("OLLAMA_EVIDENCE_RETRY_TOKENS", "360")),
+    )
 )
 
 print(f"[TrendCurrent PIPELINE] {PIPELINE_VERSION}")
@@ -307,12 +310,16 @@ def _split_source(source):
     if not text:
         return [""]
 
-    # The normal chunk size remains unchanged. A single larger chunk is allowed
-    # only for payloads that stay below a conservative 18k-character ceiling.
+    # Keep a single inference for moderately sized sources, but do not let the
+    # character shortcut outrun the configured model context.  The evidence
+    # prompt adds the indexed source plus a potentially long VALID ID list, so
+    # the safe single-chunk ceiling is deliberately below the raw context size.
     # This is a performance optimization, not a content reduction.
-    # Never split a source that safely fits in one inference context.
     # ARTICLE markers are provenance metadata and must not multiply CPU calls.
-    if len(text) <= 18000:
+    # For the default 4096-token context, 12000 characters is a conservative
+    # ceiling that preserves the production optimization seen with ~9k sources.
+    single_chunk_chars = min(12000, EVIDENCE_CHUNK_CHARS)
+    if len(text) <= single_chunk_chars:
         return [text]
 
     effective_chunk_chars = EVIDENCE_CHUNK_CHARS
@@ -497,15 +504,15 @@ def _evidence_prompt(source, max_facts=None):
     return f"""
 Extract factual evidence for ONE concrete story from the SOURCE.
 
+Return ONLY compact JSON:
+{{"facts":[{{"f":"supported fact","x":"A1-S1"}}]}}
+
 Rules:
-- Read the entire source.
-- Return as many genuinely distinct, directly supported facts as the source provides, up to {limit}.
-- For a source with enough concrete detail, aim for 5-8 distinct facts rather than stopping after 2-3.
-- Never pad, invent, infer, or manufacture facts just to reach a count.
-- Do not stop early merely because the main event is already identified.
-- Prefer concrete developments, actions, decisions, entities, dates, numbers,
-  locations, status, official responses, investigation/development details and other
-  materially useful details that are explicitly stated in the source.
+- Read the entire source and stay within ONE coherent event/story.
+- Return distinct, directly supported facts, up to {limit}; never pad or stop early without checking the source.
+- Prefer concrete developments, actions, decisions, entities, dates, numbers, locations, status and other materially useful details explicitly stated in the source.
+- Each fact must be ONE concise factual claim; preferably no more than 20-30 words.
+- Do not repeat the same fact in different wording.
 - No outside knowledge, inference, motives, causes, significance or predictions.
 - Preserve names, dates, numbers and certainty exactly.
 - Each fact must be supported by one source sentence.
@@ -513,8 +520,6 @@ Rules:
 - Never invent or alter IDs.
 - A score does not establish a winner unless the sentence explicitly says so.
 - Return ONLY JSON.
-
-{{"facts":[{{"f":"supported fact","x":"A1-S1"}}]}}
 
 SOURCE:
 {indexed_source}
@@ -1844,8 +1849,8 @@ def generate(prompt, retries=0, evidence=None):
     )
 
     # Factual validation is intentionally NOT performed here.
-    # generate.py owns the single production factual-validation authority
-    print("[PIPELINE] Article generation complete | factual validation skipped in benchmark mode")
+    # generate.py owns the single production factual-validation authority.
+    print("[PIPELINE] Article generation complete | factual validation delegated to generate.py")
     print(
         f"[TIMER] PIPELINE TOTAL | "
         f"elapsed={time.perf_counter() - pipeline_start:.2f}s"
