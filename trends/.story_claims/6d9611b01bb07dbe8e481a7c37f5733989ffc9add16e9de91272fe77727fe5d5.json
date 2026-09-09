@@ -1,0 +1,101 @@
+{
+  "topic_title": "Vidéo de policiers municipaux tenant des propos racistes et misogynes à Carcassonne : le maire de Carcassonne s’exprime",
+  "evidence_lock": {
+    "primary_group": "C1-G1",
+    "facts": [
+      {
+        "id": "F1",
+        "group": "C1-G1",
+        "fact": "Un policier municipal de Carcassonne, membre bénévole du service d’ordre du RN, a été exclu du parti le **9 septembre 2026** pour propos racistes, sexistes et complotistes.",
+        "excerpt": "Le policier municipal de Carcassonne, membre bénévole du service d’ordre de Jordan Bardella et qui a tenu des propos racistes, sexistes et complotistes, objet d’une enquête, a été exclu mercredi 9 septembre 2026 du Rassemblement national, le parti d’extrême droite condamnant ces propos \"avec la plus grande fermeté\".",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core",
+        "lineage_members": [
+          "F1",
+          "F2",
+          "F3",
+          "F8"
+        ]
+      },
+      {
+        "id": "F4",
+        "group": "C1-G1",
+        "fact": "Les propos ont été filmés **sans son consentement** lors d’une patrouille nocturne en **novembre 2025** via une caméra piéton active.",
+        "excerpt": "Les faits remontent au mois de novembre 2025, lors d’une patrouille nocturne, quatre policiers municipaux de Carcassonne dans l’Aude se filment sans le savoir avec la caméra piéton restée active de l’uniforme d’un des leurs, le chef d’équipe, un ancien parachutiste de 50 ans lié avec le service d’ordre du Rassemblement national comme avec le nouveau maire RN de la ville, Christophe Barthès.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core",
+        "lineage_members": [
+          "F4",
+          "F5"
+        ]
+      },
+      {
+        "id": "F6",
+        "group": "C1-G1",
+        "fact": "Le policier concerné, chef d’équipe de 50 ans et ancien parachutiste, a déposé plainte pour **« atteinte à la vie privée »** après les révélations.",
+        "excerpt": "Même le principal intéressé dans l’histoire en a pris un (il a repris le travail depuis mars 2026, NDLR), avant de déposer plainte pour \"atteinte à la vie privée\".",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "supporting",
+        "lineage_members": [
+          "F6"
+        ]
+      },
+      {
+        "id": "F7",
+        "group": "C1-G1",
+        "fact": "Il avait assuré la sécurité de **Jordan Bardella** lors d’une visite à Carcassonne le **7 février 2025** pour la campagne municipale.",
+        "excerpt": "Il avait assuré la sécurité de Jordan Bardella lors d’une visite à Carcassonne Il avait d’ailleurs assuré la sécurité lors de la venue de Jordan Bardella à la Cité de Carcassonne le 7 février 2025 à l’occasion de la campagne des municipales où le président du RN était venu soutenir Christophe Barthès.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "supporting",
+        "lineage_members": [
+          "F7"
+        ]
+      }
+    ],
+    "core_fact_ids": [
+      "F1",
+      "F4"
+    ],
+    "supporting_fact_ids": [
+      "F4",
+      "F6",
+      "F7",
+      "F1"
+    ],
+    "fact_lineage": {
+      "raw_facts": 8,
+      "unique_information_units": 4,
+      "merged_facts": 0,
+      "merge_pairs": [],
+      "candidate_pairs": 2,
+      "semantic_duplicate_clusters": [
+        [
+          "F1",
+          "F2",
+          "F3",
+          "F8"
+        ],
+        [
+          "F4",
+          "F5"
+        ]
+      ],
+      "semantic_duplicate_fact_ids": [
+        "F2",
+        "F3",
+        "F8",
+        "F5"
+      ]
+    }
+  },
+  "created_at": 1788974955.0536735,
+  "pid": 16024
+}
