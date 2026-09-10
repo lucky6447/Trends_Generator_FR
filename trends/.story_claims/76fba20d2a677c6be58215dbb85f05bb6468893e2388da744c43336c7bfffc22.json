@@ -1,0 +1,108 @@
+{
+  "topic_title": "RD Congo : verdict reporté dans le procès de l'ex ministre Constant Mutamba",
+  "evidence_lock": {
+    "primary_group": "C1-G1",
+    "facts": [
+      {
+        "id": "F1",
+        "group": "C1-G1",
+        "fact": "The verdict in the trial of Constant Mutamba, former Justice Minister of the DRC, was postponed.",
+        "excerpt": "🇨🇩 En RDC, le verdict du procès de Constant Mutamba est reporté.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core",
+        "lineage_members": [
+          "F1"
+        ]
+      },
+      {
+        "id": "F2",
+        "group": "C1-G1",
+        "fact": "Mutamba is accused of embezzling funds meant to compensate victims of a violent episode during the Second Congo War.",
+        "excerpt": "L’ancien ministre de la Justice est accusé d’avoir détourné des fonds destinés à indemniser les victimes d’un épisode sanglant de la deuxième guerre du Congo.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core",
+        "lineage_members": [
+          "F2"
+        ]
+      },
+      {
+        "id": "F3",
+        "group": "C1-G1",
+        "fact": "The alleged misconduct occurred at the beginning of the 2000s.",
+        "excerpt": "Des faits remontant au début des années 2000.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core",
+        "lineage_members": [
+          "F3"
+        ]
+      },
+      {
+        "id": "F4",
+        "group": "C1-G1",
+        "fact": "The postponement was reported on **10/09/2026** in the DRC.",
+        "excerpt": "RD Congo : verdict reporté dans le procès de l'ex ministre Constant Mutamba Afrique Publié le : 10/09/2026 - 20:38 Partager 🇨🇩 En RDC, le verdict du procès de Constant Mutamba est reporté.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core",
+        "lineage_members": [
+          "F4"
+        ]
+      },
+      {
+        "id": "F5",
+        "group": "C1-G1",
+        "fact": "The case involves funds intended for victims of a violent event during the Second Congo War.",
+        "excerpt": "L’ancien ministre de la Justice est accusé d’avoir détourné des fonds destinés à indemniser les victimes d’un épisode sanglant de la deuxième guerre du Congo.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "supporting",
+        "lineage_members": [
+          "F5"
+        ]
+      },
+      {
+        "id": "F6",
+        "group": "C1-G1",
+        "fact": "The events date back to the early 2000s.",
+        "excerpt": "Des faits remontant au début des années 2000.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "supporting",
+        "lineage_members": [
+          "F6"
+        ]
+      }
+    ],
+    "core_fact_ids": [
+      "F1",
+      "F2",
+      "F3",
+      "F4"
+    ],
+    "supporting_fact_ids": [
+      "F5",
+      "F6"
+    ],
+    "fact_lineage": {
+      "raw_facts": 6,
+      "unique_information_units": 6,
+      "merged_facts": 0,
+      "merge_pairs": [],
+      "candidate_pairs": 1,
+      "semantic_duplicate_clusters": [],
+      "semantic_duplicate_fact_ids": [],
+      "dedup_mode": "deterministic_lexical_fast_path"
+    }
+  },
+  "created_at": 1789072502.5575333,
+  "pid": 13684
+}

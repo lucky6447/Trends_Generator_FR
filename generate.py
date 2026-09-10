@@ -2317,7 +2317,7 @@ def _fc_numeric_tokens(value):
 def _measure_fact_expression(article, generation_evidence):
     """Measure how many locked evidence facts are explicitly expressed in the article.
 
-    Monitoring only: failures never block, repair, or regenerate an article.
+    Measurement layer: the caller applies the mandatory core-fact publication guard.
     """
     facts = generation_evidence.get("facts", []) if isinstance(generation_evidence, dict) else []
     facts = [
@@ -2480,24 +2480,42 @@ def generate_valid_article(prompt, reference_date, trend, prelocked_evidence=Non
         if isinstance(locked_facts, list) and len(locked_facts) >= 1:
             print(f"[EVIDENCE COVERAGE] locked_facts={len(locked_facts)} | core_facts={len(core_fact_ids)} | supporting_facts={len(supporting_fact_ids)} | article_words={len(paragraph_text.split())}")
         fact_expression = _measure_fact_expression(article, generation_evidence)
-        # Every fact that survives semantic deduplication is locked evidence and
-        # must be explicitly expressed in the published narrative. This is not a
-        # word floor: the article may still be as short as the evidence naturally
-        # permits, but it may not silently discard usable locked facts.
+        # Core evidence facts are mandatory for publication. Supporting facts are
+        # measured for observability but are not individually mandatory. This is
+        # deliberately not a word floor: article length remains evidence-driven.
         if fact_expression.get("status") == "PASS":
-            coverage = fact_expression.get("coverage")
-            if coverage is not None and coverage < 1.0:
+            core_facts = int(fact_expression.get("core_facts") or 0)
+            core_coverage = fact_expression.get("core_coverage")
+            supporting_coverage = fact_expression.get("supporting_coverage")
+            locked_facts = int(fact_expression.get("locked_facts") or 0)
+
+            # Fail closed if locked evidence exists but core classification is absent.
+            # This prevents incomplete/legacy evidence from bypassing the factuality guard.
+            if locked_facts > 0 and core_facts == 0:
                 print(
-                    f"[FACT CONSISTENCY GUARD] FAIL | "
-                    f"coverage={coverage:.3f} | "
-                    f"expressed_facts={fact_expression.get('expressed_facts')} | "
-                    f"locked_facts={fact_expression.get('locked_facts')}"
+                    "[FACT CONSISTENCY GUARD] FAIL | "
+                    "core_fact_ids unavailable for locked evidence"
                 )
-                raise Exception("Article omitted one or more locked evidence facts.")
+                raise Exception(
+                    "Core evidence classification unavailable; publication blocked."
+                )
+
+            # Every core fact must be explicitly expressed. Supporting facts remain
+            # diagnostic only and therefore cannot cause publication rejection.
+            if core_coverage is None or core_coverage < 1.0:
+                print(
+                    "[FACT CONSISTENCY GUARD] FAIL | "
+                    f"core_coverage={core_coverage!r} | "
+                    f"expressed_core_facts={fact_expression.get('expressed_core_facts')} | "
+                    f"core_facts={core_facts} | "
+                    f"supporting_coverage={supporting_coverage!r}"
+                )
+                raise Exception("Article omitted one or more core evidence facts.")
+
             print(
-                f"[FACT CONSISTENCY GUARD] PASS | "
-                f"coverage={coverage:.3f}" if coverage is not None
-                else "[FACT CONSISTENCY GUARD] PASS | no locked facts"
+                "[FACT CONSISTENCY GUARD] PASS | "
+                f"core_coverage={core_coverage:.3f} | "
+                f"supporting_coverage={supporting_coverage!r}"
             )
         else:
             print("[FACT CONSISTENCY GUARD] UNAVAILABLE — publication blocked")

@@ -1,10 +1,10 @@
-from pathlib import Path
+﻿from pathlib import Path
 
 ROOT = Path(__file__).parent
 
 # ===== Fixed language identity (do not inherit process environment) =====
 LANGUAGE = 'fr'
-LANGUAGE_NAME = 'Français'
+LANGUAGE_NAME = 'FranГ§ais'
 COUNTRY = 'France'
 
 # ===== Permanent discovery mode =====
@@ -25,3 +25,10 @@ PROCESSED_FILE = ROOT / "processed.json"
 CHECK_INTERVAL = 600
 MAX_ARTICLES_PER_RUN = 1
 ARTICLES_PER_PAGE = 18
+
+RUN_TIME_BUDGET_SECONDS = 50 * 60
+
+
+
+MAX_CONCRETE_STORY_CANDIDATES_PER_RUN = 8
+
