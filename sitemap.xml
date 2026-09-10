@@ -2,9 +2,15 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
     <loc>https://trendcurrent.today/</loc>
-    <lastmod>2026-09-09</lastmod>
+    <lastmod>2026-09-10</lastmod>
     <changefreq>hourly</changefreq>
     <priority>1.0</priority>
+  </url>
+  <url>
+    <loc>https://trendcurrent.today/date/2026-09-10/</loc>
+    <lastmod>2026-09-10</lastmod>
+    <changefreq>daily</changefreq>
+    <priority>0.6</priority>
   </url>
   <url>
     <loc>https://trendcurrent.today/date/2026-09-09/</loc>
@@ -59,6 +65,12 @@
     <lastmod>2026-09-01</lastmod>
     <changefreq>daily</changefreq>
     <priority>0.6</priority>
+  </url>
+  <url>
+    <loc>https://trendcurrent.today/trends/video-iphone-duo-voici-quoi-ressemble-le-premier-smartphone-pliable-d-apple</loc>
+    <lastmod>2026-09-10</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
   </url>
   <url>
     <loc>https://trendcurrent.today/trends/vid-o-de-policiers-municipaux-tenant-des-propos-racistes-et-misogynes-carcassonne-le-maire-de-carcassonne-s-exprime</loc>

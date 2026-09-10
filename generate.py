@@ -14,6 +14,9 @@ import difflib
 import hashlib
 import subprocess
 import time
+import html as _html
+from html.parser import HTMLParser
+from urllib.request import Request, urlopen
 from datetime import date
 
 from config import MAX_ARTICLES_PER_RUN, LANGUAGE, SOURCE_FIRST, TREND_DIR
@@ -22,6 +25,7 @@ from rss_source_discovery import fetch_source_stories
 from news import fetch_news, fetch_news_discovery, hydrate_story_sources, hydrate_news_items
 from prompt import build_prompt
 from ollama_client import generate, extract_evidence, validate_article_structure, substantive_story_value_gate
+from story_coherence import filter_evidence as filter_story_coherence
 from ollama import chat
 from config import MODEL
 
@@ -243,16 +247,9 @@ def validate_language_integrity(article):
     return True
 
 # Article length is determined by the amount of usable verified evidence.
-# There is no artificial word-count target or word-count retry.
-# Evidence sufficiency is a hard pre-generation eligibility gate.
-# Count only provenance-verified, deduplicated information units; syndicated
-# duplicates must not inflate the minimum. Candidates with fewer than 3
-# genuinely distinct usable facts are rejected before substantive-value judging
-# and before the expensive article-generation pipeline.
-EVIDENCE_MIN_FACTS_FOR_GENERATION = max(
-    3,
-    int(os.getenv("EVIDENCE_MIN_FACTS_FOR_GENERATION", "3")),
-)
+# There is no artificial word-count target, word-count retry, or minimum
+# evidence-fact gate before substantive story-value judging. Small but concrete
+# stories are allowed to reach the unchanged substantive-value gate.
 
 SKIP_PATTERNS = [
     " vs ",
@@ -380,10 +377,19 @@ def _normalize_existing_story_title(text):
 
 
 _EXISTING_STORY_STOPWORDS = {
+    # English
     "the", "a", "an", "and", "or", "but", "amid", "after", "before", "during",
     "with", "without", "from", "into", "over", "under", "for", "of", "to", "in",
     "on", "at", "as", "by", "is", "are", "was", "were", "has", "have", "had",
     "new", "latest", "news", "report", "reports", "update", "updates",
+    # French -- essential for FR cross-run story identity.
+    "le", "la", "les", "un", "une", "des", "du", "de", "d", "au", "aux",
+    "et", "ou", "mais", "avec", "sans", "pour", "par", "dans", "sur", "sous",
+    "entre", "vers", "chez", "apres", "avant", "pendant", "selon", "est", "sont",
+    "a", "ont", "avait", "avaient", "etre", "ete", "ce", "cet", "cette", "ces",
+    "qui", "que", "quoi", "dont", "plus", "moins", "tres", "comme", "aussi",
+    "nouveau", "nouvelle", "nouvelles", "actualite", "actualites", "rapport", "rapports",
+    "mise", "jour",
 }
 
 
@@ -428,9 +434,14 @@ def _existing_story_title_match(candidate_title, existing_title):
     if len(common) >= 4 and min_coverage >= 0.50:
         return True, sequence_ratio, len(common), min_coverage
 
-    # Three shared tokens can still be enough when the headlines are clearly
-    # paraphrases rather than merely sharing a broad topic.
+    # Three shared concrete tokens can be enough for a clear paraphrase.
     if len(common) >= 3 and sequence_ratio >= 0.68 and min_coverage >= 0.50:
+        return True, sequence_ratio, len(common), min_coverage
+
+    # French headlines are often compact paraphrases where sequence similarity
+    # drops after removing articles/prepositions. If the two titles still share
+    # most of their concrete vocabulary, treat them as the same story.
+    if len(common) >= 3 and min_coverage >= 0.67 and sequence_ratio >= 0.58:
         return True, sequence_ratio, len(common), min_coverage
 
     return False, sequence_ratio, len(common), min_coverage
@@ -1299,22 +1310,31 @@ def _selected_story_news(news, story_selection):
 
 
 def _is_valid_publisher_image_url(url):
-    """Accept only plausible publisher image URLs; reject media/placeholders/thumbnails."""
+    """Validate a URL already obtained from the canonical publisher-image resolver."""
     value = str(url or "").strip()
     if not value or not re.match(r"^https?://", value, re.I):
         return False
+
     lower = value.casefold()
     blocked = (
         "placeholder", "place-holder", "default-image", "default_image",
         "no-image", "no_image", "spacer.gif", "transparent.gif",
-        "video", ".mp4", ".webm", ".m3u8", ".mp3", ".wav", ".aac",
         "favicon", "/favicon", "sprite", "tracking", "pixel",
         "googlelogo", "googleusercontent", "gstatic.com/images/branding",
     )
     if any(token in lower for token in blocked):
         return False
 
-    # Reject obvious thumbnail-sized variants such as ?w=96 / ?width=120.
+    # Never allow media resources to be rendered as article images.
+    path = lower.split("?", 1)[0].split("#", 1)[0]
+    if path.endswith((
+        ".mp4", ".m4v", ".webm", ".mov", ".m3u8", ".mpd",
+        ".avi", ".mkv", ".flv", ".wmv", ".mp3", ".m4a", ".wav", ".ogg",
+        ".svg",
+    )):
+        return False
+
+    # Reject obvious tiny thumbnail variants such as ?w=96 / ?width=120.
     try:
         query = parse_qs(urlparse(value).query)
         for key in ("w", "width", "h", "height", "size"):
@@ -1325,155 +1345,233 @@ def _is_valid_publisher_image_url(url):
     except Exception:
         pass
 
-    path = lower.split("?", 1)[0].split("#", 1)[0]
-    return bool(re.search(r"\.(?:jpg|jpeg|png|webp|avif)(?:$|/)", path)) or any(
-        token in lower for token in ("/image/", "/images/", "/photo/", "/photos/", "/media/")
-    )
+    # Do not require a file extension: many publisher CDNs expose image URLs
+    # without .jpg/.webp in the path. The canonical news.py resolver has already
+    # established that this URL came from JSON-LD image.url.
+    return True
 
 
-def _extract_jsonld_image_url(html, base_url=""):
-    """Return the best article image from JSON-LD image.url only.
+class _JSONLDImageParser(HTMLParser):
+    """Collect application/ld+json blocks without treating HTML images as evidence."""
+    def __init__(self):
+        super().__init__(convert_charrefs=False)
+        self.blocks = []
+        self._capture = False
+        self._buffer = []
 
-    Article/NewsArticle/BlogPosting/etc. images are preferred. Person,
-    Organization, Brand, ImageObject and Logo nodes are never treated as
-    article images. If JSON-LD has no usable image, fall back to standard
-    publisher social metadata (og:image/twitter:image), then a sufficiently
-    large content <img>.
-    """
-    article_types = {"article", "newsarticle", "blogposting", "techarticle", "report"}
-    excluded_types = {"person", "organization", "brand", "imageobject", "logo", "website"}
-    primary = []
-    generic = []
-
-    def node_types(node):
-        raw = node.get("@type") if isinstance(node, dict) else None
-        values = raw if isinstance(raw, list) else [raw]
-        return {str(v).split("/")[-1].casefold() for v in values if v}
-
-    def add_image_from_node(node, bucket):
-        if not isinstance(node, dict):
+    def handle_starttag(self, tag, attrs):
+        if tag.casefold() != "script":
             return
-        image = node.get("image")
-        image_items = image if isinstance(image, list) else [image]
-        for item in image_items:
-            if not isinstance(item, dict):
-                continue
-            # Deliberately ONLY image.url. Never contentUrl/thumbnailUrl.
-            image_url = item.get("url")
-            if isinstance(image_url, str):
-                absolute = urljoin(base_url, image_url.strip()) if base_url else image_url.strip()
-                if _is_valid_publisher_image_url(absolute):
-                    bucket.append(absolute)
+        attrs_map = {str(k).casefold(): str(v or "") for k, v in attrs}
+        if attrs_map.get("type", "").casefold().split(";")[0].strip() == "application/ld+json":
+            self._capture = True
+            self._buffer = []
 
-    for block in re.findall(
-        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-        html or "", flags=re.I | re.S,
-    ):
-        raw = re.sub(r"^\s*<!--|-->\s*$", "", block.strip()).strip()
-        if not raw:
+    def handle_endtag(self, tag):
+        if tag.casefold() == "script" and self._capture:
+            self.blocks.append("".join(self._buffer))
+            self._capture = False
+            self._buffer = []
+
+    def handle_data(self, data):
+        if self._capture:
+            self._buffer.append(data)
+
+    def handle_entityref(self, name):
+        if self._capture:
+            self._buffer.append(f"&{name};")
+
+    def handle_charref(self, name):
+        if self._capture:
+            self._buffer.append(f"&#{name};")
+
+
+def _jsonld_image_urls(payload):
+    """Yield only values from JSON-LD ``image`` objects that expose ``url``."""
+    found = []
+    seen = set()
+
+    def visit(node):
+        if isinstance(node, dict):
+            image_value = node.get("image")
+            if isinstance(image_value, dict):
+                candidate = str(image_value.get("url") or "").strip()
+                if candidate and candidate not in seen:
+                    seen.add(candidate)
+                    found.append(candidate)
+            elif isinstance(image_value, list):
+                for image_obj in image_value:
+                    if isinstance(image_obj, dict):
+                        candidate = str(image_obj.get("url") or "").strip()
+                        if candidate and candidate not in seen:
+                            seen.add(candidate)
+                            found.append(candidate)
+            for value in node.values():
+                visit(value)
+        elif isinstance(node, list):
+            for value in node:
+                visit(value)
+
+    visit(payload)
+    return found
+
+
+def _extract_jsonld_publisher_image(publisher_url):
+    """Fetch the publisher page and accept only JSON-LD image.url.
+
+    This is a narrow recovery path for publishers whose page is reachable but
+    whose image metadata was not surfaced by news.extract_source_image(). It
+    deliberately does NOT inspect og:image, twitter:image, <img>, CSS, or
+    arbitrary page URLs.
+    """
+    url = str(publisher_url or "").strip()
+    if not url or not re.match(r"^https?://", url, re.I):
+        return ""
+
+    request = Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.8",
+        },
+    )
+    with urlopen(request, timeout=12) as response:
+        raw = response.read(2_500_000)
+        charset = response.headers.get_content_charset() or "utf-8"
+        try:
+            text = raw.decode(charset, errors="replace")
+        except (LookupError, UnicodeDecodeError):
+            text = raw.decode("utf-8", errors="replace")
+
+    parser = _JSONLDImageParser()
+    parser.feed(text)
+    parser.close()
+
+    for block in parser.blocks:
+        block = _html.unescape(block).strip()
+        if not block:
             continue
         try:
-            data = json.loads(raw)
+            payload = json.loads(block)
         except Exception:
+            # Some publishers put more than one JSON object in a JSON-LD block.
+            # Do not guess at non-JSON content; skip the malformed block.
             continue
-
-        stack = [data]
-        while stack:
-            node = stack.pop()
-            if isinstance(node, dict):
-                types = node_types(node)
-                if types & excluded_types:
-                    pass
-                elif types & article_types:
-                    add_image_from_node(node, primary)
-                else:
-                    # WebPage and unknown containers are only generic fallback.
-                    add_image_from_node(node, generic)
-                for key, value in node.items():
-                    if key == "image":
-                        continue
-                    if isinstance(value, (dict, list)):
-                        stack.append(value)
-            elif isinstance(node, list):
-                stack.extend(node)
-
-    seen = set()
-    for url in primary + generic:
-        if url not in seen:
-            seen.add(url)
-            return url
-
-    # Publisher-standard fallback when JSON-LD does not expose an image.url.
-    meta_patterns = (
-        r'<meta[^>]+(?:property|name)=["\']og:image["\'][^>]+content=["\']([^"\']+)',
-        r'<meta[^>]+(?:property|name)=["\']og:image:url["\'][^>]+content=["\']([^"\']+)',
-        r'<meta[^>]+(?:property|name)=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)',
-        r'<meta[^>]+(?:property|name)=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)',
-    )
-    for pattern in meta_patterns:
-        for match in re.finditer(pattern, html or "", flags=re.I):
-            candidate = urljoin(base_url, match.group(1).strip()) if base_url else match.group(1).strip()
+        for candidate in _jsonld_image_urls(payload):
             if _is_valid_publisher_image_url(candidate):
                 return candidate
+    return ""
 
-    # Last fallback: real content <img> with explicit reasonable dimensions.
-    for tag in re.findall(r'<img\b[^>]*>', html or "", flags=re.I):
-        src_match = re.search(r'\b(?:src|data-src|data-lazy-src|data-original)=["\']([^"\']+)', tag, flags=re.I)
-        if not src_match:
-            continue
-        candidate = urljoin(base_url, src_match.group(1).strip()) if base_url else src_match.group(1).strip()
-        if not _is_valid_publisher_image_url(candidate):
-            continue
-        dims = []
-        for attr in ("width", "height"):
-            m = re.search(rf'\b{attr}=["\'](\d+)', tag, flags=re.I)
-            dims.append(int(m.group(1)) if m else None)
-        if dims[0] and dims[1] and (dims[0] < 500 or dims[1] < 250):
-            continue
-        return candidate
 
-    return None
+def _publisher_image_candidate_urls(item, image_data=None):
+    """Return publisher-page URLs, prioritizing resolver-confirmed source URLs."""
+    candidates = []
+    for value in (
+        (image_data or {}).get("source_url", ""),
+        item.get("publisher_url", "") if isinstance(item, dict) else "",
+        item.get("publisher", "") if isinstance(item, dict) else "",
+        item.get("source_url", "") if isinstance(item, dict) else "",
+    ):
+        value = str(value or "").strip()
+        if value and re.match(r"^https?://", value, re.I) and value not in candidates:
+            candidates.append(value)
+    return candidates
 
 
 def _ensure_publisher_images(selected_news):
-    """Second-pass publisher image extraction after article quality gates."""
-    import urllib.request
+    """Finalize publisher images without erasing a verified cross-publisher fallback.
+
+    Canonical policy:
+      - direct publisher JSON-LD image.url is accepted;
+      - if direct fails, news.py may return a verified independent publisher
+        fallback JSON-LD image.url;
+      - once FOUND, that verified image is authoritative for the selected source;
+      - this finalizer must never call the resolver without the story title,
+        because title is required to activate cross-publisher fallback.
+    """
+    from news import extract_source_image
 
     items = list(selected_news or [])
     found = 0
+    allowed_reasons = {
+        "jsonld_image_url",
+        "fallback_jsonld_image_url",
+        "article_img_tag",
+    }
+
     for item in items:
         if not isinstance(item, dict):
             continue
+
         existing = str(item.get("image") or item.get("image_url") or "").strip()
-        if existing and _is_valid_publisher_image_url(existing):
+        existing_status = str(item.get("image_status") or "").strip().upper()
+        existing_reason = str(item.get("image_reason") or "").strip().casefold()
+
+        # IMPORTANT: preserve BOTH direct and verified fallback images.
+        if (
+            existing
+            and _is_valid_publisher_image_url(existing)
+            and existing_status == "FOUND"
+            and existing_reason in allowed_reasons
+        ):
             item["image"] = existing
             found += 1
+            print(
+                f"[SOURCE IMAGE] PRESERVE | image={existing} | "
+                f"reason={existing_reason}"
+            )
             continue
 
         url = str(item.get("url") or item.get("link") or "").strip()
+        title = str(item.get("title") or "").strip()
         if not url:
             continue
+
         try:
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (TrendCurrent publisher image resolver)"},
-            )
-            with urllib.request.urlopen(req, timeout=12) as response:
-                html = response.read(5000000).decode("utf-8", errors="replace")
-            image_url = _extract_jsonld_image_url(html, base_url=url)
-            if image_url:
-                item["image"] = image_url
-                found += 1
-                print(f"[SOURCE IMAGE] FOUND: {image_url} | source=publisher-image-resolver")
-            else:
-                print(f"[SOURCE IMAGE] NONE: {url} | jsonld.image.url not found")
+            # Pass the title. Without it, extract_source_image() cannot perform
+            # the cross-publisher fallback query.
+            image_data = extract_source_image(url, title=title) or {}
         except Exception as exc:
-            print(f"[SOURCE IMAGE] ERROR: {url} | {exc}")
+            print(f"[SOURCE IMAGE] CANONICAL ERROR: {url} | {exc}")
+            image_data = {}
+
+        image_url = str(image_data.get("image") or "").strip()
+        image_reason = str(
+            image_data.get("image_reason")
+            or "jsonld_image_url_not_found_or_invalid"
+        ).strip().casefold()
+
+        if (
+            image_url
+            and _is_valid_publisher_image_url(image_url)
+            and image_data.get("image_status") == "FOUND"
+            and image_reason in allowed_reasons
+        ):
+            item["image"] = image_url
+            item["image_source_url"] = image_data.get("source_url", "")
+            item["image_source"] = image_data.get("source", "")
+            item["image_status"] = "FOUND"
+            item["image_reason"] = image_reason
+            found += 1
+            print(
+                f"[SOURCE IMAGE] FOUND: {image_url} | "
+                f"source=canonical-news-resolver | reason={image_reason}"
+            )
+        else:
+            item["image"] = ""
+            item["image_status"] = "NONE"
+            item["image_reason"] = image_reason
+            print(
+                f"[SOURCE IMAGE] NONE: {url} | reason={image_reason}"
+            )
 
     print(f"[SOURCE IMAGE] FINAL | publisher_images={found} | sources={len(items)}")
     return items
-
-
 
 def _ensure_rendered_publisher_image(rendered_html, article, selected_news):
     """Guarantee the verified publisher image reaches final HTML presentation and stays responsive."""
@@ -1481,9 +1579,6 @@ def _ensure_rendered_publisher_image(rendered_html, article, selected_news):
     if not html:
         return html
 
-    # The renderer's image markup is intentionally presentation-only.
-    # Keep the image inside the article width on desktop and mobile; otherwise
-    # a native publisher image (often 1200-1920px wide) can overflow the page.
     image_css = (
         '<style id="tc-responsive-article-image">'
         '.tc-article-image{width:100%;max-width:100%;margin:0 0 32px;overflow:hidden;}'
@@ -1500,20 +1595,31 @@ def _ensure_rendered_publisher_image(rendered_html, article, selected_news):
         else:
             html = image_css + html
 
-    # If the renderer already supplied an image, keep it and only repair its
-    # responsive presentation.
-    if re.search(r"<img\b[^>]+src\s*=", html, flags=re.IGNORECASE):
-        return html
-
+    # Only a verified JSON-LD publisher image satisfies this gate. Both direct
+    # and cross-publisher fallback JSON-LD image.url results are valid.
     image_url = ""
+    verified_image_urls = []
     for item in selected_news or []:
         if not isinstance(item, dict):
             continue
         candidate = str(item.get("image") or item.get("image_url") or "").strip()
-        if _is_valid_publisher_image_url(candidate):
-            image_url = candidate
-            break
-    if not image_url:
+        if (
+            _is_valid_publisher_image_url(candidate)
+            and str(item.get("image_status") or "").strip().upper() == "FOUND"
+            and str(item.get("image_reason") or "").strip().casefold()
+                in {"jsonld_image_url", "fallback_jsonld_image_url"}
+        ):
+            if not image_url:
+                image_url = candidate
+            verified_image_urls.append(candidate)
+
+    if not verified_image_urls:
+        print("[SOURCE IMAGE] OPTIONAL | no verified publisher image; publishing without image.")
+        return html
+
+    # If the exact verified publisher image is already rendered, keep it.
+    if any(candidate in html or candidate.replace("&", "&amp;") in html
+           for candidate in verified_image_urls):
         return html
 
     from html import escape
@@ -1529,7 +1635,8 @@ def _ensure_rendered_publisher_image(rendered_html, article, selected_news):
         if match:
             pos = match.end()
             return html[:pos] + figure + html[pos:]
-    return html
+    raise ValueError("Publisher image gate failed: could not inject verified image into HTML.")
+
 
 def _shorten_headline(title):
     title = " ".join(str(title or "").split()).strip()
@@ -2429,7 +2536,28 @@ def generate_valid_article(prompt, reference_date, trend, prelocked_evidence=Non
         if isinstance(locked_facts, list) and len(locked_facts) >= 1:
             print(f"[EVIDENCE COVERAGE] locked_facts={len(locked_facts)} | core_facts={len(core_fact_ids)} | supporting_facts={len(supporting_fact_ids)} | article_words={len(paragraph_text.split())}")
         fact_expression = _measure_fact_expression(article, generation_evidence)
-        print("[FACT CONSISTENCY GUARD] DISABLED — publication not blocked by deterministic fact-expression guard")
+        # Core evidence fidelity is a publication gate. Supporting facts remain
+        # useful coverage telemetry, but a locked core fact must never disappear
+        # from the published narrative. This does not impose a word floor and
+        # does not require every supporting fact to be mentioned.
+        if fact_expression.get("status") == "PASS":
+            core_coverage = fact_expression.get("core_coverage")
+            if core_coverage is not None and core_coverage < 1.0:
+                print(
+                    f"[FACT CONSISTENCY GUARD] FAIL | "
+                    f"core_coverage={core_coverage:.3f} | "
+                    f"expressed_core_facts={fact_expression.get('expressed_core_facts')} | "
+                    f"core_facts={fact_expression.get('core_facts')}"
+                )
+                raise Exception("Article omitted one or more locked core evidence facts.")
+            print(
+                f"[FACT CONSISTENCY GUARD] PASS | "
+                f"core_coverage={core_coverage:.3f}" if core_coverage is not None
+                else "[FACT CONSISTENCY GUARD] PASS | no core facts"
+            )
+        else:
+            print("[FACT CONSISTENCY GUARD] UNAVAILABLE — publication blocked")
+            raise Exception("Fact-expression validation unavailable; publication blocked.")
         normalized_headline = _shorten_headline(article.get("title", ""))
         article["title"] = normalized_headline; article["h1"] = normalized_headline
         article = enforce_headline_policy(article, trend)
@@ -2483,6 +2611,45 @@ def git_push():
     print("SUCCESS: GitHub updated.")
 
 
+def _fetch_broad_news_fallback_seeds():
+    """Fetch broad FR news leads when direct-source discovery is insufficient.
+
+    Direct publisher RSS remains first choice. This fallback is supplementary
+    only: every returned lead still passes the normal deterministic eligibility,
+    story discovery, evidence, substantive-value, and generation gates.
+    """
+    fallback_queries = {
+        "en": ["latest news", "breaking news", "top news"],
+        "en-us": ["latest news", "breaking news", "top news"],
+        "de": ["aktuelle nachrichten", "eilmeldungen", "top nachrichten"],
+        "es": ["últimas noticias", "última hora", "principales noticias"],
+        "it": ["ultime notizie", "ultim'ora", "principali notizie"],
+        "fr": ["dernières actualités", "actualité dernière minute", "actualités France"],
+        "pt": ["últimas notícias", "última hora", "principais notícias"],
+        "pt-br": ["últimas notícias", "última hora", "principais notícias"],
+        "id": ["berita terbaru", "berita terkini", "berita utama"],
+    }.get(str(LANGUAGE or "").strip().casefold(), ["latest news", "breaking news", "top news"])
+
+    fallback = fetch_news_discovery(
+        fallback_queries,
+        per_query_limit=8,
+        max_results=12,
+    )
+    seeds = []
+    for item in fallback:
+        seed = dict(item)
+        seed["discovery_provider"] = "google_news_bing_fallback"
+        seed["discovery_source"] = str(item.get("source") or "").strip()
+        seed["discovery_context"] = "broad_news_fallback"
+        seeds.append(seed)
+
+    print(
+        f"[SOURCE FIRST] Broad news fallback | "
+        f"queries={len(fallback_queries)} | seeds={len(seeds)}"
+    )
+    return seeds
+
+
 def main():
     monitor.start_run(language=LANGUAGE, model=MODEL, pipeline="universal-fact-lock-v2.9.5-ministral-all-facts-no-word-floor", max_articles=MAX_ARTICLES_PER_RUN)
     processed = load_processed()
@@ -2498,38 +2665,16 @@ def main():
         )
 
         # Direct publisher RSS is preferred, but it must never be a single
-        # point of failure for discovery. If the configured publisher has no
-        # fresh item, immediately fall back to the existing Google News ->
-        # Bing discovery mechanism. Freshness, deduplication and all downstream
+        # point of failure. A weak direct feed is not considered healthy merely
+        # because it returned one or two fresh rows; those rows may all be
+        # processed, irrelevant, or fail downstream story quality. The broad
+        # Google News -> Bing mechanism is therefore available as a supplementary
+        # discovery pool when the direct-source reservoir is insufficient.
         if not trends:
-            fallback_queries = {
-                "en": ["latest news", "breaking news", "top news"],
-                "en-us": ["latest news", "breaking news", "top news"],
-                "de": ["aktuelle nachrichten", "eilmeldungen", "top nachrichten"],
-                "es": ["últimas noticias", "última hora", "principales noticias"],
-                "it": ["ultime notizie", "ultim'ora", "principali notizie"],
-                "fr": ["dernières nouvelles", "dernière minute", "actualités principales"],
-                "pt": ["últimas notícias", "última hora", "principais notícias"],
-                "pt-br": ["últimas notícias", "última hora", "principais notícias"],
-                "id": ["berita terbaru", "berita terkini", "berita utama"],
-            }.get(str(LANGUAGE or "").strip().casefold(), ["latest news", "breaking news", "top news"])
-
-            fallback = fetch_news_discovery(
-                fallback_queries,
-                per_query_limit=8,
-                max_results=12,
-            )
-            trends = []
-            for item in fallback:
-                seed = dict(item)
-                seed["discovery_provider"] = "google_news_bing_fallback"
-                seed["discovery_source"] = str(item.get("source") or "").strip()
-                seed["discovery_context"] = "broad_news_fallback"
-                trends.append(seed)
-
+            trends = _fetch_broad_news_fallback_seeds()
             print(
                 f"[SOURCE FIRST] Direct RSS empty -> broad news fallback | "
-                f"queries={len(fallback_queries)} | seeds={len(trends)}"
+                f"seeds={len(trends)}"
             )
     else:
         trends = fetch_trends()
@@ -2554,6 +2699,43 @@ def main():
         trends,
         processed,
     )
+
+    # A direct RSS feed can be technically non-empty while yielding no usable
+    # production candidates after deterministic filtering. Treat that as a weak
+    # discovery result and supplement it with the existing Google News -> Bing
+    # fallback. Direct-source candidates remain first in the queue.
+    if source_first and len(candidate_trends) < max(4, MAX_ARTICLES_PER_RUN * 4):
+        fallback_seeds = _fetch_broad_news_fallback_seeds()
+        if fallback_seeds:
+            existing_keys = {
+                (
+                    str(item.get("url") or item.get("link") or "").strip().casefold(),
+                    _norm(item.get("title")),
+                )
+                for item in trends
+                if isinstance(item, dict)
+            }
+            added = 0
+            for seed in fallback_seeds:
+                key = (
+                    str(seed.get("url") or seed.get("link") or "").strip().casefold(),
+                    _norm(seed.get("title")),
+                )
+                if key in existing_keys:
+                    continue
+                trends.append(seed)
+                existing_keys.add(key)
+                added += 1
+
+            if added:
+                candidate_trends = _deterministic_production_reservoir(
+                    trends,
+                    processed,
+                )
+                print(
+                    f"[SOURCE FIRST] Weak direct reservoir -> fallback supplemented | "
+                    f"added={added} | production_candidates={len(candidate_trends)}"
+                )
 
     print(
         f"[STORY DISCOVERY] seeds={len(candidate_trends)} | "
@@ -2799,6 +2981,23 @@ def main():
                         f"source_chars={len(evidence_source)}"
                     )
                     evidence_lock = extract_evidence(evidence_source)
+
+                    # STORY COHERENCE BOUNDARY: the selected concrete story is
+                    # already known upstream. Filter the extracted facts before
+                    # semantic deduplication, evidence sufficiency, substantive
+                    # value, reservation, or generation. This prevents unrelated
+                    # stories from the same Google News pool from contaminating
+                    # the evidence lock. The layer is fail-closed.
+                    evidence_lock = filter_story_coherence(
+                        evidence_lock,
+                        keyword,
+                        selected_news,
+                        # Do not pass the broad discovery keyword as an anchor hint.
+                        # The coherence layer must select the concrete anchor from the locked source set.
+                        # Passing the keyword here caused false rejects when the real publisher headline
+                        # was semantically correct but shared few literal tokens with the broad topic.
+                        
+                    )
                     evidence_lock = _semantic_deduplicate_evidence_facts(evidence_lock)
 
                     locked_facts = (
@@ -2821,43 +3020,6 @@ def main():
                         if isinstance(lineage, dict)
                         else evidence_fact_count
                     )
-
-                    # Hard article-eligibility gate: a standalone TrendCurrent
-                    # article must have at least three distinct verified
-                    # information units. This is NOT a word floor, NOT a retry,
-                    # and NOT a ranking rule. It prevents thin 1-2 fact evidence
-                    # from reaching generation and producing non-articles.
-                    if unique_information_units < EVIDENCE_MIN_FACTS_FOR_GENERATION:
-                        trend["_production_status"] = "REJECT"
-                        trend["_production_reject_reason"] = (
-                            f"insufficient unique evidence facts "
-                            f"({unique_information_units} < "
-                            f"{EVIDENCE_MIN_FACTS_FOR_GENERATION})"
-                        )
-                        print(
-                            f"[TOPIC FILTER] EVIDENCE SUFFICIENCY REJECT | "
-                            f"unique_information_units={unique_information_units} | "
-                            f"minimum={EVIDENCE_MIN_FACTS_FOR_GENERATION} | "
-                            f"{keyword} | story={story_number} | "
-                            f"reason=insufficient distinct evidence for meaningful article"
-                        )
-                        monitor.candidate_event(
-                            "evidence_sufficiency",
-                            status="REJECT",
-                            news_count=len(news),
-                            selected_source_indices=story_selection.get("selected_indices", []),
-                            selected_source_count=story_selection.get("selected_count"),
-                            evidence_source_chars=len(evidence_source),
-                            evidence_fact_count=evidence_fact_count,
-                            unique_information_units=unique_information_units,
-                            evidence_facts=locked_facts,
-                            minimum_facts=EVIDENCE_MIN_FACTS_FOR_GENERATION,
-                        )
-                        monitor.finish_candidate(
-                            "REJECT",
-                            reason=trend["_production_reject_reason"],
-                        )
-                        continue
 
                     print(
                         f"[TOPIC FILTER] SUBSTANTIVE STORY VALUE CHECK | "

@@ -1,0 +1,146 @@
+{
+  "topic_title": "VIDEO iPhone Duo : voici à quoi ressemble le premier smartphone pliable d’Apple",
+  "evidence_lock": {
+    "primary_group": "C1-G1",
+    "facts": [
+      {
+        "id": "F1",
+        "group": "C1-G1",
+        "fact": "Apple a officiellement annoncé l'iPhone Duo, son premier smartphone pliable, lors d'une keynote le 9 septembre 2026.",
+        "excerpt": "C’est lors de la keynote du 9 septembre que la firme de Cupertino a levé le voile sur ce modèle qui adopte un format livre avec deux écrans.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core",
+        "story_classification": "PRIMARY",
+        "lineage_members": [
+          "F1"
+        ]
+      },
+      {
+        "id": "F2",
+        "group": "C1-G1",
+        "fact": "L'iPhone Duo adopte un format livre avec deux écrans : un écran extérieur de 5,4 pouces et un écran intérieur de 7,6 pouces en mode déplié.",
+        "excerpt": "Lorsqu’il est refermé, l’iPhone Duo présente un écran extérieur de 5,4 pouces avec un format livre.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core",
+        "story_classification": "PRIMARY",
+        "lineage_members": [
+          "F2"
+        ]
+      },
+      {
+        "id": "F3",
+        "group": "C1-G1",
+        "fact": "Le châssis de l'iPhone Duo est en titane avec des renforts en fibre céramique pour renforcer la solidité.",
+        "excerpt": "Apple a travaillé la solidité, puisque le châssis utilise du titane avec des renforts en fibre céramique.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core",
+        "story_classification": "PRIMARY",
+        "lineage_members": [
+          "F3"
+        ]
+      },
+      {
+        "id": "F4",
+        "group": "C1-G1",
+        "fact": "L'iPhone Duo intègre une puce A20 Pro avec une gravure 2 nm, 6 cœurs et un NPU de 32 cœurs pour les traitements IA.",
+        "excerpt": "Sous le capot, on trouve une puce A20 Pro avec une gravure 2 nm, 6 cœurs et un NPU de 32 cœurs pour les traitements IA.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core",
+        "story_classification": "PRIMARY",
+        "lineage_members": [
+          "F4"
+        ]
+      },
+      {
+        "id": "F5",
+        "group": "C1-G1",
+        "fact": "Le smartphone utilise une eSIM exclusive, sans support pour les cartes SIM physiques.",
+        "excerpt": "Le smartphone pliable repose entièrement sur une eSIM, pas de carte SIM physique ici.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "supporting",
+        "story_classification": "PRIMARY",
+        "lineage_members": [
+          "F5"
+        ]
+      },
+      {
+        "id": "F6",
+        "group": "C1-G1",
+        "fact": "Les précommandes pour l'iPhone Duo ouvrent le 16 octobre 2026, avec une disponibilité générale à partir du 23 octobre 2026.",
+        "excerpt": "C’est le 16 octobre 2026 que les précommandes ouvriront et les livraisons seront effectuées dès le 23 octobre.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "supporting",
+        "story_classification": "PRIMARY",
+        "lineage_members": [
+          "F6"
+        ]
+      },
+      {
+        "id": "F7",
+        "group": "C1-G1",
+        "fact": "Le prix de départ de l'iPhone Duo est de 2 399 euros pour la version 256 Go en France.",
+        "excerpt": "Voici tout ce qu’il faut savoir sur l’iPhone Duo Pour le prix, vous vous en doutez, c’est salé, puisque l’on parle d’à partir de 2 399 euros avec 256 Go de stockage.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "supporting",
+        "story_classification": "PRIMARY",
+        "lineage_members": [
+          "F7"
+        ]
+      },
+      {
+        "id": "F8",
+        "group": "C1-G1",
+        "fact": "L'iPhone Duo est compatible avec l'Apple Pencil, contrairement à la plupart des concurrents pliables.",
+        "excerpt": "Un modèle doté de deux écrans, d’une puce A20 Pro, d’un lecteur d’empreintes Touch ID et d’une compatibilité avec l’Apple Pencil qui arrivera plus tard cette année.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "supporting",
+        "story_classification": "PRIMARY",
+        "lineage_members": [
+          "F8"
+        ]
+      }
+    ],
+    "core_fact_ids": [
+      "F1",
+      "F2",
+      "F3",
+      "F4"
+    ],
+    "supporting_fact_ids": [
+      "F5",
+      "F6",
+      "F7",
+      "F8"
+    ],
+    "fact_lineage": {
+      "raw_facts": 8,
+      "unique_information_units": 8,
+      "merged_facts": 0,
+      "merge_pairs": [],
+      "candidate_pairs": 2,
+      "semantic_duplicate_clusters": [],
+      "semantic_duplicate_fact_ids": []
+    },
+    "excluded_facts": [],
+    "story_anchor": "Apple lance l’iPhone Duo, son premier téléphone pliable, qui coûtera à partir de 1 999 dollars et sera lancé le 23 octobre - Informat.ro",
+    "story_coherence_version": "v1.1"
+  },
+  "created_at": 1789054470.2835321,
+  "pid": 2864
+}

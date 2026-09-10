@@ -22,6 +22,7 @@ import json
 import os
 import time
 import re
+import unicodedata
 
 from ollama import chat
 from config import MODEL
@@ -241,13 +242,44 @@ def _validate_and_filter(result, topic, news, evidence, story_anchor_hint=""):
     valid_ids = [item for item in valid_ids if item]
 
     source_titles = [item["title"] for item in _source_titles(news)]
-    anchor = str(result.get("story_anchor", "")).strip()
+    anchor_raw = str(result.get("story_anchor", "")).strip()
 
-    if not anchor or anchor not in source_titles:
+    def _normalise_anchor(value):
+        """Normalise formatting only; never perform semantic/fuzzy matching.
+
+        This is deliberately language-agnostic. It handles Unicode composition,
+        case, typographic apostrophes/dashes, and whitespace differences while
+        preserving the actual words of the publisher headline.
+        """
+        text = unicodedata.normalize("NFKC", str(value or "")).casefold().strip()
+        text = text.replace("\u2018", "'").replace("\u2019", "'")
+        text = text.replace("\u201b", "'").replace("\u2032", "'")
+        text = re.sub(r"[\u2010-\u2015\u2212]", "-", text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    anchor_norm = _normalise_anchor(anchor_raw)
+    if not anchor_norm:
+        raise ValueError(
+            "Story coherence returned an empty story anchor."
+        )
+
+    # The model must select one of the supplied publisher headlines. We allow
+    # formatting-only differences (Unicode punctuation, case, whitespace), but
+    # NEVER semantic/fuzzy matching or a newly invented headline.
+    canonical_anchor = next(
+        (title for title in source_titles if _normalise_anchor(title) == anchor_norm),
+        None,
+    )
+    if canonical_anchor is None:
         raise ValueError(
             "Story coherence returned a story anchor that is not an exact "
-            "supplied source headline."
+            "supplied source headline after formatting normalization."
         )
+
+    # Store the actual supplied headline, not the model's formatting variant.
+    # This keeps the downstream story identity deterministic across languages.
+    anchor = canonical_anchor
 
     # If upstream supplied a concrete discovery headline, require the selected
     # source headline to represent that same story. We use conservative token

@@ -6,6 +6,27 @@
       "enabled": true,
       "priority": 1,
       "usage_status": "needs_permission"
+    },
+    {
+      "name": "France 24",
+      "url": "https://www.france24.com/fr/rss",
+      "enabled": true,
+      "priority": 2,
+      "usage_status": "needs_permission"
+    },
+    {
+      "name": "Franceinfo",
+      "url": "https://www.franceinfo.fr/titres.rss",
+      "enabled": true,
+      "priority": 3,
+      "usage_status": "needs_permission"
+    },
+    {
+      "name": "Le Figaro",
+      "url": "https://www.lefigaro.fr/rss/figaro_actualites.xml",
+      "enabled": true,
+      "priority": 4,
+      "usage_status": "needs_permission"
     }
   ]
 }

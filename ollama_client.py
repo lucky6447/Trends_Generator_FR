@@ -42,7 +42,7 @@ NUM_THREADS = (
     else None
 )
 
-NUM_CTX = max(4096, int(os.getenv("OLLAMA_NUM_CTX", "4096")))
+NUM_CTX = max(8192, int(os.getenv("OLLAMA_NUM_CTX", "8192")))
 
 # IMPORTANT: Do not force num_batch=512 by default.
 # Keep an explicit override available for controlled benchmarking.
@@ -102,10 +102,8 @@ EVIDENCE_EXPANSION = os.getenv(
 # One retry is allowed only for malformed/truncated evidence JSON.
 # The retry uses a smaller output contract and a bounded output ceiling.
 EVIDENCE_RETRY_TOKENS = max(
-    256, min(
-        EVIDENCE_TOKENS,
-        int(os.getenv("OLLAMA_EVIDENCE_RETRY_TOKENS", "360")),
-    )
+    EVIDENCE_TOKENS,
+    int(os.getenv("OLLAMA_EVIDENCE_RETRY_TOKENS", "700")),
 )
 
 print(f"[TrendCurrent PIPELINE] {PIPELINE_VERSION}")
@@ -316,8 +314,9 @@ def _split_source(source):
     # the safe single-chunk ceiling is deliberately below the raw context size.
     # This is a performance optimization, not a content reduction.
     # ARTICLE markers are provenance metadata and must not multiply CPU calls.
-    # For the default 4096-token context, 12000 characters is a conservative
-    # ceiling that preserves the production optimization seen with ~9k sources.
+    # For the default 8192-token context, 12000 characters remains a conservative
+    # single-chunk ceiling while leaving substantial headroom for the indexed-source
+    # wrapper, valid-ID list, instructions, and compact JSON evidence output.
     single_chunk_chars = min(12000, EVIDENCE_CHUNK_CHARS)
     if len(text) <= single_chunk_chars:
         return [text]
