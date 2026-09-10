@@ -19,13 +19,12 @@ from html.parser import HTMLParser
 from urllib.request import Request, urlopen
 from datetime import date
 
-from config import MAX_ARTICLES_PER_RUN, LANGUAGE, SOURCE_FIRST, TREND_DIR
+from config import MAX_ARTICLES_PER_RUN, LANGUAGE, SOURCE_FIRST, TREND_DIR, RUN_TIME_BUDGET_SECONDS, MAX_CONCRETE_STORY_CANDIDATES_PER_RUN
 from rss import fetch_trends
 from rss_source_discovery import fetch_source_stories
 from news import fetch_news, fetch_news_discovery, hydrate_story_sources, hydrate_news_items
 from prompt import build_prompt
 from ollama_client import generate, extract_evidence, validate_article_structure, substantive_story_value_gate
-from story_coherence import filter_evidence as filter_story_coherence
 from ollama import chat
 from config import MODEL
 
@@ -1800,13 +1799,11 @@ def _enrich_evidence_for_generation(evidence, trend):
     return enriched
 
 def _semantic_deduplicate_evidence_facts(evidence):
-    """Collapse evidence facts that describe the same substantive information unit.
+    """Conservative deterministic evidence deduplication.
 
-    The extractor's fact_lineage is not trusted as the sole uniqueness authority because
-    it can treat paraphrases, repeated source metadata, or restated claims as separate
-    facts. A bounded semantic clustering pass is used before evidence sufficiency and
-    generation. Only valid extractor fact IDs may be returned; malformed model output
-    fails closed to the original facts rather than inventing a new fact.
+    No LLM call is allowed in this hot path. The extractor already instructs the
+    model not to repeat facts; this layer only collapses obvious lexical
+    restatements and preserves distinct details.
     """
     if not isinstance(evidence, dict):
         raise ValueError("Evidence lock is not an object.")
@@ -1819,134 +1816,81 @@ def _semantic_deduplicate_evidence_facts(evidence):
         result["fact_lineage"] = lineage
         return result
 
-    fact_rows = []
-    valid_ids = set()
+    def tokens(text):
+        text = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode("ascii").casefold()
+        return {t for t in re.findall(r"[a-z0-9]+", text) if len(t) > 2}
+
+    def similarity(a, b):
+        ta, tb = tokens(a), tokens(b)
+        if not ta or not tb:
+            return 0.0, 0.0
+        jaccard = len(ta & tb) / max(1, len(ta | tb))
+        sequence = difflib.SequenceMatcher(None, str(a).casefold(), str(b).casefold()).ratio()
+        return jaccard, sequence
+
+    deduped = []
+    duplicate_clusters = []
+    duplicate_ids = []
+
     for fact in facts:
         if not isinstance(fact, dict):
             continue
-        fact_id = str(fact.get("id", "")).strip()
         text = str(fact.get("fact", "")).strip()
-        if not fact_id or not text:
+        fid = str(fact.get("id", "")).strip()
+        if not text or not fid:
             continue
-        valid_ids.add(fact_id)
-        fact_rows.append({"id": fact_id, "fact": text})
 
-    if len(fact_rows) < 2:
-        result = dict(evidence)
-        result["facts"] = [f for f in facts if isinstance(f, dict) and str(f.get("id", "")).strip() in valid_ids]
-        lineage = dict(result.get("fact_lineage") or {}) if isinstance(result.get("fact_lineage"), dict) else {}
-        lineage["unique_information_units"] = len(result["facts"])
-        result["fact_lineage"] = lineage
-        return result
+        duplicate_of = None
+        for existing in deduped:
+            jaccard, sequence = similarity(text, existing.get("fact", ""))
+            # Deliberately conservative: only obvious restatements are merged.
+            if sequence >= 0.90 or (jaccard >= 0.78 and sequence >= 0.82):
+                duplicate_of = existing
+                break
 
-    numbered = "\n".join(f"{i+1}. [{row['id']}] {row['fact']}" for i, row in enumerate(fact_rows))
-    prompt = f"""
-Cluster these extracted evidence facts into substantive information units.
+        if duplicate_of is None:
+            item = dict(fact)
+            item["lineage_members"] = [fid]
+            deduped.append(item)
+        else:
+            duplicate_of.setdefault("lineage_members", []).append(fid)
+            duplicate_clusters.append([str(x) for x in duplicate_of["lineage_members"]])
+            duplicate_ids.append(fid)
 
-Two facts belong to the SAME unit when they communicate the same underlying factual
-claim/event, even if they are paraphrased, reordered, or expressed with different wording.
-Do NOT merge facts merely because they share a person, organization, topic, date, or event.
-A genuinely new detail remains a separate unit.
-Source/publisher attribution alone is not a new substantive fact when it merely repeats
-an already stated claim.
+    # Re-number IDs while preserving lineage/provenance.
+    old_to_new = {}
+    for idx, fact in enumerate(deduped, 1):
+        old_ids = [str(x) for x in fact.get("lineage_members", [])]
+        new_id = f"F{idx}"
+        for old_id in old_ids:
+            old_to_new[old_id] = new_id
+        fact["id"] = new_id
 
-Return ONLY JSON in this exact shape:
-{{"clusters":[["F1","F2"],["F3"]]}}
+    result = dict(evidence)
+    result["facts"] = deduped
 
-Every fact ID must appear exactly once. Use only IDs supplied below. Do not invent IDs.
+    for key in ("core_fact_ids", "supporting_fact_ids"):
+        values = result.get(key, [])
+        if isinstance(values, list):
+            mapped = []
+            for value in values:
+                new_id = old_to_new.get(str(value).strip())
+                if new_id and new_id not in mapped:
+                    mapped.append(new_id)
+            result[key] = mapped
 
-FACTS:
-{numbered}
-"""
+    lineage = dict(result.get("fact_lineage") or {}) if isinstance(result.get("fact_lineage"), dict) else {}
+    lineage["unique_information_units"] = len(deduped)
+    lineage["semantic_duplicate_clusters"] = duplicate_clusters
+    lineage["semantic_duplicate_fact_ids"] = duplicate_ids
+    lineage["dedup_mode"] = "deterministic_lexical_fast_path"
+    result["fact_lineage"] = lineage
 
-    try:
-        raw = chat(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={
-                "temperature": 0.0,
-                "top_p": 0.85,
-                "top_k": 40,
-                "num_ctx": max(4096, int(os.getenv("OLLAMA_NUM_CTX", "4096"))),
-                "num_predict": 256,
-            },
-            format="json",
-        )
-        content = getattr(getattr(raw, "message", None), "content", "") or ""
-        start = content.find("{")
-        end = content.rfind("}")
-        if start < 0 or end <= start:
-            raise ValueError("semantic fact dedup returned no JSON object")
-        parsed = json.loads(content[start:end + 1])
-        clusters_raw = parsed.get("clusters")
-        if not isinstance(clusters_raw, list):
-            raise ValueError("semantic fact dedup returned invalid clusters")
-
-        clusters = []
-        seen = set()
-        for cluster in clusters_raw:
-            if not isinstance(cluster, list) or not cluster:
-                raise ValueError("semantic fact dedup returned invalid cluster")
-            ids = [str(x).strip() for x in cluster]
-            if any(x not in valid_ids for x in ids) or len(set(ids)) != len(ids):
-                raise ValueError("semantic fact dedup returned unknown/duplicate fact ID")
-            if any(x in seen for x in ids):
-                raise ValueError("semantic fact dedup did not assign each fact exactly once")
-            seen.update(ids)
-            clusters.append(ids)
-
-        if seen != valid_ids:
-            raise ValueError("semantic fact dedup omitted one or more fact IDs")
-
-        by_id = {str(f.get("id")): f for f in facts if isinstance(f, dict)}
-        representative_for = {}
-        deduped_facts = []
-        duplicate_ids = []
-        duplicate_clusters = []
-
-        for cluster in clusters:
-            representative = cluster[0]
-            base = dict(by_id[representative])
-            members = list(cluster)
-            base["lineage_members"] = members
-            if len(members) > 1:
-                duplicate_clusters.append(members)
-                duplicate_ids.extend(members[1:])
-            for member in members:
-                representative_for[member] = representative
-            deduped_facts.append(base)
-
-        result = dict(evidence)
-        result["facts"] = deduped_facts
-
-        for key in ("core_fact_ids", "supporting_fact_ids"):
-            values = result.get(key, [])
-            if isinstance(values, list):
-                mapped = []
-                for value in values:
-                    rep = representative_for.get(str(value).strip())
-                    if rep and rep not in mapped:
-                        mapped.append(rep)
-                result[key] = mapped
-
-        lineage = dict(result.get("fact_lineage") or {}) if isinstance(result.get("fact_lineage"), dict) else {}
-        lineage["unique_information_units"] = len(deduped_facts)
-        lineage["semantic_duplicate_clusters"] = duplicate_clusters
-        lineage["semantic_duplicate_fact_ids"] = duplicate_ids
-        result["fact_lineage"] = lineage
-
-        print(
-            f"[EVIDENCE SEMANTIC DEDUP] facts_in={len(facts)} | "
-            f"unique_units={len(deduped_facts)} | duplicates_removed={len(duplicate_ids)}"
-        )
-        return result
-    except Exception as exc:
-        # Do not silently claim semantic uniqueness if the semantic check failed.
-        # Preserve the original evidence and make the failure observable; the existing
-        # evidence sufficiency gate will still use the extractor's value in this case.
-        print(f"[EVIDENCE SEMANTIC DEDUP] unavailable | {exc}")
-        return evidence
-
+    print(
+        f"[EVIDENCE SEMANTIC DEDUP] deterministic | facts_in={len(facts)} | "
+        f"unique_units={len(deduped)} | duplicates_removed={len(duplicate_ids)}"
+    )
+    return result
 
 def _run_repetition_guard(article, generation_evidence, event_name="repetition_guard"):
     """Cheap deterministic post-generation repetition gate.
@@ -2536,24 +2480,24 @@ def generate_valid_article(prompt, reference_date, trend, prelocked_evidence=Non
         if isinstance(locked_facts, list) and len(locked_facts) >= 1:
             print(f"[EVIDENCE COVERAGE] locked_facts={len(locked_facts)} | core_facts={len(core_fact_ids)} | supporting_facts={len(supporting_fact_ids)} | article_words={len(paragraph_text.split())}")
         fact_expression = _measure_fact_expression(article, generation_evidence)
-        # Core evidence fidelity is a publication gate. Supporting facts remain
-        # useful coverage telemetry, but a locked core fact must never disappear
-        # from the published narrative. This does not impose a word floor and
-        # does not require every supporting fact to be mentioned.
+        # Every fact that survives semantic deduplication is locked evidence and
+        # must be explicitly expressed in the published narrative. This is not a
+        # word floor: the article may still be as short as the evidence naturally
+        # permits, but it may not silently discard usable locked facts.
         if fact_expression.get("status") == "PASS":
-            core_coverage = fact_expression.get("core_coverage")
-            if core_coverage is not None and core_coverage < 1.0:
+            coverage = fact_expression.get("coverage")
+            if coverage is not None and coverage < 1.0:
                 print(
                     f"[FACT CONSISTENCY GUARD] FAIL | "
-                    f"core_coverage={core_coverage:.3f} | "
-                    f"expressed_core_facts={fact_expression.get('expressed_core_facts')} | "
-                    f"core_facts={fact_expression.get('core_facts')}"
+                    f"coverage={coverage:.3f} | "
+                    f"expressed_facts={fact_expression.get('expressed_facts')} | "
+                    f"locked_facts={fact_expression.get('locked_facts')}"
                 )
-                raise Exception("Article omitted one or more locked core evidence facts.")
+                raise Exception("Article omitted one or more locked evidence facts.")
             print(
                 f"[FACT CONSISTENCY GUARD] PASS | "
-                f"core_coverage={core_coverage:.3f}" if core_coverage is not None
-                else "[FACT CONSISTENCY GUARD] PASS | no core facts"
+                f"coverage={coverage:.3f}" if coverage is not None
+                else "[FACT CONSISTENCY GUARD] PASS | no locked facts"
             )
         else:
             print("[FACT CONSISTENCY GUARD] UNAVAILABLE — publication blocked")
@@ -2687,6 +2631,21 @@ def main():
 
     generated = 0
     new_keywords = []
+    run_started_monotonic = time.monotonic()
+    concrete_candidates_processed = 0
+    budget_exhausted = False
+
+    def _run_budget_exhausted(stage=""):
+        nonlocal budget_exhausted
+        elapsed = time.monotonic() - run_started_monotonic
+        if elapsed >= RUN_TIME_BUDGET_SECONDS:
+            if not budget_exhausted:
+                budget_exhausted = True
+                print(f"[RUN BUDGET] HARD STOP | elapsed={elapsed:.1f}s | budget={RUN_TIME_BUDGET_SECONDS}s | stage={stage}")
+            return True
+        return False
+
+    print(f"[RUN BUDGET] limit={RUN_TIME_BUDGET_SECONDS}s | max_concrete_candidates={MAX_CONCRETE_STORY_CANDIDATES_PER_RUN}")
 
     # ============================================================
     # DISCOVERY -> CONCRETE STORIES
@@ -2744,6 +2703,8 @@ def main():
 
     for trend in candidate_trends:
         if generated >= MAX_ARTICLES_PER_RUN:
+            break
+        if _run_budget_exhausted("before_seed"):
             break
 
         keyword = trend["title"]
@@ -2882,6 +2843,13 @@ def main():
             for story_number, story_selection in enumerate(story_candidates, 1):
                 if generated >= MAX_ARTICLES_PER_RUN:
                     break
+                if concrete_candidates_processed >= MAX_CONCRETE_STORY_CANDIDATES_PER_RUN:
+                    budget_exhausted = True
+                    print(f"[RUN BUDGET] HARD CANDIDATE STOP | processed={concrete_candidates_processed} | limit={MAX_CONCRETE_STORY_CANDIDATES_PER_RUN}")
+                    break
+                if _run_budget_exhausted("before_candidate"):
+                    break
+                concrete_candidates_processed += 1
 
                 trend["_story_selection"] = story_selection
                 trend["news"] = news
@@ -2975,6 +2943,8 @@ def main():
                         f"story={story_number}/{len(story_candidates)}"
                     )
 
+                    if _run_budget_exhausted("before_evidence_extraction"):
+                        raise RuntimeError("run time budget exhausted before evidence extraction")
                     evidence_source = _build_evidence_source(selected_news, {"selected_indices": list(range(len(selected_news)))})
                     print(
                         f"[TOPIC FILTER] Evidence source prepared | "
@@ -2982,22 +2952,12 @@ def main():
                     )
                     evidence_lock = extract_evidence(evidence_source)
 
-                    # STORY COHERENCE BOUNDARY: the selected concrete story is
-                    # already known upstream. Filter the extracted facts before
-                    # semantic deduplication, evidence sufficiency, substantive
-                    # value, reservation, or generation. This prevents unrelated
-                    # stories from the same Google News pool from contaminating
-                    # the evidence lock. The layer is fail-closed.
-                    evidence_lock = filter_story_coherence(
-                        evidence_lock,
-                        keyword,
-                        selected_news,
-                        # Do not pass the broad discovery keyword as an anchor hint.
-                        # The coherence layer must select the concrete anchor from the locked source set.
-                        # Passing the keyword here caused false rejects when the real publisher headline
-                        # was semantically correct but shared few literal tokens with the broad topic.
-                        
-                    )
+                    # FAST PATH v2.9.7:
+                    # Story Discovery has already selected the concrete story and
+                    # independent source set. Evidence extraction is explicitly locked
+                    # to ONE coherent event. Skip the redundant LLM coherence inference
+                    # here; continue with deterministic evidence deduplication and the
+                    # existing substantive-value gate.
                     evidence_lock = _semantic_deduplicate_evidence_facts(evidence_lock)
 
                     locked_facts = (
@@ -3113,6 +3073,8 @@ def main():
                         evidence_lock=evidence_lock,
                     )
 
+                    if _run_budget_exhausted("before_article_generation"):
+                        raise RuntimeError("run time budget exhausted before article generation")
                     article = generate_valid_article(
                         generation_prompt,
                         reference_date,
@@ -3192,8 +3154,10 @@ def main():
     except Exception as e:
         print("UPDATE ERROR:", e)
 
-    print(f"Finished. Generated {generated} article(s).")
-    monitor.end_run(generated=generated, status="FINISHED")
+    elapsed_total = time.monotonic() - run_started_monotonic
+    final_status = "TIME_BUDGET" if budget_exhausted else "FINISHED"
+    print(f"Finished. Generated {generated} article(s). | elapsed={elapsed_total:.1f}s | candidates={concrete_candidates_processed} | status={final_status}")
+    monitor.end_run(generated=generated, status=final_status)
 
     if generated:
         git_push()

@@ -3,7 +3,7 @@ import os
 import re
 import time
 import difflib
-from ollama import chat
+from ollama import Client
 from config import MODEL, LANGUAGE
 import generator_monitor as monitor
 
@@ -29,7 +29,7 @@ import generator_monitor as monitor
 #   * preserve multilingual operation
 # ============================================================
 
-PIPELINE_VERSION = "universal-fact-lock-v2.9.6-ministral-compact-evidence-no-word-floor"
+PIPELINE_VERSION = "universal-fact-lock-v2.9.8-ministral-fast-path"
 
 # IMPORTANT: Do not force a CPU thread count by default.
 # Ollama can auto-detect the runner's optimal thread count.
@@ -43,6 +43,15 @@ NUM_THREADS = (
 )
 
 NUM_CTX = max(8192, int(os.getenv("OLLAMA_NUM_CTX", "8192")))
+
+# A run-level budget cannot interrupt a synchronous Ollama call. Keep each
+# individual model request bounded so the process can actually return control
+# to generate.py and enforce the 50-minute run budget.
+OLLAMA_TIMEOUT_SECONDS = max(30, int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "210")))
+OLLAMA_CLIENT = Client(
+    host=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
+    timeout=OLLAMA_TIMEOUT_SECONDS,
+)
 
 # IMPORTANT: Do not force num_batch=512 by default.
 # Keep an explicit override available for controlled benchmarking.
@@ -59,9 +68,7 @@ NUM_BATCH = (
 EVIDENCE_CHUNK_CHARS = max(
     7000, int(os.getenv("OLLAMA_EVIDENCE_CHUNK_CHARS", "18000"))
 )
-EVIDENCE_TOKENS = max(
-    520, int(os.getenv("OLLAMA_EVIDENCE_TOKENS", "560"))
-)
+EVIDENCE_TOKENS = max(320, int(os.getenv("OLLAMA_EVIDENCE_TOKENS", "360")))
 EVIDENCE_MAX_FACTS = max(
     4, min(8, int(os.getenv("OLLAMA_EVIDENCE_MAX_FACTS", "8")))
 )
@@ -78,9 +85,7 @@ CORE_FACTS_MAX = max(1, min(4, int(os.getenv("OLLAMA_CORE_FACTS_MAX", "4"))))
 WRITER_SOURCE_CONTEXT = os.getenv("OLLAMA_WRITER_SOURCE_CONTEXT", "0").strip() == "1"
 WRITER_SOURCE_CONTEXT_CHARS = max(4000, int(os.getenv("OLLAMA_WRITER_SOURCE_CONTEXT_CHARS", "12000")))
 
-ARTICLE_TOKENS = max(
-    520, int(os.getenv("OLLAMA_ARTICLE_TOKENS", "720"))
-)
+ARTICLE_TOKENS = max(340, int(os.getenv("OLLAMA_ARTICLE_TOKENS", "400")))
 AUDIT_TOKENS = max(
     240, int(os.getenv("OLLAMA_AUDIT_TOKENS", "320"))
 )
@@ -103,7 +108,7 @@ EVIDENCE_EXPANSION = os.getenv(
 # The retry uses a smaller output contract and a bounded output ceiling.
 EVIDENCE_RETRY_TOKENS = max(
     EVIDENCE_TOKENS,
-    int(os.getenv("OLLAMA_EVIDENCE_RETRY_TOKENS", "700")),
+    int(os.getenv("OLLAMA_EVIDENCE_RETRY_TOKENS", "420")),
 )
 
 print(f"[TrendCurrent PIPELINE] {PIPELINE_VERSION}")
@@ -210,7 +215,7 @@ def _call(
     if threads is not None:
         kwargs["options"]["num_thread"] = threads
 
-    response = chat(**kwargs)
+    response = OLLAMA_CLIENT.chat(**kwargs)
     raw = response.message.content or ""
     elapsed = time.perf_counter() - started
 
@@ -317,7 +322,7 @@ def _split_source(source):
     # For the default 8192-token context, 12000 characters remains a conservative
     # single-chunk ceiling while leaving substantial headroom for the indexed-source
     # wrapper, valid-ID list, instructions, and compact JSON evidence output.
-    single_chunk_chars = min(12000, EVIDENCE_CHUNK_CHARS)
+    single_chunk_chars = min(10000, EVIDENCE_CHUNK_CHARS)
     if len(text) <= single_chunk_chars:
         return [text]
 
@@ -1430,16 +1435,13 @@ _ARTICLE_FORMAT = {
 
 
 def _article_prompt(evidence, source_context=None):
-    """Build the dedicated newsroom-writing prompt for the article writer.
+    """Build a compact evidence-locked newsroom-writing prompt.
 
-    The writer sees a closed factual universe. The objective is complete, natural news prose
-    that reports the available facts without artificial expansion or artificial compression. The model is
-    explicitly told how to turn distinct locked facts into a coherent story while
-    preserving uncertainty and avoiding generic AI filler.
+    Keep the writer prompt short on CPU. The evidence lock and downstream
+    validation remain the factual authority.
     """
     facts = evidence.get("facts", []) if isinstance(evidence, dict) else []
     core_ids = set(evidence.get("core_fact_ids", [])) if isinstance(evidence, dict) else set()
-    supporting_ids = set(evidence.get("supporting_fact_ids", [])) if isinstance(evidence, dict) else set()
 
     fact_lines = []
     for fact in facts:
@@ -1447,214 +1449,64 @@ def _article_prompt(evidence, source_context=None):
             continue
         fid = str(fact.get("id", "")).strip()
         text = str(fact.get("fact", "")).strip()
-        if not fid or not text:
-            continue
-        role = "CORE" if fid in core_ids else "SUPPORTING"
-        fact_lines.append(f"- {fid} [{role}]: {text}")
+        if fid and text:
+            role = "CORE" if fid in core_ids else "SUPPORTING"
+            fact_lines.append(f"- {fid} [{role}]: {text}")
 
     source_block = ""
     if source_context:
         bounded = str(source_context).strip()[:WRITER_SOURCE_CONTEXT_CHARS]
         if bounded:
-            source_block = f"""
-
-OPTIONAL SOURCE CONTEXT:
-This context is provided only to help with wording and chronology. It is NOT an
-additional factual authority. If it conflicts with LOCKED FACTS, ignore it. Never
-introduce a detail from this context unless that detail is also represented in the
-LOCKED FACTS.
-{bounded}
-"""
+            source_block = (
+                "\nOPTIONAL SOURCE CONTEXT (wording/chronology only; never factual authority):\n"
+                + bounded
+            )
 
     return f"""
-You are TrendCurrent's newsroom writer. Write ONE finished news article in {LANGUAGE}.
+Write ONE finished, natural news article in {LANGUAGE}.
 
-The reader should feel that a real journalist has reported the event clearly and
-naturally. Do not write an evidence checklist, a source summary, an AI explanation,
-or a sequence of paraphrases.
+HARD FACTUAL LOCK:
+- Use ONLY the LOCKED FACTS below.
+- Do not invent or infer motives, causes, significance, implications, reactions,
+  predictions, background, names, dates, numbers, locations, roles or relationships.
+- Preserve reported/expected/proposed/planned/investigated certainty exactly.
+- Never infer winners or losers from score ordering.
+- Do not mention sources, evidence, publishers, this prompt, AI, or the writing process.
 
-==================== FACTUAL LOCK ====================
-LOCKED FACTS are the complete factual universe for this article.
-Use ONLY information contained in these facts.
+NEWSROOM STYLE:
+- Lead with the actual concrete event.
+- Develop the story using distinct locked facts and useful details.
+- Every substantive sentence must add information; never repeat a fact merely with synonyms.
+- Do not pad, compress away useful factual detail, or manufacture context.
+- No generic filler about importance, impact, significance, attention or expectations.
+- Supporting facts are usable information and should be included when they add distinct value.
+- Keep the article coherent and naturally structured.
+- No word-count target or minimum length.
 
-Never invent or infer:
-- motives, causes, significance, implications, reactions, predictions or background;
-- dates, numbers, names, locations, roles or relationships not present in the facts;
-- winners or losers from score ordering;
-- details that are merely plausible or normally associated with the event.
+COVERAGE:
+- Every locked fact must be explicitly communicated in the article body.
+- Attach fact_ids ONLY to paragraphs that genuinely communicate those facts.
+- Do not add an ID merely to satisfy coverage.
+- Before returning, silently verify every locked fact is covered and nothing unsupported was added.
 
-Preserve the certainty of the facts. If a fact says something was reported, expected,
-proposed, planned, believed, or under investigation, do not rewrite it as confirmed.
-=======================================================
+HEADLINE:
+- title and h1 must be identical.
+- Maximum 10 words and 65 characters.
+- Describe the actual reported event.
+- Description must summarize the news without merely repeating the headline.
 
-==================== NEWSROOM STYLE ====================
-1. Lead with the actual news.
-   The first sentence should tell the reader what happened, was announced, changed,
-   decided, recorded, or was otherwise concretely reported.
-
-2. Then develop the story.
-   Use the other distinct facts to answer the natural next questions a reader would
-   have: who was involved, what happened next, when/where it happened, what the
-   current status is, or what other directly reported detail matters.
-
-3. Make every sentence earn its place.
-   Each substantive sentence must add information that the reader did not already
-   receive. A sentence that merely restates the previous sentence must not be written.
-
-4. DEVELOP DISTINCT FACTS — DO NOT COMPRESS THE STORY.
-   When multiple distinct locked facts are available, give each fact clear factual expression.
-   Do not routinely pack several independent facts into one short sentence just to be concise.
-   Prefer a natural sequence of substantive sentences that lets the reader understand the event,
-   its concrete developments, the people/entities involved, timing, location, status, numbers,
-   and other verified details that are actually present in the locked evidence.
-   A four-fact evidence set should normally read as a developed short news story, not as three
-   compressed bullet-like statements. Do not add facts to achieve this; use the detail already
-   contained in the locked evidence and optional source context.
-   4A. COVERAGE DEPTH FOR RICH EVIDENCE.
-   When there are 4 or more distinct locked facts, do not default to a 2-3 sentence summary.
-   As a practical newsroom heuristic, a 4-fact story will usually need about 3-4 substantive
-   sentences, and a 5-6 fact story will usually need about 4-6 substantive sentences, unless
-   two facts genuinely belong together and can be communicated completely in one sentence.
-   This is NOT a word-count target, NOT a minimum word floor, and NOT a requirement to force
-   one sentence per fact. It is a safeguard against losing concrete information through
-   over-compression.
-
-   If several facts contain useful details such as different actions, people, locations, dates,
-   numbers, decisions, responses, or status changes, preserve those details in the prose.
-   Do not replace several concrete facts with one broad sentence that merely summarizes them.
-   Before returning the article, ask silently: "If I removed this sentence, would a distinct
-   locked fact or a materially useful detail disappear?" If yes, keep it. If no, remove it.
-
-
-5. Never convert one fact into several sentences merely for length.
-   Paraphrasing, re-labeling, repeating an attribution, or swapping synonyms does not
-   create new information.
-
-5. Prefer concrete nouns and verbs.
-   State the event directly. Avoid vague constructions such as "the development
-   highlights", "the move underscores", "the news marks a significant milestone",
-   "the event demonstrates", or "the announcement reflects" unless the locked facts
-   themselves contain that concrete claim and it genuinely adds information.
-
-6. No generic AI filler.
-   Do not use empty phrases about importance, significance, attention, impact,
-   excitement, interest, progress, or expectations unless they are themselves a
-   verified fact and materially useful to the reader.
-
-7. Do not manufacture context.
-   If the locked evidence does not explain why something matters, do not explain why
-   it matters. If it does not provide a consequence, do not invent one.
-
-8. Use natural paragraphs.
-   Group related facts together, but give distinct factual units clear expression. Use
-   separate sentences or paragraphs when that is the natural way to report different
-   facts. Do not split one fact merely to make the article longer.
-
-9. Be complete, not artificially brief.
-   There is NO target word count and NO minimum length. The absence of a word target does
-   NOT mean minimize the article. Write until all useful locked information has been
-   clearly reported. When several distinct facts are available, do not omit or over-compress
-   them merely to keep the article short. Preserve the factual detail already present in the
-   locked evidence and use it to produce a genuinely developed news story. Concision is good;
-   unexplained compression of several concrete facts into a few bare claims is not.
-
-   9A. DO NOT SAVE WORDS BY DELETING FACTUAL DETAIL.
-   Shorter is not automatically better. If the locked evidence contains a concrete detail that
-   materially improves the reader's understanding of the story, include it even when the main
-   event could technically be stated in fewer words. Do not use generic framing, source mentions,
-   or repeated attribution as substitutes for that detail.
-
-10. Supporting facts are real information.
-   Use a supporting fact when it adds a distinct useful detail. Do not discard verified
-   information simply because it is not CORE. Combine facts naturally where possible,
-   but do not turn multiple distinct facts into one vague sentence.
-
-11. Write as one coherent story.
-    Do not mention "the source", "the evidence", "the locked facts", "this article",
-    the writing process, or the instructions.
-
-12. SOURCE-DIGEST BAN — HARD WRITING RULE.
-    Never write a sentence whose purpose is to tell the reader where the information came from.
-    Never mention a publisher, news outlet, website, article, report, or publication merely as
-    provenance. Report the verified event directly.
-
-    NEVER write source-digest or source-listing sentences such as:
-    - "The news was first reported by X."
-    - "X first reported the development."
-    - "The report was published by X."
-    - "X also confirmed the story."
-    - "X reported the development in an article titled ..."
-    - "X and Y reported independently."
-    - "The report appeared on X."
-    These sentences are NOT news content and must not appear anywhere in the article.
-
-    NEVER end the article with a source-listing, publisher attribution, or provenance sentence.
-    The final paragraph must contain actual verified news information, not information about
-    who reported it.
-
-    Attribution is allowed only when the identity of the speaker, decision-maker, authority,
-    or other source actor is itself part of the news. In that case, state the substantive claim
-    directly (for example, who said or announced it), rather than describing the existence of
-    a publisher article.
-=========================================================
-
-==================== FACT COVERAGE ======================
-CORE FACT COVERAGE IS A HARD REQUIREMENT.
-Every CORE fact MUST be genuinely communicated in the article body. A fact is NOT covered
-merely because the article discusses the same general topic. Every CORE fact must appear
-as a distinct, meaningful factual statement, unless two facts can genuinely be communicated
-together without losing either fact. Never omit, merge away, or replace a CORE fact with a
-vague summary just to make the article shorter.
-
-Every distinct useful supporting factual unit should also be considered for inclusion; do
-not omit verified information merely because the article can be made shorter.
-
-Before returning JSON, silently enumerate every CORE fact ID and verify that the article body
-contains a meaningful statement for each one.
-
-The fact_ids field is an internal audit map. Assign an ID to a paragraph ONLY when
-that paragraph actually communicates that fact in its text. Do not use an ID merely
-to satisfy coverage.
-
-Multiple facts may be communicated naturally in one sentence or paragraph. Never
-create a separate sentence solely because a fact needs an ID.
-
-Before returning the article, perform an internal ALL-FACT checklist:
-- Identify every locked fact ID in the input, including CORE and SUPPORTING.
-- Verify that every locked fact is explicitly communicated in the article body, not merely
-  implied by the general topic.
-- If there are 7 locked facts, all 7 must appear as meaningful factual information.
-- Do not omit a supporting fact just because it is not CORE.
-- Attach each fact_id only to the paragraph that genuinely communicates that fact.
-- Then silently check that nothing was added beyond the locked facts, that each sentence
-  adds new information, and that no fact was repeated or paraphrased without new value.
-- Remove any generic sentence that does not carry a verified detail.
-=========================================================
-
-==================== HEADLINE / DESCRIPTION =============
-- TITLE and H1 must be identical.
-- Headline: maximum 10 words and 65 characters.
-- Headline must describe the actual reported event, not its supposed importance.
-- Description must summarize the article's actual news and must not simply repeat the
-  headline with minor word substitutions.
-- Do not put unsupported interpretation into the headline or description.
-=========================================================
-
-Return ONLY valid JSON in exactly this shape:
+Return ONLY this JSON:
 {{
   "title":"...",
   "description":"...",
   "h1":"...",
-  "paragraphs":[
-    {{"text":"...","fact_ids":["F1","F2"]}}
-  ]
+  "paragraphs":[{{"text":"...","fact_ids":["F1"]}}]
 }}
 
 LOCKED FACTS:
 {chr(10).join(fact_lines) or "No locked facts available."}
 {source_block}
 """
-
 
 def _normalize_generated_article(article, evidence):
     if not isinstance(article, dict):
@@ -1741,7 +1593,7 @@ def _generate_article(evidence, source_context=None):
     fact_count = len(evidence.get("facts", [])) if isinstance(evidence, dict) else 0
     # Give richer evidence enough JSON/prose capacity while keeping the CPU path
     # bounded. This is a token ceiling, not a content requirement.
-    dynamic_tokens = min(960, max(ARTICLE_TOKENS, 560 + fact_count * 55))
+    dynamic_tokens = min(460, max(ARTICLE_TOKENS, 340 + fact_count * 30))
     raw_article = _call(
         _article_prompt(evidence, source_context=source_context),
         temperature=0.08,
