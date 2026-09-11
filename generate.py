@@ -1829,9 +1829,10 @@ def validate_article(article):
 def _deterministic_temporal_event_guard(evidence, trend=None, reference_date=None):
     """Reject only a narrow, high-confidence temporal/event mismatch in locked CORE facts.
 
-    This is not a general factual audit. It fires only when the selected topic
-    explicitly names a year that conflicts materially with a CORE evidence year,
-    or when CORE evidence mixes the current run year with a materially older year.
+    This is not a general factual audit. It rejects materially stale CORE events:
+    an explicit topic-year conflict, a current-year CORE event mixed with a materially
+    older CORE event, or a CORE event whose explicit years are all materially older
+    than the current run year without a verified current-year development.
     SUPPORTING facts are ignored because they may legitimately provide historical
     context. No LLM call, inference, repair, or regeneration is performed.
     """
@@ -1896,6 +1897,30 @@ def _deterministic_temporal_event_guard(evidence, trend=None, reference_date=Non
                 "current_year": current_year,
                 "core_years": core_years,
                 "older_core_years": older_core_years,
+            }
+
+    # A fresh source is not enough to make an old event a current story.
+    # If every explicit CORE year is materially older than the run year, there
+    # is no verified current-year development in the locked CORE evidence.
+    # Supporting facts may still contain historical context; only CORE facts
+    # determine whether the concrete story itself is stale.
+    if current_year is not None and core_years:
+        materially_old_core_years = [
+            year for year in core_years if year <= current_year - 2
+        ]
+        if materially_old_core_years and current_year not in core_years:
+            print(
+                "[TEMPORAL/EVENT GUARD] REJECT | "
+                f"current_year={current_year} | core_years={core_years} | "
+                f"materially_old_core_years={materially_old_core_years} | "
+                "reason=historical CORE event without current-year development"
+            )
+            return {
+                "status": "REJECT",
+                "reason": "historical CORE event without current-year development",
+                "current_year": current_year,
+                "core_years": core_years,
+                "materially_old_core_years": materially_old_core_years,
             }
 
     print(
