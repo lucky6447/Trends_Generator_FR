@@ -136,8 +136,29 @@ The goal is complete, informative treatment of the useful verified evidence,
 not minimum length and not maximum length.
 
 ============================================================
-4. FACT COVERAGE WITHOUT REPETITION
+4. FACT COVERAGE — ALL LOCKED FACTS ARE MANDATORY
 ============================================================
+
+HARD REQUIREMENT — EVERY LOCKED FACT MUST BE DEVELOPED:
+
+- Every locked fact supplied in the evidence is mandatory article content.
+- You MUST develop EVERY locked fact that belongs to the selected story.
+- Do NOT omit a locked fact because it is classified as SUPPORTING.
+- Do NOT treat SUPPORTING facts as optional.
+- Every locked fact must be substantively communicated in the article body.
+- A vague reference, brief mention, partial clause, or generic wording does NOT
+  count as substantive coverage.
+- When a locked fact contains concrete details such as a person, organisation,
+  action, date, number, price, location, status, result, quote, or other material
+  detail, preserve and communicate those details when explicitly supported.
+- You may combine closely related locked facts in the same sentence or paragraph,
+  but the distinct information contained in each fact must still be communicated.
+- Do NOT attach a fact_id merely to make it appear covered. The text associated
+  with that fact_id must actually communicate the substance of the fact.
+- Before returning JSON, silently check every locked fact individually and confirm
+  that its substantive information is present in the article.
+- If even ONE locked fact has not been substantively developed, the article is
+  incomplete and MUST NOT be returned as a publishable article.
 
 A fact stated once is DONE.
 
@@ -316,9 +337,14 @@ Before returning the JSON, silently check:
 8. Are useful, distinct primary-story facts unnecessarily omitted?
 9. Did I give important verified developments enough explicit detail rather than
    merely mentioning them?
-10. If no useful fact remains, did I stop instead of padding?
-11. Do title and H1 match and satisfy both headline limits?
-12. Does the article read like normal newsroom copy?
+10. Did I substantively develop EVERY locked fact, including every SUPPORTING fact?
+11. Does every fact_id correspond to text that actually communicates that fact's
+    substance rather than a superficial mention?
+12. If even one locked fact is missing or only superficially mentioned, is the
+    article treated as incomplete rather than publishable?
+13. If no useful fact remains, did I stop instead of padding?
+14. Do title and H1 match and satisfy both headline limits?
+15. Does the article read like normal newsroom copy?
 
 Return ONLY valid JSON in exactly this structure:
 

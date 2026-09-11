@@ -310,6 +310,42 @@ def _sports_source_in_item(item):
     )
 
 
+LOCAL_NEWS_TOPIC_PATTERNS = (
+    r"\blocal news\b", r"\blocal news update\b", r"\blocal headlines?\b",
+    r"\blocal stories\b", r"\blocal report\b", r"\blocal reports\b",
+    r"\blocal police\b", r"\blocal politics\b", r"\blocal government\b",
+    r"\blocal council\b", r"\bcity council\b", r"\btown council\b",
+    r"\bmunicipal news\b", r"\bmunicipal government\b",
+    r"\bmunicipal council\b", r"\bdistrict council\b",
+    r"\bregional news\b", r"\bregional headlines?\b", r"\bregional update\b",
+    r"\bcommunity news\b", r"\bcommunity update\b",
+    r"\bactualidad local\b", r"\bnoticias locales?\b",
+    r"\bnachrichten aus der region\b", r"\blokalnachrichten\b",
+    r"\bnotizie locali\b", r"\bactualités locales?\b",
+)
+
+def _is_local_news_topic(title, news=None):
+    """Return True for explicit local/regional-news topics."""
+    text = " ".join(str(title or "").split()).casefold()
+    if any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in LOCAL_NEWS_TOPIC_PATTERNS):
+        return True
+
+    # Only use an explicit local/regional signal from source metadata/headlines.
+    # A normal national/international story mentioning a city must not be rejected.
+    for item in (news or ()):
+        if not isinstance(item, dict):
+            continue
+        item_text = " ".join(
+            str(item.get(key, "") or "")
+            for key in ("title", "summary", "source")
+        ).casefold()
+        if any(re.search(pattern, item_text, flags=re.IGNORECASE)
+               for pattern in LOCAL_NEWS_TOPIC_PATTERNS):
+            return True
+
+    return False
+
+
 def _is_sports_topic(title, news=None):
     """
     Return True only for a strong sports signal.
@@ -1760,14 +1796,12 @@ def _headline_violations(article, trend):
 
 
 def enforce_headline_policy(article, trend):
-    """Deterministic headline policy only; never call the LLM for repair."""
-    title = str(article.get("title", "")).strip()
-    h1 = str(article.get("h1", "")).strip()
-    if not title or title != h1:
-        raise ValueError("Headline policy failed: title and H1 must be identical and non-empty.")
-    words = title.split()
-    if len(words) > 10 or len(title) > 65:
-        raise ValueError("Headline policy failed: title exceeds 10 words or 65 characters.")
+    """Deterministic headline gate; never call the LLM for repair."""
+    violations = _headline_violations(article, trend)
+    if violations:
+        raise ValueError(
+            "Headline policy failed: " + "; ".join(violations)
+        )
     return article
 
 def validate_article(article):
@@ -2326,131 +2360,115 @@ _FACT_GUARD_STOPWORDS = {
 }
 
 def _measure_fact_expression(article, generation_evidence):
-    """Measure fact expression without a second LLM call.
+    """Deterministically verify substantive support for every declared locked fact.
 
-    The newsroom writer already emits fact_ids per paragraph and
-    _normalize_generated_article validates every ID against the locked evidence
-    and requires every CORE fact to be covered. Reuse that validated coverage
-    map as the authoritative expression result. A lightweight lexical sanity
-    check is retained only as a diagnostic signal; it never triggers another
-    inference call.
+    fact_ids are provenance metadata, not proof of coverage. Each locked fact must
+    have at least one paragraph containing meaningful lexical support from the
+    locked fact/excerpt. This gate is fail-closed and never calls or retries Ollama.
     """
     facts = generation_evidence.get("facts", []) if isinstance(generation_evidence, dict) else []
-    facts = [
-        fact for fact in facts
-        if isinstance(fact, dict)
-        and str(fact.get("id", "")).strip()
-        and str(fact.get("fact", "")).strip()
-    ]
-    if not facts:
-        return {
-            "status": "UNAVAILABLE",
-            "method": "none",
-            "locked_facts": 0,
-            "expressed_facts": 0,
-            "coverage": None,
-            "information_density": None,
-            "expressed_fact_ids": [],
-            "core_facts": 0,
-            "expressed_core_facts": 0,
-            "core_coverage": None,
-            "supporting_facts": 0,
-            "expressed_supporting_facts": 0,
-            "supporting_coverage": None,
-            "article_words": 0,
-        }
-
+    facts = [f for f in facts if isinstance(f, dict) and str(f.get("id", "")).strip() and str(f.get("fact", "")).strip()]
     paragraphs = article.get("paragraphs", []) if isinstance(article, dict) else []
-    article_text = " ".join(str(p).strip() for p in paragraphs if str(p).strip()).strip()
+    paragraphs = [str(p).strip() for p in paragraphs if str(p).strip()]
+    article_text = " ".join(paragraphs).strip()
     article_words = len(article_text.split())
-    if not article_text:
+
+    if not facts or not paragraphs:
         return {
-            "status": "UNAVAILABLE",
-            "method": "validated_fact_ids",
-            "locked_facts": len(facts),
-            "expressed_facts": 0,
-            "coverage": None,
-            "information_density": None,
-            "expressed_fact_ids": [],
+            "status": "UNAVAILABLE", "method": "substantive_lexical_fact_support",
+            "locked_facts": len(facts), "expressed_facts": 0, "coverage": None,
+            "information_density": None, "expressed_fact_ids": [],
             "core_facts": len(generation_evidence.get("core_fact_ids", []) or []),
-            "expressed_core_facts": 0,
-            "core_coverage": None,
+            "expressed_core_facts": 0, "core_coverage": None,
             "supporting_facts": len(generation_evidence.get("supporting_fact_ids", []) or []),
-            "expressed_supporting_facts": 0,
-            "supporting_coverage": None,
-            "article_words": 0,
+            "expressed_supporting_facts": 0, "supporting_coverage": None,
+            "article_words": article_words,
+            "unsupported_fact_ids": [str(f.get("id", "")).strip() for f in facts],
         }
 
-    valid_ids = {str(fact["id"]).strip() for fact in facts}
-    declared_ids = article.get("_declared_fact_ids", [])
-    if not isinstance(declared_ids, list):
-        declared_ids = []
+    import re
+    stopwords = {
+        "the","and","for","with","from","that","this","was","were","has","have","had",
+        "are","is","its","into","after","before","over","under","about","than","then",
+        "they","their","them","there","which","while","also","been","being","will","would",
+        "could","should","said","says","according","official","officials","new","latest","news",
+        "story","article","reported","reportedly","report","reports",
+    }
 
+    def tokens(text):
+        return {t.casefold() for t in re.findall(r"[\w’'-]+", str(text or ""), flags=re.UNICODE)
+                if len(t) > 2 and t.casefold() not in stopwords}
+
+    def numbers(text):
+        return set(re.findall(r"\b\d+(?:[.,:/-]\d+)*%?\b", str(text or "")))
+
+    paragraph_tokens = [tokens(p) for p in paragraphs]
+    paragraph_numbers = [numbers(p) for p in paragraphs]
     expressed_ids = []
-    for value in declared_ids:
-        fid = str(value).strip()
-        if fid in valid_ids and fid not in expressed_ids:
+    support_debug = {}
+
+    for fact in facts:
+        fid = str(fact["id"]).strip()
+        fact_text = str(fact.get("fact", "")).strip()
+        excerpt = str(fact.get("excerpt", "")).strip()
+        reference_tokens = tokens(fact_text) | tokens(excerpt)
+        fact_numbers = numbers(fact_text) | numbers(excerpt)
+        best = (0.0, 0, 0, None)
+
+        for idx, p_tokens in enumerate(paragraph_tokens):
+            if not p_tokens or not reference_tokens:
+                continue
+            overlap = len(p_tokens & reference_tokens)
+            score = overlap / max(1, min(len(reference_tokens), 12))
+            number_hits = len(fact_numbers & paragraph_numbers[idx])
+            if fact_numbers and number_hits:
+                score = max(score, min(1.0, 0.45 + 0.10 * number_hits))
+            candidate = (score, overlap, number_hits, idx + 1)
+            if candidate[:3] > best[:3]:
+                best = candidate
+
+        score, overlap, number_hits, paragraph = best
+        fact_word_count = len(tokens(fact_text))
+        if fact_word_count <= 4:
+            supported = overlap >= 2 or number_hits >= 1
+        else:
+            supported = overlap >= 3 and score >= 0.25
+
+        support_debug[fid] = {
+            "paragraph": paragraph, "score": round(score, 3),
+            "overlap": overlap, "number_hits": number_hits,
+            "supported": supported,
+        }
+        if supported:
             expressed_ids.append(fid)
 
-    # The normalizer guarantees all CORE IDs are declared/covered before this
-    # function runs. If the private coverage map is absent, fail closed rather
-    # than silently substituting an unverified LLM judgment.
-    if not declared_ids:
-        return {
-            "status": "UNAVAILABLE",
-            "method": "validated_fact_ids",
-            "locked_facts": len(facts),
-            "expressed_facts": 0,
-            "coverage": None,
-            "information_density": None,
-            "expressed_fact_ids": [],
-            "core_facts": len(generation_evidence.get("core_fact_ids", []) or []),
-            "expressed_core_facts": 0,
-            "core_coverage": None,
-            "supporting_facts": len(generation_evidence.get("supporting_fact_ids", []) or []),
-            "expressed_supporting_facts": 0,
-            "supporting_coverage": None,
-            "article_words": article_words,
-        }
-
-    locked_count = len(facts)
-    expressed_count = len(expressed_ids)
-    coverage = expressed_count / locked_count if locked_count else None
-    density = (expressed_count / article_words * 100) if article_words else None
-
-    core_ids = {
-        str(value).strip()
-        for value in (generation_evidence.get("core_fact_ids", []) or [])
-    }
-    supporting_ids = {
-        str(value).strip()
-        for value in (generation_evidence.get("supporting_fact_ids", []) or [])
-    }
+    valid_ids = {str(f["id"]).strip() for f in facts}
+    expressed_ids = [fid for fid in expressed_ids if fid in valid_ids]
     expressed_set = set(expressed_ids)
+    core_ids = {str(v).strip() for v in (generation_evidence.get("core_fact_ids", []) or [])}
+    supporting_ids = {str(v).strip() for v in (generation_evidence.get("supporting_fact_ids", []) or [])}
     expressed_core = len(core_ids & expressed_set)
     expressed_supporting = len(supporting_ids & expressed_set)
+    coverage = len(expressed_ids) / len(facts) if facts else None
 
     print(
-        f"[FACT EXPRESSION] validated fact_ids | locked={locked_count} | "
-        f"expressed={expressed_count} | coverage={coverage:.3f} | "
+        f"[FACT EXPRESSION] substantive lexical support | locked={len(facts)} | "
+        f"expressed={len(expressed_ids)} | coverage={coverage:.3f} | "
         f"core_coverage={expressed_core / len(core_ids) if core_ids else None!r}"
     )
-
     return {
-        "status": "PASS",
-        "method": "validated_fact_ids",
-        "locked_facts": locked_count,
-        "expressed_facts": expressed_count,
+        "status": "PASS", "method": "substantive_lexical_fact_support",
+        "locked_facts": len(facts), "expressed_facts": len(expressed_ids),
         "coverage": coverage,
-        "information_density": density,
+        "information_density": (len(expressed_ids) / article_words * 100) if article_words else None,
         "expressed_fact_ids": expressed_ids,
-        "core_facts": len(core_ids),
-        "expressed_core_facts": expressed_core,
+        "core_facts": len(core_ids), "expressed_core_facts": expressed_core,
         "core_coverage": expressed_core / len(core_ids) if core_ids else None,
-        "supporting_facts": len(supporting_ids),
-        "expressed_supporting_facts": expressed_supporting,
+        "supporting_facts": len(supporting_ids), "expressed_supporting_facts": expressed_supporting,
         "supporting_coverage": expressed_supporting / len(supporting_ids) if supporting_ids else None,
         "article_words": article_words,
+        "unsupported_fact_ids": [fid for fid in valid_ids if fid not in expressed_set],
+        "support_debug": support_debug,
     }
 
 def generate_valid_article(prompt=None, reference_date=None, trend=None, prelocked_evidence=None):
@@ -2478,41 +2496,31 @@ def generate_valid_article(prompt=None, reference_date=None, trend=None, prelock
         fact_expression = _measure_fact_expression(article, generation_evidence)
         # The validated coverage map is internal-only and must never reach rendering.
         article.pop("_declared_fact_ids", None)
-        # Core evidence facts are mandatory for publication. Supporting facts are
-        # measured for observability but are not individually mandatory. This is
-        # deliberately not a word floor: article length remains evidence-driven.
+        # Every locked evidence fact is mandatory for publication.
+        # This is deliberately not a word floor: article length remains evidence-driven.
         if fact_expression.get("status") == "PASS":
-            core_facts = int(fact_expression.get("core_facts") or 0)
+            coverage = fact_expression.get("coverage")
             core_coverage = fact_expression.get("core_coverage")
             supporting_coverage = fact_expression.get("supporting_coverage")
             locked_facts = int(fact_expression.get("locked_facts") or 0)
 
-            # Fail closed if locked evidence exists but core classification is absent.
-            # This prevents incomplete/legacy evidence from bypassing the factuality guard.
-            if locked_facts > 0 and core_facts == 0:
+            # Every locked fact must be explicitly expressed by the generated article.
+            # Supporting facts are no longer diagnostic-only.
+            if locked_facts > 0 and (coverage is None or coverage < 1.0):
                 print(
                     "[FACT CONSISTENCY GUARD] FAIL | "
-                    "core_fact_ids unavailable for locked evidence"
-                )
-                raise Exception(
-                    "Core evidence classification unavailable; publication blocked."
-                )
-
-            # Every core fact must be explicitly expressed. Supporting facts remain
-            # diagnostic only and therefore cannot cause publication rejection.
-            if core_coverage is None or core_coverage < 1.0:
-                print(
-                    "[FACT CONSISTENCY GUARD] FAIL | "
+                    f"coverage={coverage!r} | "
+                    f"expressed_facts={fact_expression.get('expressed_facts')} | "
+                    f"locked_facts={locked_facts} | "
                     f"core_coverage={core_coverage!r} | "
-                    f"expressed_core_facts={fact_expression.get('expressed_core_facts')} | "
-                    f"core_facts={core_facts} | "
                     f"supporting_coverage={supporting_coverage!r}"
                 )
-                raise Exception("Article omitted one or more core evidence facts.")
+                raise Exception("Article omitted one or more locked evidence facts.")
 
             print(
                 "[FACT CONSISTENCY GUARD] PASS | "
-                f"core_coverage={core_coverage:.3f} | "
+                f"coverage={coverage!r} | "
+                f"core_coverage={core_coverage!r} | "
                 f"supporting_coverage={supporting_coverage!r}"
             )
         else:
@@ -2725,10 +2733,13 @@ def main():
 
         keyword = trend["title"]
 
-        # Cheap deterministic sports exclusion MUST happen before any news
-        # retrieval. Sports-only trends must not consume RSS/network capacity.
+        # Cheap deterministic sports/local-news exclusion MUST happen before any news
+        # retrieval. Excluded topic types must not consume RSS/network capacity.
         if _is_sports_topic(keyword):
             print(f"[TrendCurrent] SKIP sports topic: {keyword}")
+            continue
+        if _is_local_news_topic(keyword):
+            print(f"[TrendCurrent] SKIP local-news topic: {keyword}")
             continue
 
         try:
@@ -2844,6 +2855,9 @@ def main():
 
             if _is_sports_topic(keyword, news):
                 print(f"[TrendCurrent] SKIP sports topic after relevance: {keyword}")
+                continue
+            if _is_local_news_topic(keyword, news):
+                print(f"[TrendCurrent] SKIP local-news topic after relevance: {keyword}")
                 continue
 
             story_candidates = _discover_concrete_story_candidates(news, keyword)
@@ -3151,7 +3165,26 @@ def main():
                         supporting_coverage=fact_expression.get("supporting_coverage"),
                     )
 
-                    slug = slugify(keyword)
+                    base_slug = slugify(keyword)
+                    if not base_slug:
+                        raise ValueError("Article slug is empty after normalization.")
+
+                    # One trend may legitimately yield multiple concrete stories.
+                    # Never let a later story overwrite the earlier story's HTML.
+                    # Keep the first story's normal SEO slug and suffix subsequent
+                    # candidates deterministically. If a suffixed slug already exists,
+                    # advance until the filesystem path is unused.
+                    story_number = int(trend.get("_story_number", 1) or 1)
+                    story_count = int(trend.get("_story_candidate_count", 1) or 1)
+                    slug = base_slug if story_count <= 1 and story_number <= 1 else f"{base_slug}-story-{story_number}"
+                    slug_path = TREND_DIR / f"{slug}.html"
+                    suffix = 2
+                    while slug_path.exists():
+                        slug = f"{base_slug}-story-{story_number}-{suffix}"
+                        slug_path = TREND_DIR / f"{slug}.html"
+                        suffix += 1
+                        if suffix > 1000:
+                            raise ValueError("Unable to allocate a unique article slug.")
                     article["slug"] = slug
 
                     # Images are presentation metadata, not discovery/evidence data.

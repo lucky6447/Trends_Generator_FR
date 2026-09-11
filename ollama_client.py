@@ -1669,20 +1669,34 @@ HARD FACTUAL LOCK:
 NEWSROOM STYLE:
 - Lead with the actual concrete event.
 - Develop the story using distinct locked facts and useful details.
-- When several distinct developments belong to the same story, give each important
-  development enough precise sentence-level treatment to be genuinely informative;
-  do not merely mention each fact in passing.
-- Do not compress a rich evidence set into one short sentence per fact simply to be brief.
+- Develop every distinct locked fact that materially contributes to the story with
+  enough precise sentence-level treatment to be genuinely informative; do not omit
+  a locked fact merely because it is classified as SUPPORTING.
+- A fact is covered only when the reader receives the actual substance of that
+  development, including the concrete action, result, timing, person/entity, or other
+  essential detail contained in the locked fact. Preserve useful detail from the fact
+  instead of reducing it to a bare statement.
+- Do not compress multiple distinct locked facts into a sequence of very short
+  sentences just to finish quickly. Let each distinct development have the space
+  needed to explain what happened clearly, while combining closely related facts
+  naturally when that improves readability.
+- Coverage is not a checklist exercise: fact_ids record which facts a paragraph
+  genuinely communicates, but attaching an ID does not make a thin mention sufficient.
 - Every substantive sentence must add information; never repeat a fact merely with synonyms.
 - Do not pad, manufacture context, or add unsupported detail.
 - No generic filler about importance, impact, significance, attention or expectations.
-- Supporting facts are optional. Include them when they materially improve the reader's understanding, but do not force background details into the article.
+- Every locked fact must be developed. Closely related locked facts may be combined
+  naturally in the same sentence or paragraph, but none may be omitted merely because
+  it is classified as SUPPORTING or because it is inconvenient to fit into the prose.
 - Keep the article coherent and naturally structured.
-- No word-count target or minimum length.
+- No word-count target or minimum length; natural development of all distinct locked
+  facts takes priority over arbitrary brevity, but do not add unsupported or repetitive text.
 
 COVERAGE:
-- Every CORE fact must be explicitly communicated in the article body.
-- SUPPORTING facts may be omitted when they are background rather than necessary to understand the concrete development.
+- Every locked fact must be explicitly communicated in the article body.
+- Do NOT omit any locked fact. SUPPORTING facts are mandatory, not optional.
+- Closely related facts may be combined naturally, but every locked fact's distinct
+  substantive information must still be communicated.
 - Attach fact_ids ONLY to paragraphs that genuinely communicate those facts.
 - Do not add an ID merely to satisfy coverage.
 - Before returning, silently verify every locked fact is covered and nothing unsupported was added.
@@ -1720,8 +1734,9 @@ def _normalize_generated_article(article, evidence):
     if not isinstance(raw_paragraphs, list) or not raw_paragraphs:
         raise ValueError("Article generator returned no paragraphs.")
 
-    # Every locked fact ID is valid paragraph metadata. CORE facts are the
-    # mandatory coverage universe; SUPPORTING facts are optional context.
+    # Every locked fact ID is valid paragraph metadata. All locked facts are
+    # mandatory coverage; the writer must substantively develop every distinct
+    # usable fact rather than dropping supporting information by default.
     all_fact_ids = {
         str(f.get("id", "")).strip()
         for f in (evidence.get("facts", []) if isinstance(evidence, dict) else [])
@@ -1732,16 +1747,9 @@ def _normalize_generated_article(article, evidence):
         if isinstance(evidence, dict)
         else set()
     )
-    supporting_fact_ids = (
-        set(evidence.get("supporting_fact_ids", []))
-        if isinstance(evidence, dict)
-        else set()
-    )
     valid_fact_ids = all_fact_ids
-    # Core facts define the mandatory factual spine. Supporting facts remain
-    # available to the writer but are optional, matching generate.py's publication
-    # guard and preventing background context from causing false coverage rejects.
-    required_fact_ids = core_fact_ids or all_fact_ids
+    # Every locked fact is part of the required factual coverage universe.
+    required_fact_ids = all_fact_ids
     covered = set()
     paragraphs = []
 
@@ -1765,7 +1773,8 @@ def _normalize_generated_article(article, evidence):
             raise ValueError(f"Paragraph {index} has no fact coverage metadata.")
         paragraphs.append(text)
 
-    # CORE facts are mandatory for coverage. SUPPORTING facts are optional.
+    # All locked facts are mandatory for coverage. Closely related facts may be
+    # naturally combined in the same paragraph and fact_ids can be attached together.
     missing = sorted(
         required_fact_ids - covered,
         key=lambda x: int(x[1:]) if x[1:].isdigit() else 999999,

@@ -1,0 +1,53 @@
+{
+  "topic_title": "11-Septembre : les images des commémorations américaines",
+  "evidence_lock": {
+    "primary_group": "G1",
+    "facts": [
+      {
+        "id": "F1",
+        "group": "G1",
+        "fact": "Les États-Unis ont commémoré le 25ᵉ anniversaire des attentats du 11-Septembre avec une cérémonie centrale à New York, incluant la lecture des noms des près de 3 000 victimes à Ground Zero.",
+        "excerpt": "A \"Ground Zero\", site des anciennes tours jumelles du World Trade Center, les proches des victimes ont procédé toute la matinée à la longue et solennelle lecture des noms des près de 3.000 morts, dans un quartier sud de Manhattan bouclé pour l'occasion.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core"
+      },
+      {
+        "id": "F2",
+        "group": "G1",
+        "fact": "Donald Trump a assisté à une cérémonie au Pentagone plutôt qu'à celle de New York pour les commémorations du 11-Septembre.",
+        "excerpt": "Donald Trump a fait le choix d'assister à une autre cérémonie au Pentagone, quartier général du ministère de la Défense, également ciblé ce jour-là par un avion détourné par des pirates de l'air de l'organisation jihadiste Al-Qaïda.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core"
+      },
+      {
+        "id": "F3",
+        "group": "G1",
+        "fact": "The city allegedly concealed information about air toxicity following the 9/11 attacks.",
+        "excerpt": "Cette semaine, il a par ailleurs annoncé la publication de dizaines de milliers de documents révélant, selon lui, des dissimulations de la ville sur la toxicité de l'air après les attaques contre le World Trade Center.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core"
+      }
+    ],
+    "core_fact_ids": [
+      "F1",
+      "F2",
+      "F3"
+    ],
+    "supporting_fact_ids": [],
+    "fact_lineage": {
+      "raw_facts": 3,
+      "unique_information_units": 3,
+      "merged_facts": 0,
+      "merge_pairs": [],
+      "candidate_pairs": 0
+    }
+  },
+  "created_at": 1789150201.1342788,
+  "pid": 10396
+}
