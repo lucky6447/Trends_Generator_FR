@@ -1,0 +1,53 @@
+{
+  "topic_title": "Carte blanche d’Adèle Haenel : vives réactions après la suppression d’un replay de « La Grande Librairie »",
+  "evidence_lock": {
+    "primary_group": "G1",
+    "facts": [
+      {
+        "id": "F1",
+        "group": "G1",
+        "fact": "L’actrice de 37 ans a critiqué sur Instagram la suppression du replay de son intervention par France Télévisions.",
+        "excerpt": "L’actrice de 37 ans a estimé sur Instagram qu’en supprimant le replay de son intervention, France Télévisions fait « la démonstration parfaite de la pertinence des propos qui consistaient à dire qu’en fait il y a certains mots, certaines réalités, que tout le monde sait et qui ne doivent surtout pas être dites ».",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core"
+      },
+      {
+        "id": "F2",
+        "group": "G1",
+        "fact": "Elle affirme que cette suppression prouve la justesse de ses propos selon lesquels certains mots ou réalités, connus de tous, ne doivent pas être exprimés.",
+        "excerpt": "L’actrice de 37 ans a estimé sur Instagram qu’en supprimant le replay de son intervention, France Télévisions fait « la démonstration parfaite de la pertinence des propos qui consistaient à dire qu’en fait il y a certains mots, certaines réalités, que tout le monde sait et qui ne doivent surtout pas être dites ».",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core"
+      },
+      {
+        "id": "F3",
+        "group": "G1",
+        "fact": "Adèle Haenel published a *carte blanche* in *Le Monde* titled *‘Carte blanche d’Adèle Haenel : vives réactions après la suppression d’un replay de « La Grande Librairie »’*.",
+        "excerpt": "Carte blanche d’Adèle Haenel : vives réactions après la suppression d’un replay de « La Grande Librairie » Le Monde.fr\nCarte blanche d’Adèle Haenel : vives réactions après la suppression d’un replay de « La Grande Librairie » Le Monde.fr Carte blanche d’Adèle Haenel : vives réactions après la suppression d’un replay de « La Grande Librairie » Le Monde.fr",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core"
+      }
+    ],
+    "core_fact_ids": [
+      "F1",
+      "F2",
+      "F3"
+    ],
+    "supporting_fact_ids": [],
+    "fact_lineage": {
+      "raw_facts": 3,
+      "unique_information_units": 3,
+      "merged_facts": 0,
+      "merge_pairs": [],
+      "candidate_pairs": 0
+    }
+  },
+  "created_at": 1789158312.1763868,
+  "pid": 15644
+}
