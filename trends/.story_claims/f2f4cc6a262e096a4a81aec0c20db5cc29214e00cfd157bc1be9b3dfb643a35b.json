@@ -1,0 +1,53 @@
+{
+  "topic_title": "Les terroristes du 11 septembre pas dans les avions ? Attention à cette intox",
+  "evidence_lock": {
+    "primary_group": "G1",
+    "facts": [
+      {
+        "id": "F1",
+        "group": "G1",
+        "fact": "Theories persist 25 years later questioning the terrorist nature of the 9/11 attacks.",
+        "excerpt": "Publié le : 25 ans après, certaines théories continuent de remettre en cause le caractère terroriste des attentats du 11 septembre 2001.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core"
+      },
+      {
+        "id": "F2",
+        "group": "G1",
+        "fact": "One claim is that the attackers' names were not on passenger lists of the flights.",
+        "excerpt": "Pour preuve, elles avancent que les noms des auteurs des attentats n'étaient pas inscrits sur les listes des passagers des vols.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core"
+      },
+      {
+        "id": "F3",
+        "group": "G1",
+        "fact": "The documents cited are actually victim lists from the attacks, with hijacker names intentionally removed.",
+        "excerpt": "C'est faux : les documents en question sont en réalité des listes de victimes des attentats, desquelles les noms des pirates de l'air ont été volontairement exclus.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core"
+      }
+    ],
+    "core_fact_ids": [
+      "F1",
+      "F2",
+      "F3"
+    ],
+    "supporting_fact_ids": [],
+    "fact_lineage": {
+      "raw_facts": 3,
+      "unique_information_units": 3,
+      "merged_facts": 0,
+      "merge_pairs": [],
+      "candidate_pairs": 0
+    }
+  },
+  "created_at": 1789163330.4495394,
+  "pid": 10904
+}
