@@ -23,7 +23,6 @@ from config import MAX_ARTICLES_PER_RUN, LANGUAGE, SOURCE_FIRST, TREND_DIR, RUN_
 from rss import fetch_trends
 from rss_source_discovery import fetch_source_stories
 from news import fetch_news, fetch_news_discovery, hydrate_story_sources, hydrate_news_items
-from prompt import build_prompt
 from ollama_client import generate, extract_evidence, validate_article_structure, substantive_story_value_gate
 from ollama import chat
 from config import MODEL
@@ -1154,6 +1153,52 @@ def _discover_concrete_story_candidates(news, topic):
         )
     return candidates
 
+def _is_non_story_discovery_seed(trend):
+    """Reject obvious roundup/bulletin/headline-format seeds before corroboration.
+
+    This is a narrow discovery-quality guard. It does NOT judge whether a story is
+    important, popular, or factual; it only removes publisher feed entries that are
+    clearly containers for multiple stories rather than one concrete event. Such
+    seeds should never consume corroboration, hydration, evidence extraction, or
+    Ollama time.
+    """
+    if not isinstance(trend, dict):
+        return False, "invalid seed"
+
+    title = re.sub(r"\s+", " ", str(trend.get("title", "") or "")).strip().casefold()
+    if not title:
+        return True, "empty title"
+
+    # Deliberately narrow: only unmistakable multi-story/bulletin formats.
+    non_story_patterns = (
+        r"\blatest news headlines?\b",
+        r"\btoday(?:'s|s)? headlines?\b",
+        r"\btop headlines?\b",
+        r"\bheadlines? from .*\bat \d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b",
+        r"\b(?:morning|midday|afternoon|evening|night) headlines?\b",
+        r"\bnews roundup\b",
+        r"\broundup of (?:the )?(?:latest )?news\b",
+        r"\b(?:daily|morning|evening|night) news briefing\b",
+        r"\bnews briefing\b",
+        r"\btop stories (?:today|tonight)\b",
+        r"\bnews(?:cast| bulletin)\b.*\bat \d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b",
+    )
+    for pattern in non_story_patterns:
+        if re.search(pattern, title, flags=re.IGNORECASE):
+            return True, "non-story roundup/bulletin format"
+
+    # A very explicit headline-list construction is also safe to reject when it
+    # names a broadcast time. This catches publisher variants not covered above.
+    if "headlines" in title and re.search(
+        r"\b(?:at|@)\s*\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b",
+        title,
+        flags=re.IGNORECASE,
+    ):
+        return True, "timed headline bulletin"
+
+    return False, ""
+
+
 def _deterministic_production_reservoir(trends, processed):
     """Return every deterministic-eligible trend without ranking or scoring."""
     processed_norm = {_norm(x) for x in processed}
@@ -1166,6 +1211,13 @@ def _deterministic_production_reservoir(trends, processed):
 
         title = _clean(trend.get("title"))
         if not title:
+            continue
+
+        non_story, reject_reason = _is_non_story_discovery_seed(trend)
+        if non_story:
+            print(
+                f"[STORY DISCOVERY] SKIP non-story seed | reason={reject_reason} | title={title}"
+            )
             continue
 
         norm_title = _norm(title)
@@ -1247,7 +1299,7 @@ def _build_trend_discovery_queries(trend, keyword, max_queries=3):
 
 
 def _build_evidence_source(news, story_selection):
-    """Build evidence input from the exact source selection already made upstream."""
+    """Build the canonical structured evidence source from the exact selected sources."""
     items = list(news or [])
     selection = story_selection or {}
     indices = list(selection.get("selected_indices") or [])
@@ -1274,27 +1326,9 @@ def _build_evidence_source(news, story_selection):
             "content": evidence_text[:5000],
         })
 
-    return "\n".join([
-        "SOURCE MATERIAL:",
-        *[
-            "\n".join([
-                f"SOURCE S{i}",
-                f"ARTICLE {i}",
-                f"Title: {item['title']}",
-                f"Source: {item['source']}",
-                f"Published: {item['published']}",
-                "",
-                "Summary:",
-                item["summary"],
-                "",
-                "Full Article:",
-                item["content"],
-                "---",
-            ])
-            for i, item in enumerate(compact_sources, 1)
-        ],
-    ])
-
+    # Keep the source structured until ollama_client builds the single canonical
+    # sentence index. This removes dict -> large string -> chunks -> re-index churn.
+    return {"articles": compact_sources}
 
 def _selected_story_news(news, story_selection):
     """Return exactly the sources selected by Story Source Decision."""
@@ -1758,6 +1792,86 @@ def validate_article(article):
 
 
 # ============================================================
+def _deterministic_temporal_event_guard(evidence, trend=None, reference_date=None):
+    """Reject only a narrow, high-confidence temporal/event mismatch in locked CORE facts.
+
+    This is not a general factual audit. It fires only when the selected topic
+    explicitly names a year that conflicts materially with a CORE evidence year,
+    or when CORE evidence mixes the current run year with a materially older year.
+    SUPPORTING facts are ignored because they may legitimately provide historical
+    context. No LLM call, inference, repair, or regeneration is performed.
+    """
+    if not isinstance(evidence, dict):
+        raise ValueError("Temporal/event guard requires an evidence object.")
+
+    facts = evidence.get("facts", [])
+    if not isinstance(facts, list) or not facts:
+        return {"status": "PASS", "checked": False, "reason": "no locked facts"}
+
+    year_re = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
+    core_facts = []
+    for item in facts:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role", "")).strip().casefold() != "core":
+            continue
+        fact_text = str(item.get("fact", "") or "").strip()
+        years = sorted({int(y) for y in year_re.findall(fact_text)})
+        if years:
+            core_facts.append({"id": str(item.get("id", "")), "fact": fact_text, "years": years})
+
+    if not core_facts:
+        return {"status": "PASS", "checked": False, "reason": "no explicit years in CORE facts"}
+
+    topic = str((trend or {}).get("title", "") or "").strip()
+    topic_years = sorted({int(y) for y in year_re.findall(topic)})
+    core_years = sorted({year for item in core_facts for year in item["years"]})
+    current_year = getattr(reference_date, "year", None)
+
+    if topic_years:
+        conflicts = sorted({
+            (topic_year, fact_year)
+            for topic_year in topic_years
+            for fact_year in core_years
+            if abs(topic_year - fact_year) >= 2
+        })
+        if conflicts:
+            print(
+                "[TEMPORAL/EVENT GUARD] REJECT | "
+                f"topic_years={topic_years} | core_years={core_years} | conflicts={conflicts}"
+            )
+            return {
+                "status": "REJECT",
+                "reason": "explicit topic year conflicts with CORE event year",
+                "topic_years": topic_years,
+                "core_years": core_years,
+                "conflicts": conflicts,
+            }
+
+    if current_year is not None and current_year in core_years:
+        older_core_years = [year for year in core_years if year <= current_year - 2]
+        if older_core_years:
+            print(
+                "[TEMPORAL/EVENT GUARD] REJECT | "
+                f"current_year={current_year} | core_years={core_years} | "
+                f"older_core_years={older_core_years}"
+            )
+            return {
+                "status": "REJECT",
+                "reason": "current-year CORE event mixed with materially older CORE event",
+                "current_year": current_year,
+                "core_years": core_years,
+                "older_core_years": older_core_years,
+            }
+
+    print(
+        "[TEMPORAL/EVENT GUARD] PASS | "
+        f"topic_years={topic_years or []} | core_years={core_years or []}"
+    )
+    return {"status": "PASS", "checked": True, "topic_years": topic_years, "core_years": core_years}
+
+
+# ============================================================
 def _enrich_evidence_for_generation(evidence, trend):
     """
     Add deterministic topic context to the already locked evidence.
@@ -1791,6 +1905,9 @@ def _enrich_evidence_for_generation(evidence, trend):
         "source headline to add specificity that the locked evidence does not support."
     )
 
+    # CORE/SUPPORTING roles are preserved from the locked evidence. Supporting
+    # facts are optional context and must not be promoted to mandatory coverage.
+    #
     # IMPORTANT: Do not pass publisher/source headlines into article generation.
     # Headlines are discovery metadata and can contain claims that are stronger,
     # newer, or more specific than the source body. The locked evidence facts are
@@ -1798,99 +1915,6 @@ def _enrich_evidence_for_generation(evidence, trend):
     #
     return enriched
 
-def _semantic_deduplicate_evidence_facts(evidence):
-    """Conservative deterministic evidence deduplication.
-
-    No LLM call is allowed in this hot path. The extractor already instructs the
-    model not to repeat facts; this layer only collapses obvious lexical
-    restatements and preserves distinct details.
-    """
-    if not isinstance(evidence, dict):
-        raise ValueError("Evidence lock is not an object.")
-
-    facts = evidence.get("facts", [])
-    if not isinstance(facts, list) or len(facts) < 2:
-        result = dict(evidence)
-        lineage = dict(result.get("fact_lineage") or {}) if isinstance(result.get("fact_lineage"), dict) else {}
-        lineage["unique_information_units"] = len(facts) if isinstance(facts, list) else 0
-        result["fact_lineage"] = lineage
-        return result
-
-    def tokens(text):
-        text = unicodedata.normalize("NFKD", str(text or "")).encode("ascii", "ignore").decode("ascii").casefold()
-        return {t for t in re.findall(r"[a-z0-9]+", text) if len(t) > 2}
-
-    def similarity(a, b):
-        ta, tb = tokens(a), tokens(b)
-        if not ta or not tb:
-            return 0.0, 0.0
-        jaccard = len(ta & tb) / max(1, len(ta | tb))
-        sequence = difflib.SequenceMatcher(None, str(a).casefold(), str(b).casefold()).ratio()
-        return jaccard, sequence
-
-    deduped = []
-    duplicate_clusters = []
-    duplicate_ids = []
-
-    for fact in facts:
-        if not isinstance(fact, dict):
-            continue
-        text = str(fact.get("fact", "")).strip()
-        fid = str(fact.get("id", "")).strip()
-        if not text or not fid:
-            continue
-
-        duplicate_of = None
-        for existing in deduped:
-            jaccard, sequence = similarity(text, existing.get("fact", ""))
-            # Deliberately conservative: only obvious restatements are merged.
-            if sequence >= 0.90 or (jaccard >= 0.78 and sequence >= 0.82):
-                duplicate_of = existing
-                break
-
-        if duplicate_of is None:
-            item = dict(fact)
-            item["lineage_members"] = [fid]
-            deduped.append(item)
-        else:
-            duplicate_of.setdefault("lineage_members", []).append(fid)
-            duplicate_clusters.append([str(x) for x in duplicate_of["lineage_members"]])
-            duplicate_ids.append(fid)
-
-    # Re-number IDs while preserving lineage/provenance.
-    old_to_new = {}
-    for idx, fact in enumerate(deduped, 1):
-        old_ids = [str(x) for x in fact.get("lineage_members", [])]
-        new_id = f"F{idx}"
-        for old_id in old_ids:
-            old_to_new[old_id] = new_id
-        fact["id"] = new_id
-
-    result = dict(evidence)
-    result["facts"] = deduped
-
-    for key in ("core_fact_ids", "supporting_fact_ids"):
-        values = result.get(key, [])
-        if isinstance(values, list):
-            mapped = []
-            for value in values:
-                new_id = old_to_new.get(str(value).strip())
-                if new_id and new_id not in mapped:
-                    mapped.append(new_id)
-            result[key] = mapped
-
-    lineage = dict(result.get("fact_lineage") or {}) if isinstance(result.get("fact_lineage"), dict) else {}
-    lineage["unique_information_units"] = len(deduped)
-    lineage["semantic_duplicate_clusters"] = duplicate_clusters
-    lineage["semantic_duplicate_fact_ids"] = duplicate_ids
-    lineage["dedup_mode"] = "deterministic_lexical_fast_path"
-    result["fact_lineage"] = lineage
-
-    print(
-        f"[EVIDENCE SEMANTIC DEDUP] deterministic | facts_in={len(facts)} | "
-        f"unique_units={len(deduped)} | duplicates_removed={len(duplicate_ids)}"
-    )
-    return result
 
 def _run_repetition_guard(article, generation_evidence, event_name="repetition_guard"):
     """Cheap deterministic post-generation repetition gate.
@@ -2301,23 +2325,15 @@ _FACT_GUARD_STOPWORDS = {
     "new","latest","news","report","reports","story","article","podcast",
 }
 
-def _fc_tokens(value):
-    value = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
-    return [
-        token for token in re.findall(r"[a-z0-9]+", value.casefold())
-        if len(token) >= 3 and token not in _FACT_GUARD_STOPWORDS
-    ]
-
-def _fc_numeric_tokens(value):
-    return set(re.findall(
-        r"\b\d+(?:[.,]\d+)?%?\b|\b(?:19|20)\d{2}\b",
-        str(value or ""),
-    ))
-
 def _measure_fact_expression(article, generation_evidence):
-    """Measure how many locked evidence facts are explicitly expressed in the article.
+    """Measure fact expression without a second LLM call.
 
-    Measurement layer: the caller applies the mandatory core-fact publication guard.
+    The newsroom writer already emits fact_ids per paragraph and
+    _normalize_generated_article validates every ID against the locked evidence
+    and requires every CORE fact to be covered. Reuse that validated coverage
+    map as the authoritative expression result. A lightweight lexical sanity
+    check is retained only as a diagnostic signal; it never triggers another
+    inference call.
     """
     facts = generation_evidence.get("facts", []) if isinstance(generation_evidence, dict) else []
     facts = [
@@ -2329,11 +2345,19 @@ def _measure_fact_expression(article, generation_evidence):
     if not facts:
         return {
             "status": "UNAVAILABLE",
+            "method": "none",
             "locked_facts": 0,
             "expressed_facts": 0,
             "coverage": None,
             "information_density": None,
             "expressed_fact_ids": [],
+            "core_facts": 0,
+            "expressed_core_facts": 0,
+            "core_coverage": None,
+            "supporting_facts": 0,
+            "expressed_supporting_facts": 0,
+            "supporting_coverage": None,
+            "article_words": 0,
         }
 
     paragraphs = article.get("paragraphs", []) if isinstance(article, dict) else []
@@ -2342,130 +2366,102 @@ def _measure_fact_expression(article, generation_evidence):
     if not article_text:
         return {
             "status": "UNAVAILABLE",
+            "method": "validated_fact_ids",
             "locked_facts": len(facts),
             "expressed_facts": 0,
             "coverage": None,
             "information_density": None,
             "expressed_fact_ids": [],
+            "core_facts": len(generation_evidence.get("core_fact_ids", []) or []),
+            "expressed_core_facts": 0,
+            "core_coverage": None,
+            "supporting_facts": len(generation_evidence.get("supporting_fact_ids", []) or []),
+            "expressed_supporting_facts": 0,
+            "supporting_coverage": None,
+            "article_words": 0,
         }
 
-    numbered = "\n".join(
-        f"{i + 1}. [{fact['id']}] {fact['fact']}"
-        for i, fact in enumerate(facts)
-    )
-    prompt = f"""
-Determine which locked evidence facts are explicitly expressed in the article.
+    valid_ids = {str(fact["id"]).strip() for fact in facts}
+    declared_ids = article.get("_declared_fact_ids", [])
+    if not isinstance(declared_ids, list):
+        declared_ids = []
 
-A fact is EXPRESSED only when the article clearly states the same substantive
-information. Do not count inference, implication, background knowledge, or a
-fact that could merely be guessed from the article. Paraphrases count.
-One article sentence may express multiple facts.
+    expressed_ids = []
+    for value in declared_ids:
+        fid = str(value).strip()
+        if fid in valid_ids and fid not in expressed_ids:
+            expressed_ids.append(fid)
 
-Return ONLY JSON:
-{{"expressed_fact_ids":["F1","F3"]}}
-
-Use only the fact IDs supplied below. Do not invent IDs.
-
-LOCKED FACTS:
-{numbered}
-
-ARTICLE:
-{article_text}
-"""
-    try:
-        raw = chat(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={
-                "temperature": 0.0,
-                "top_p": 0.85,
-                "top_k": 40,
-                "num_ctx": max(4096, int(os.getenv("OLLAMA_NUM_CTX", "4096"))),
-                "num_predict": max(64, min(192, len(facts) * 12 + 32)),
-            },
-            format="json",
-        )
-        content = getattr(getattr(raw, "message", None), "content", "") or ""
-        start = content.find("{")
-        end = content.rfind("}")
-        if start < 0 or end <= start:
-            raise ValueError("fact expression measurement returned no JSON object")
-        parsed = json.loads(content[start:end + 1])
-        raw_ids = parsed.get("expressed_fact_ids", [])
-        if not isinstance(raw_ids, list):
-            raise ValueError("fact expression measurement returned invalid IDs")
-
-        valid_ids = {str(fact["id"]).strip() for fact in facts}
-        expressed_ids = []
-        for value in raw_ids:
-            fact_id = str(value).strip()
-            if fact_id in valid_ids and fact_id not in expressed_ids:
-                expressed_ids.append(fact_id)
-
-        locked_count = len(facts)
-        expressed_count = len(expressed_ids)
-        coverage = expressed_count / locked_count if locked_count else None
-        density = (expressed_count / article_words * 100) if article_words else None
-
-        core_ids = {
-            str(value).strip()
-            for value in (generation_evidence.get("core_fact_ids", []) or [])
-        }
-        supporting_ids = {
-            str(value).strip()
-            for value in (generation_evidence.get("supporting_fact_ids", []) or [])
-        }
-        expressed_core = len(core_ids & set(expressed_ids))
-        expressed_supporting = len(supporting_ids & set(expressed_ids))
-        core_coverage = (
-            expressed_core / len(core_ids) if core_ids else None
-        )
-        supporting_coverage = (
-            expressed_supporting / len(supporting_ids) if supporting_ids else None
-        )
-
-        print(
-            f"[FACT EXPRESSION] locked={locked_count} | "
-            f"expressed={expressed_count} | coverage="
-            f"{coverage:.3f} | density={density:.2f}/100w"
-            if coverage is not None and density is not None
-            else f"[FACT EXPRESSION] locked={locked_count} | expressed={expressed_count}"
-        )
-        return {
-            "status": "PASS",
-            "locked_facts": locked_count,
-            "expressed_facts": expressed_count,
-            "coverage": coverage,
-            "information_density": density,
-            "expressed_fact_ids": expressed_ids,
-            "core_facts": len(core_ids),
-            "expressed_core_facts": expressed_core,
-            "core_coverage": core_coverage,
-            "supporting_facts": len(supporting_ids),
-            "expressed_supporting_facts": expressed_supporting,
-            "supporting_coverage": supporting_coverage,
-            "article_words": article_words,
-        }
-    except Exception as exc:
-        print(f"[FACT EXPRESSION] unavailable | {exc}")
+    # The normalizer guarantees all CORE IDs are declared/covered before this
+    # function runs. If the private coverage map is absent, fail closed rather
+    # than silently substituting an unverified LLM judgment.
+    if not declared_ids:
         return {
             "status": "UNAVAILABLE",
+            "method": "validated_fact_ids",
             "locked_facts": len(facts),
-            "expressed_facts": None,
+            "expressed_facts": 0,
             "coverage": None,
             "information_density": None,
             "expressed_fact_ids": [],
+            "core_facts": len(generation_evidence.get("core_fact_ids", []) or []),
+            "expressed_core_facts": 0,
+            "core_coverage": None,
+            "supporting_facts": len(generation_evidence.get("supporting_fact_ids", []) or []),
+            "expressed_supporting_facts": 0,
+            "supporting_coverage": None,
+            "article_words": article_words,
         }
 
+    locked_count = len(facts)
+    expressed_count = len(expressed_ids)
+    coverage = expressed_count / locked_count if locked_count else None
+    density = (expressed_count / article_words * 100) if article_words else None
 
-def generate_valid_article(prompt, reference_date, trend, prelocked_evidence=None):
+    core_ids = {
+        str(value).strip()
+        for value in (generation_evidence.get("core_fact_ids", []) or [])
+    }
+    supporting_ids = {
+        str(value).strip()
+        for value in (generation_evidence.get("supporting_fact_ids", []) or [])
+    }
+    expressed_set = set(expressed_ids)
+    expressed_core = len(core_ids & expressed_set)
+    expressed_supporting = len(supporting_ids & expressed_set)
+
+    print(
+        f"[FACT EXPRESSION] validated fact_ids | locked={locked_count} | "
+        f"expressed={expressed_count} | coverage={coverage:.3f} | "
+        f"core_coverage={expressed_core / len(core_ids) if core_ids else None!r}"
+    )
+
+    return {
+        "status": "PASS",
+        "method": "validated_fact_ids",
+        "locked_facts": locked_count,
+        "expressed_facts": expressed_count,
+        "coverage": coverage,
+        "information_density": density,
+        "expressed_fact_ids": expressed_ids,
+        "core_facts": len(core_ids),
+        "expressed_core_facts": expressed_core,
+        "core_coverage": expressed_core / len(core_ids) if core_ids else None,
+        "supporting_facts": len(supporting_ids),
+        "expressed_supporting_facts": expressed_supporting,
+        "supporting_coverage": expressed_supporting / len(supporting_ids) if supporting_ids else None,
+        "article_words": article_words,
+    }
+
+def generate_valid_article(prompt=None, reference_date=None, trend=None, prelocked_evidence=None):
     """Generate once and publish after deterministic/language/repetition validation.
 
-    No post-generation LLM factual validation, repair, or regeneration occurs.
+    Fact-expression is measured from the validated fact-ID coverage map. There is
+    no second LLM call, factual repair, or regeneration loop.
     """
     try:
         generation_evidence = _enrich_evidence_for_generation(prelocked_evidence, trend)
-        article = generate(prompt, evidence=generation_evidence)
+        article = generate("", evidence=generation_evidence)
         # The HTML renderer does not parse Markdown. Strip model-emitted
         # emphasis markers before any validation/rendering so literal "*" and
         # "**" cannot leak into titles, metadata, or article paragraphs.
@@ -2480,6 +2476,8 @@ def generate_valid_article(prompt, reference_date, trend, prelocked_evidence=Non
         if isinstance(locked_facts, list) and len(locked_facts) >= 1:
             print(f"[EVIDENCE COVERAGE] locked_facts={len(locked_facts)} | core_facts={len(core_fact_ids)} | supporting_facts={len(supporting_fact_ids)} | article_words={len(paragraph_text.split())}")
         fact_expression = _measure_fact_expression(article, generation_evidence)
+        # The validated coverage map is internal-only and must never reach rendering.
+        article.pop("_declared_fact_ids", None)
         # Core evidence facts are mandatory for publication. Supporting facts are
         # measured for observability but are not individually mandatory. This is
         # deliberately not a word floor: article length remains evidence-driven.
@@ -2918,8 +2916,6 @@ def main():
                         status="PASS",
                     )
 
-                    generation_prompt = build_prompt(trend)
-
                     # STAGED SOURCE ACQUISITION:
                     # story discovery uses RSS metadata only; full publisher extraction
                     # is performed only for the already selected concrete story sources.
@@ -2964,20 +2960,53 @@ def main():
                     if _run_budget_exhausted("before_evidence_extraction"):
                         raise RuntimeError("run time budget exhausted before evidence extraction")
                     evidence_source = _build_evidence_source(selected_news, {"selected_indices": list(range(len(selected_news)))})
+                    evidence_source_chars = sum(
+                        len(str(value or ""))
+                        for item in evidence_source.get("articles", [])
+                        for value in (
+                            item.get("title", ""),
+                            item.get("source", ""),
+                            item.get("published", ""),
+                            item.get("summary", ""),
+                            item.get("description", ""),
+                            item.get("content", ""),
+                        )
+                    )
                     print(
                         f"[TOPIC FILTER] Evidence source prepared | "
-                        f"source_chars={len(evidence_source)}"
+                        f"source_chars={evidence_source_chars}"
                     )
                     evidence_lock = extract_evidence(evidence_source)
 
-                    # FAST PATH v2.9.7:
-                    # Story Discovery has already selected the concrete story and
-                    # independent source set. Evidence extraction is explicitly locked
-                    # to ONE coherent event. Skip the redundant LLM coherence inference
-                    # here; continue with deterministic evidence deduplication and the
-                    # existing substantive-value gate.
-                    evidence_lock = _semantic_deduplicate_evidence_facts(evidence_lock)
+                    temporal_event_check = _deterministic_temporal_event_guard(
+                        evidence_lock,
+                        trend=trend,
+                        reference_date=reference_date,
+                    )
+                    if temporal_event_check.get("status") != "PASS":
+                        trend["_production_status"] = "REJECT"
+                        trend["_production_reject_reason"] = temporal_event_check.get(
+                            "reason", "temporal/event guard rejected evidence"
+                        )
+                        monitor.candidate_event(
+                            "temporal_event_guard",
+                            **temporal_event_check,
+                        )
+                        monitor.finish_candidate(
+                            "REJECT",
+                            reason=f"temporal_event_guard={temporal_event_check.get('reason')}"
+                        )
+                        continue
 
+                    monitor.candidate_event(
+                        "temporal_event_guard",
+                        **temporal_event_check,
+                    )
+
+                    # FAST PATH:
+                    # extract_evidence() now returns the authoritative deduplicated
+                    # evidence + lineage state. Do not run a second generation-side
+                    # semantic dedup pass over the same locked facts.
                     locked_facts = (
                         evidence_lock.get("facts", [])
                         if isinstance(evidence_lock, dict)
@@ -3015,7 +3044,7 @@ def main():
                             news_count=len(news),
                             selected_source_indices=story_selection.get("selected_indices", []),
                             selected_source_count=story_selection.get("selected_count"),
-                            evidence_source_chars=len(evidence_source),
+                            evidence_source_chars=evidence_source_chars,
                             evidence_facts=locked_facts,
                             evidence_fact_count=evidence_fact_count,
                         )
@@ -3031,7 +3060,7 @@ def main():
                         news_count=len(news),
                         selected_source_indices=story_selection.get("selected_indices", []),
                         selected_source_count=story_selection.get("selected_count"),
-                        evidence_source_chars=len(evidence_source),
+                        evidence_source_chars=evidence_source_chars,
                         evidence_facts=locked_facts,
                         evidence_fact_count=evidence_fact_count,
                         unique_information_units=unique_information_units,
@@ -3071,11 +3100,6 @@ def main():
                         reservation_file=cross_run_reservation.get("path"),
                     )
 
-                    evidence_lock = _enrich_evidence_for_generation(
-                        evidence_lock,
-                        trend,
-                    )
-                    trend["_evidence_lock"] = evidence_lock
                     print(
                         f"[TOPIC FILTER] EVIDENCE USABILITY PASS | "
                         f"facts={evidence_fact_count} | {keyword} | story={story_number}"
@@ -3085,7 +3109,7 @@ def main():
                         news_count=len(news),
                         selected_source_indices=story_selection.get("selected_indices", []),
                         selected_source_count=story_selection.get("selected_count"),
-                        evidence_source_chars=len(evidence_source),
+                        evidence_source_chars=evidence_source_chars,
                         evidence_facts=locked_facts,
                         evidence_fact_count=evidence_fact_count,
                         evidence_lock=evidence_lock,
@@ -3094,9 +3118,8 @@ def main():
                     if _run_budget_exhausted("before_article_generation"):
                         raise RuntimeError("run time budget exhausted before article generation")
                     article = generate_valid_article(
-                        generation_prompt,
-                        reference_date,
-                        trend,
+                        reference_date=reference_date,
+                        trend=trend,
                         prelocked_evidence=evidence_lock,
                     )
 

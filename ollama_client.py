@@ -29,7 +29,7 @@ import generator_monitor as monitor
 #   * preserve multilingual operation
 # ============================================================
 
-PIPELINE_VERSION = "universal-fact-lock-v2.9.8-ministral-fast-path"
+PIPELINE_VERSION = "universal-fact-lock-v2.9.10-progressive-evidence-role-lock-fixed"
 
 # IMPORTANT: Do not force a CPU thread count by default.
 # Ollama can auto-detect the runner's optimal thread count.
@@ -44,13 +44,11 @@ NUM_THREADS = (
 
 NUM_CTX = max(8192, int(os.getenv("OLLAMA_NUM_CTX", "8192")))
 
-# A run-level budget cannot interrupt a synchronous Ollama call. Keep each
-# individual model request bounded so the process can actually return control
-# to generate.py and enforce the 50-minute run budget.
-OLLAMA_TIMEOUT_SECONDS = max(30, int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "210")))
+# Do not impose an artificial per-call timeout on local Ollama inference.
+# Ollama must be allowed to finish a legitimate CPU inference normally.
+# The continuous runner is responsible only for external process protection.
 OLLAMA_CLIENT = Client(
     host=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
-    timeout=OLLAMA_TIMEOUT_SECONDS,
 )
 
 # IMPORTANT: Do not force num_batch=512 by default.
@@ -65,10 +63,13 @@ NUM_BATCH = (
 # The old extractor asked the model for facts + quotes + groups at once.
 # That made a 500-token ceiling very easy to hit.  The balanced extractor
 # keeps one compact fact record and a small number of records.
+# Evidence is processed progressively.  The production source builder already
+# caps each publisher article at 5000 chars; keep evidence calls close to one
+# publisher article instead of concatenating many articles into one huge prompt.
 EVIDENCE_CHUNK_CHARS = max(
-    7000, int(os.getenv("OLLAMA_EVIDENCE_CHUNK_CHARS", "18000"))
+    2500, int(os.getenv("OLLAMA_EVIDENCE_CHUNK_CHARS", "5000"))
 )
-EVIDENCE_TOKENS = max(320, int(os.getenv("OLLAMA_EVIDENCE_TOKENS", "360")))
+EVIDENCE_TOKENS = max(240, int(os.getenv("OLLAMA_EVIDENCE_TOKENS", "280")))
 EVIDENCE_MAX_FACTS = max(
     4, min(8, int(os.getenv("OLLAMA_EVIDENCE_MAX_FACTS", "8")))
 )
@@ -85,7 +86,14 @@ CORE_FACTS_MAX = max(1, min(4, int(os.getenv("OLLAMA_CORE_FACTS_MAX", "4"))))
 WRITER_SOURCE_CONTEXT = os.getenv("OLLAMA_WRITER_SOURCE_CONTEXT", "0").strip() == "1"
 WRITER_SOURCE_CONTEXT_CHARS = max(4000, int(os.getenv("OLLAMA_WRITER_SOURCE_CONTEXT_CHARS", "12000")))
 
-ARTICLE_TOKENS = max(340, int(os.getenv("OLLAMA_ARTICLE_TOKENS", "400")))
+ARTICLE_TOKENS = max(480, int(os.getenv("OLLAMA_ARTICLE_TOKENS", "480")))
+# Article generation gets a bounded overflow retry only when the JSON response is
+# actually truncated/malformed. This is a transport/serialization recovery path,
+# not a factual repair or quality regeneration loop.
+ARTICLE_RETRY_TOKENS = max(
+    ARTICLE_TOKENS + 80,
+    int(os.getenv("OLLAMA_ARTICLE_RETRY_TOKENS", "640")),
+)
 AUDIT_TOKENS = max(
     240, int(os.getenv("OLLAMA_AUDIT_TOKENS", "320"))
 )
@@ -108,7 +116,7 @@ EVIDENCE_EXPANSION = os.getenv(
 # The retry uses a smaller output contract and a bounded output ceiling.
 EVIDENCE_RETRY_TOKENS = max(
     EVIDENCE_TOKENS,
-    int(os.getenv("OLLAMA_EVIDENCE_RETRY_TOKENS", "420")),
+    int(os.getenv("OLLAMA_EVIDENCE_RETRY_TOKENS", "340")),
 )
 
 print(f"[TrendCurrent PIPELINE] {PIPELINE_VERSION}")
@@ -299,94 +307,177 @@ def _call(
 # Source splitting
 # ============================================================
 
+def _canonical_evidence_articles(source):
+    """Normalize structured publisher records once into canonical evidence articles."""
+    if isinstance(source, dict) and isinstance(source.get("articles"), list):
+        articles = []
+        for item in source["articles"]:
+            if not isinstance(item, dict):
+                continue
+            articles.append({
+                "title": str(item.get("title", "") or "").strip(),
+                "source": str(item.get("source", "") or "").strip(),
+                "published": str(item.get("published", "") or "").strip(),
+                "summary": str(item.get("summary", "") or "").strip(),
+                "description": str(item.get("description", "") or "").strip(),
+                "content": str(item.get("content", "") or "").strip()[:5000],
+            })
+        if not articles:
+            raise ValueError("Evidence source contains no usable articles.")
+        return articles
+    return None
+
+
+def _serialize_canonical_article(article, article_no):
+    """Serialize one canonical article exactly once for evidence indexing."""
+    return "\n".join([
+        f"ARTICLE {article_no}",
+        f"Title: {article.get('title', '')}",
+        f"Source: {article.get('source', '')}",
+        f"Published: {article.get('published', '')}",
+        "",
+        "Summary:",
+        article.get("summary", ""),
+        "",
+        "Full Article:",
+        article.get("content", ""),
+        "---",
+    ])
+
+
+def _prepare_evidence_chunks(source):
+    """Prepare evidence chunks and sentence maps exactly once."""
+    articles = _canonical_evidence_articles(source)
+    if articles is None:
+        prepared = []
+        for chunk in _split_source(source):
+            indexed, mapping = _sentence_index_source(chunk)
+            prepared.append({"text": chunk, "indexed": indexed, "sentence_map": mapping})
+        return prepared
+
+    prepared = []
+    for article_no, article in enumerate(articles, 1):
+        serialized = _serialize_canonical_article(article, article_no)
+        if len(serialized) <= EVIDENCE_CHUNK_CHARS:
+            indexed, mapping = _sentence_index_source(serialized)
+            prepared.append({"text": serialized, "indexed": indexed, "sentence_map": mapping})
+            continue
+
+        lines = serialized.splitlines()
+        header = lines[0].strip() if lines else f"ARTICLE {article_no}"
+        body = "\n".join(lines[1:]).strip() if len(lines) > 1 else serialized
+        sentences = re.split(
+            r'(?<=[.!?])(?:["”»’\'\)\]]+)?\s+',
+            body,
+        )
+        current = header
+        for sentence in (s.strip() for s in sentences if s.strip()):
+            candidate = f"{current}\n{sentence}" if current else sentence
+            if current and len(candidate) > EVIDENCE_CHUNK_CHARS:
+                indexed, mapping = _sentence_index_source(current.strip())
+                prepared.append({"text": current.strip(), "indexed": indexed, "sentence_map": mapping})
+                current = f"{header}\n{sentence}" if header else sentence
+            else:
+                current = candidate
+        if current.strip():
+            indexed, mapping = _sentence_index_source(current.strip())
+            prepared.append({"text": current.strip(), "indexed": indexed, "sentence_map": mapping})
+
+    return prepared or [{"text": "", "indexed": "", "sentence_map": {}}]
+
+
 def _split_source(source):
     """
-    Preserve ARTICLE blocks when present. If no ARTICLE markers exist,
-    split only when necessary.
+    Split evidence material into small, provenance-safe units for progressive
+    extraction.
 
-    For a moderately large source that still fits safely inside the configured
-    context, keep it as ONE evidence chunk. This avoids an unnecessary second
-    Ollama inference for payloads just above the legacy 14k boundary while
-    preserving every source character and every provenance-bearing sentence.
+    ARTICLE blocks are the preferred unit because generate.py builds the source
+    from independently selected publisher sources and caps each article body at
+    5000 characters.  We therefore do NOT concatenate multiple ARTICLE blocks
+    into a large Ollama prompt.
+
+    If an individual unstructured source is larger than the configured ceiling,
+    split on sentence boundaries where possible.  No source text is discarded.
     """
     text = (source or "").strip()
     if not text:
         return [""]
 
-    # Keep a single inference for moderately sized sources, but do not let the
-    # character shortcut outrun the configured model context.  The evidence
-    # prompt adds the indexed source plus a potentially long VALID ID list, so
-    # the safe single-chunk ceiling is deliberately below the raw context size.
-    # This is a performance optimization, not a content reduction.
-    # ARTICLE markers are provenance metadata and must not multiply CPU calls.
-    # For the default 8192-token context, 12000 characters remains a conservative
-    # single-chunk ceiling while leaving substantial headroom for the indexed-source
-    # wrapper, valid-ID list, instructions, and compact JSON evidence output.
-    single_chunk_chars = min(10000, EVIDENCE_CHUNK_CHARS)
-    if len(text) <= single_chunk_chars:
-        return [text]
-
-    effective_chunk_chars = EVIDENCE_CHUNK_CHARS
-
-    marker = re.compile(r"(?m)^\s*ARTICLE\s+\d+\s*$")
+    marker = re.compile(r"(?m)^\s*ARTICLE\s+(\d+)\s*$")
     matches = list(marker.finditer(text))
 
-    if len(matches) < 2:
-        if len(text) <= effective_chunk_chars:
-            return [text]
-        return [
-            text[i:i + effective_chunk_chars].strip()
-            for i in range(0, len(text), effective_chunk_chars)
-            if text[i:i + effective_chunk_chars].strip()
-        ]
+    if len(matches) >= 1:
+        prefix = text[:matches[0].start()].strip()
+        blocks = []
 
-    prefix = text[:matches[0].start()].strip()
-    blocks = []
+        for i, match in enumerate(matches):
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            block = text[match.start():end].strip()
+            if block:
+                blocks.append(block)
 
-    for i, match in enumerate(matches):
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        block = text[match.start():end].strip()
-        if block:
-            blocks.append(block)
+        # Keep each ARTICLE as an independent evidence unit.  This is the key
+        # progressive-retrieval behavior: process one publisher source, collect
+        # facts, and stop as soon as enough distinct evidence exists.
+        chunks = []
+        if prefix:
+            # Prefix contains scope metadata only. Attach it to the first block
+            # so the existing source format remains recognizable.
+            chunks.append((prefix + "\n\n" + blocks[0]).strip())
+            chunks.extend(blocks[1:])
+        else:
+            chunks = blocks
+
+        # A single ARTICLE can still exceed the configured ceiling. Split it
+        # deterministically at sentence boundaries rather than character cuts.
+        final_chunks = []
+        for chunk in chunks:
+            if len(chunk) <= EVIDENCE_CHUNK_CHARS:
+                final_chunks.append(chunk)
+                continue
+
+            lines = chunk.splitlines()
+            header = lines[0].strip() if lines else ""
+            body = "\n".join(lines[1:]).strip() if len(lines) > 1 else chunk
+
+            sentences = re.split(
+                r'(?<=[.!?])(?:["”»’\'\)\]]+)?\s+',
+                body,
+            )
+            current = header
+            for sentence in (s.strip() for s in sentences if s.strip()):
+                candidate = f"{current}\n{sentence}" if current else sentence
+                if current and len(candidate) > EVIDENCE_CHUNK_CHARS:
+                    final_chunks.append(current.strip())
+                    current = f"{header}\n{sentence}" if header else sentence
+                else:
+                    current = candidate
+            if current.strip():
+                final_chunks.append(current.strip())
+
+        return final_chunks or [text]
+
+    # Unstructured fallback: sentence-aware chunks, never arbitrary character
+    # slicing unless a single sentence itself exceeds the configured ceiling.
+    sentences = re.split(
+        r'(?<=[.!?])(?:["”»’\'\)\]]+)?\s+',
+        text,
+    )
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        return [text]
 
     chunks = []
-    current = []
-    current_len = len(prefix)
-
-    for block in blocks:
-        if len(block) > effective_chunk_chars:
-            if current:
-                chunks.append(
-                    (prefix + "\n\n" if prefix else "")
-                    + "\n\n".join(current)
-                )
-                current = []
-                current_len = len(prefix)
-
-            for i in range(0, len(block), effective_chunk_chars):
-                piece = block[i:i + effective_chunk_chars].strip()
-                if piece:
-                    chunks.append(piece)
-            continue
-
-        extra = len(block) + (2 if current else 0)
-        if current and current_len + extra > effective_chunk_chars:
-            chunks.append(
-                (prefix + "\n\n" if prefix else "")
-                + "\n\n".join(current)
-            )
-            current = [block]
-            current_len = len(prefix) + len(block)
+    current = ""
+    for sentence in sentences:
+        candidate = f"{current} {sentence}".strip() if current else sentence
+        if current and len(candidate) > EVIDENCE_CHUNK_CHARS:
+            chunks.append(current)
+            current = sentence
         else:
-            current.append(block)
-            current_len += extra
-
+            current = candidate
     if current:
-        chunks.append(
-            (prefix + "\n\n" if prefix else "")
-            + "\n\n".join(current)
-        )
-
+        chunks.append(current)
     return chunks or [text]
 
 
@@ -404,8 +495,9 @@ _EVIDENCE_FORMAT = {
                 "properties": {
                     "f": {"type": "string"},
                     "x": {"type": "string"},
+                    "role": {"type": "string", "enum": ["core", "supporting"]},
                 },
-                "required": ["f", "x"],
+                "required": ["f", "x", "role"],
             },
         },
     },
@@ -501,26 +593,27 @@ def _sentence_index_source(source):
         indexed_parts.append(f"[{sid}] {sentence}")
     return "\n".join(indexed_parts), mapping
 
-def _evidence_prompt(source, max_facts=None):
+def _evidence_prompt(source, max_facts=None, indexed_source=None):
     limit = max_facts or EVIDENCE_MAX_FACTS
-    indexed_source, sentence_map = _sentence_index_source(source)
-    valid_id_text = ", ".join(sentence_map.keys())
+    if indexed_source is None:
+        indexed_source, _ = _sentence_index_source(source)
     return f"""
 Extract factual evidence for ONE concrete story from the SOURCE.
 
 Return ONLY compact JSON:
-{{"facts":[{{"f":"supported fact","x":"A1-S1"}}]}}
+{{"facts":[{{"f":"supported fact","x":"A1-S1","role":"core"}}]}}
 
 Rules:
 - Read the entire source and stay within ONE coherent event/story.
 - Return distinct, directly supported facts, up to {limit}; never pad or stop early without checking the source.
-- Prefer concrete developments, actions, decisions, entities, dates, numbers, locations, status and other materially useful details explicitly stated in the source.
+- For each fact set role to CORE when it defines the concrete development itself: the main action/decision/result/status, who did it, what changed, or essential timing/detail needed to understand what happened. Set SUPPORTING only for useful background/context that is not necessary to understand the main development.
+- If the source contains several core developments, identify each distinct core development; do not promote generic background merely to fill the core set.
 - Each fact must be ONE concise factual claim; preferably no more than 20-30 words.
 - Do not repeat the same fact in different wording.
 - No outside knowledge, inference, motives, causes, significance or predictions.
 - Preserve names, dates, numbers and certainty exactly.
 - Each fact must be supported by one source sentence.
-- x MUST be an exact sentence ID from: {valid_id_text}
+- x MUST be copied exactly from one of the sentence IDs shown inline in SOURCE, such as S3 or A1-S4.
 - Never invent or alter IDs.
 - A score does not establish a winner unless the sentence explicitly says so.
 - Return ONLY JSON.
@@ -530,17 +623,17 @@ SOURCE:
 """
 
 
-def _evidence_expansion_prompt(source):
-    indexed_source, sentence_map = _sentence_index_source(source)
-    valid_id_text = ", ".join(sentence_map.keys())
+def _evidence_expansion_prompt(source, indexed_source=None):
+    if indexed_source is None:
+        indexed_source, _ = _sentence_index_source(source)
     return f"""
 Extract the MAIN EVENT from this source and build a compact evidence ledger.
 
 Return ONLY JSON:
-{{"facts":[{{"f":"fact","x":"A1-S1"}}]}}
+{{"facts":[{{"f":"fact","x":"A1-S1","role":"core"}}]}}
 
 RULES:
-- Extract the strongest distinct facts the source genuinely supports, up to {EVIDENCE_MAX_FACTS}; when the source is rich, aim for 5-8 rather than stopping after 2-3.
+- Extract the strongest distinct facts the source genuinely supports, up to {min(4, EVIDENCE_MAX_FACTS)}; when the source is rich, extract the strongest distinct facts without padding.
 - ALL returned facts must belong to ONE coherent event/story.
 - If several ARTICLE blocks or separate stories appear in the source, choose one main story and ignore unrelated stories that merely share a keyword.
 - Do not combine separate programmes, broadcasts, people, matches, incidents or other events.
@@ -548,7 +641,7 @@ RULES:
 - Cover different useful details: event, people/entities, timing, numbers, status, location or other directly relevant facts.
 - Every fact must be explicitly supported by one sentence from one source block.
 - When ARTICLE blocks are present, the provenance ID must identify both the source article and sentence (for example A2-S3).
-- "x" must be one of these VALID SENTENCE IDs: {valid_id_text}
+- "x" must be copied exactly from one of the sentence IDs shown inline in SOURCE, such as S3 or A1-S4.
 - Do not interpret SOURCE S2, ARTICLE 2, or any source label as a sentence ID.
 - Never invent or alter an ID.
 - No excerpts, source names, dates or status fields outside "f".
@@ -574,20 +667,20 @@ SOURCE:
 
 
 
-def _evidence_retry_prompt(source):
-    indexed_source, sentence_map = _sentence_index_source(source)
-    valid_id_text = ", ".join(sentence_map.keys())
+def _evidence_retry_prompt(source, indexed_source=None):
+    if indexed_source is None:
+        indexed_source, _ = _sentence_index_source(source)
     return f"""
 Re-extract factual evidence for ONE concrete story.
 
 Return ONLY:
-{{"facts":[{{"f":"supported fact","x":"A1-S1"}}]}}
+{{"facts":[{{"f":"supported fact","x":"A1-S1","role":"core"}}]}}
 
 Rules:
 - Use only the SOURCE; no outside knowledge or inference.
-- Return distinct supported facts, up to {EVIDENCE_MAX_FACTS}; never pad.
+- Return distinct supported facts, up to {min(4, EVIDENCE_MAX_FACTS)}; never pad.
 - Keep one coherent event.
-- Every x must be an exact valid sentence ID: {valid_id_text}
+- x MUST be copied exactly from one of the sentence IDs shown inline in SOURCE, such as S3 or A1-S4.
 - Never invent or alter IDs.
 
 SOURCE:
@@ -595,7 +688,7 @@ SOURCE:
 """
 
 
-def _evidence_invalid_id_retry_prompt(source, invalid_ids):
+def _evidence_invalid_id_retry_prompt(source, invalid_ids, indexed_source=None):
     """
     Retry evidence extraction when Ollama returns a provenance ID that does not
     exist in the deterministic sentence map.
@@ -604,8 +697,8 @@ def _evidence_invalid_id_retry_prompt(source, invalid_ids):
     reinterpret or remap an invalid ID to another sentence, because doing so
     could attach a correct fact to the wrong source evidence.
     """
-    indexed_source, sentence_map = _sentence_index_source(source)
-    valid_id_text = ", ".join(sentence_map.keys())
+    if indexed_source is None:
+        indexed_source, _ = _sentence_index_source(source)
     invalid_id_text = ", ".join(sorted(set(invalid_ids)))
 
     return f"""
@@ -613,18 +706,18 @@ You are retrying TrendCurrent's source-evidence extraction because the previous
 response used invalid provenance IDs: {invalid_id_text}.
 
 Return ONLY compact JSON:
-{{"facts":[{{"f":"fact","x":"A1-S1"}}]}}
+{{"facts":[{{"f":"fact","x":"A1-S1","role":"core"}}]}}
 
 STRICT PROVENANCE RULES:
 - Read the ENTIRE SOURCE MATERIAL again.
 - Every returned fact MUST be explicitly supported by one source sentence.
-- "x" MUST be one of these exact VALID SENTENCE IDs: {valid_id_text}
+- "x" MUST be copied exactly from one of the sentence IDs shown inline in SOURCE, such as S3 or A1-S4.
 - SOURCE S2 / ARTICLE 2 are source labels, not sentence IDs.
 - NEVER invent an ID.
 - NEVER reuse an ID from memory or from a previous response.
 - NEVER change an ID's number or format.
 - If a fact cannot be tied confidently to one of the valid IDs, omit that fact.
-- Return as many distinct supported facts as possible, up to {EVIDENCE_MAX_FACTS}.
+- Return as many distinct supported facts as possible, up to {min(4, EVIDENCE_MAX_FACTS)}.
 - Keep all facts within the same main event/story.
 - Do not infer motives, causes, significance, outcomes or outside facts.
 - Do not generate excerpts, source names, dates or status fields separately.
@@ -1041,7 +1134,7 @@ def _source_excerpt_supported(source, excerpt):
     return excerpt_norm in source_norm
 
 
-def _normalize_evidence(data, source_material=None):
+def _normalize_evidence(data, source_material=None, sentence_map=None):
     if not isinstance(data, dict):
         raise ValueError("Evidence response is not an object.")
 
@@ -1049,7 +1142,8 @@ def _normalize_evidence(data, source_material=None):
     if not isinstance(raw_facts, list):
         raw_facts = []
 
-    _, sentence_map = _sentence_index_source(source_material or "")
+    if sentence_map is None:
+        _, sentence_map = _sentence_index_source(source_material or "")
     clean = []
     seen = set()
     invalid_ids = []
@@ -1074,6 +1168,11 @@ def _normalize_evidence(data, source_material=None):
             continue
         seen.add(key)
 
+        role = str(item.get("role", "")).strip().casefold()
+        if role not in {"core", "supporting"}:
+            # Conservative fallback for legacy/malformed extraction responses.
+            role = "core" if len(clean) < min(2, CORE_FACTS_MAX) else "supporting"
+
         clean.append({
             "id": f"F{len(clean) + 1}",
             "group": "G1",
@@ -1082,6 +1181,7 @@ def _normalize_evidence(data, source_material=None):
             "source": "",
             "date": "",
             "status": "",
+            "role": role,
         })
 
         if len(clean) >= EVIDENCE_MAX_FACTS:
@@ -1096,12 +1196,21 @@ def _normalize_evidence(data, source_material=None):
     if not clean:
         raise ValueError("Evidence extraction produced no usable facts.")
 
-    # Deterministically separate the strongest facts from optional supporting
-    # details. Extraction order is intentionally preserved because the prompt
-    # asks the model to return core facts first. No facts are discarded.
+    # Preserve the extractor's explicit story-role classification. Do not promote
+    # background facts to CORE merely because they appeared early in the response.
     clean = clean[:EVIDENCE_MAX_FACTS]
-    for index, fact_item in enumerate(clean):
-        fact_item["role"] = "core" if index < CORE_FACTS_MAX else "supporting"
+    core_seen = 0
+    for fact_item in clean:
+        if fact_item.get("role") == "core":
+            if core_seen >= CORE_FACTS_MAX:
+                fact_item["role"] = "supporting"
+            else:
+                core_seen += 1
+
+    # Fail closed if the extractor returned no core fact at all: the first
+    # extracted fact is the only safe legacy fallback and remains source-locked.
+    if clean and not any(f.get("role") == "core" for f in clean):
+        clean[0]["role"] = "core"
 
     return {
         "primary_group": "G1",
@@ -1112,46 +1221,139 @@ def _normalize_evidence(data, source_material=None):
 
 
 
-def _extract_evidence(source):
-    started = time.perf_counter()
-    chunks = _split_source(source)
+def _progressive_evidence_sufficient(locked_facts, lineage_stats):
+    """Decide whether progressive extraction has enough substantive evidence to stop.
 
-    print(
-        f"[TIMER] Evidence extraction START | source_chars={len(source or '')} "
-        f"| chunks={len(chunks)}"
+    This deliberately mirrors the production substantive-value gate's conservative
+    minimum: at least 3 distinct information units, at least 3 usable factual claims,
+    and at least 2 non-meta/concrete claims.  It is only a STOP condition; the
+    unchanged substantive gate remains the final eligibility authority.
+    """
+    if not isinstance(locked_facts, list) or not isinstance(lineage_stats, dict):
+        return False
+
+    try:
+        unique_units = int(lineage_stats.get(
+            "unique_information_units", len(locked_facts)
+        ))
+    except (TypeError, ValueError):
+        unique_units = len(locked_facts)
+
+    if unique_units < 3:
+        return False
+
+    meta_patterns = (
+        r"\b(?:discussed|being discussed|talked about|coverage of|covered by|"
+        r"attracting attention|fans are interested|expected to|tipped to|rumou?red|"
+        r"speculation|promotional|sponsored|advertisement)\b",
+        r"\b(?:diskutiert|besprochen|im gespräch|aufmerksamkeit|erwartet|"
+        r"gerücht|spekulation|werbung|gesponsert)\b",
+        r"\b(?:discutido|comentado|atención|esperado|rumor|especulación|"
+        r"promocional|patrocinado)\b",
+        r"\b(?:discusso|commentato|attenzione|atteso|indiscrezione|"
+        r"speculazione|promozionale|sponsorizzato)\b",
+        r"\b(?:discuté|commenté|attention|attendu|rumeur|spéculation|"
+        r"promotionnel|sponsorisé)\b",
+        r"\b(?:dibahas|dibicarakan|perhatian|diharapkan|rumor|spekulasi|"
+        r"promosi|disponsori)\b",
     )
 
-    maps = []
+    usable = 0
+    concrete = 0
 
-    for index, chunk in enumerate(chunks, 1):
+    for item in locked_facts:
+        if not isinstance(item, dict):
+            continue
+        fact = re.sub(r"\s+", " ", str(item.get("fact", "")).strip())
+        if len(fact.split()) < 4:
+            continue
+        usable += 1
+        if not any(re.search(pattern, fact, flags=re.IGNORECASE)
+                   for pattern in meta_patterns):
+            concrete += 1
+
+    return usable >= 3 and concrete >= 2
+
+
+def _extract_evidence(source):
+    started = time.perf_counter()
+    prepared_chunks = _prepare_evidence_chunks(source)
+
+    print(
+        f"[TIMER] Evidence extraction START | source_chars={len(str(source or ''))} "
+        f"| progressive_chunks={len(prepared_chunks)}"
+    )
+
+    facts = []
+    seen = set()
+    processed_chunks = 0
+    stop_reason = "all_chunks_exhausted"
+
+    def _merge_chunk_facts(chunk_facts):
+        nonlocal facts, seen
+
+        for item in chunk_facts:
+            fact = dict(item)
+            key = (
+                str(fact.get("fact", "")).strip().casefold(),
+                str(fact.get("excerpt", "")).strip().casefold(),
+            )
+            if not fact.get("fact") or not fact.get("excerpt") or key in seen:
+                continue
+            seen.add(key)
+            fact["id"] = f"F{len(facts) + 1}"
+            facts.append(fact)
+
+        # Apply the same conservative lineage deduplication incrementally so the
+        # stopping decision is based on unique information units, not raw facts.
+        locked_now, lineage_now = _deduplicate_evidence_facts(facts)
+        return locked_now, lineage_now
+
+    for index, prepared in enumerate(prepared_chunks, 1):
+        processed_chunks = index
+        chunk = prepared["text"]
+        indexed_chunk = prepared["indexed"]
+        sentence_map = prepared["sentence_map"]
+        print(
+            f"[EVIDENCE PROGRESS] chunk={index}/{len(prepared_chunks)} "
+            f"| chunk_chars={len(chunk)} | accumulated_facts={len(facts)}"
+        )
         try:
             data = _call(
-                _evidence_prompt(chunk),
+                _evidence_prompt(
+                    chunk,
+                    max_facts=min(4, EVIDENCE_MAX_FACTS),
+                    indexed_source=indexed_chunk,
+                ),
                 temperature=0.0,
                 num_predict=EVIDENCE_TOKENS,
                 num_thread=NUM_THREADS,
                 response_format=_EVIDENCE_FORMAT,
             )
-            maps.append(_normalize_evidence(data, source_material=chunk))
+            chunk_evidence = _normalize_evidence(data, source_material=chunk, sentence_map=sentence_map)
+            locked_now, lineage_now = _merge_chunk_facts(chunk_evidence["facts"])
+
         except ValueError as exc:
             message = str(exc)
 
-            # Narrow retry for malformed/truncated JSON.
+            # Narrow retry only for malformed/truncated JSON.  The retry is still
+            # limited to the CURRENT small chunk; never resend the whole source.
             if "Invalid Ollama JSON" in message:
-                print(f"[PIPELINE] Evidence JSON retry | chunk={index}")
+                print(
+                    f"[PIPELINE] Evidence JSON retry | chunk={index} "
+                    f"| predict={EVIDENCE_RETRY_TOKENS}"
+                )
                 data = _call(
-                    _evidence_retry_prompt(chunk),
+                    _evidence_retry_prompt(chunk, indexed_source=indexed_chunk),
                     temperature=0.0,
                     num_predict=EVIDENCE_RETRY_TOKENS,
                     num_thread=NUM_THREADS,
                     response_format=_EVIDENCE_FORMAT,
                 )
-                maps.append(_normalize_evidence(data, source_material=chunk))
-                continue
+                chunk_evidence = _normalize_evidence(data, source_material=chunk, sentence_map=sentence_map)
+                locked_now, lineage_now = _merge_chunk_facts(chunk_evidence["facts"])
 
-            # Narrow retry for model-generated provenance IDs that do not exist
-            # in the deterministic sentence map. Do NOT silently remap IDs.
-            if "Evidence returned unknown source ids:" in message:
+            elif "Evidence returned unknown source ids:" in message:
                 invalid_ids = [
                     item.strip()
                     for item in message.split(":", 1)[1].split(",")
@@ -1162,77 +1364,49 @@ def _extract_evidence(source):
                     f"| invalid_ids={','.join(invalid_ids)}"
                 )
                 data = _call(
-                    _evidence_invalid_id_retry_prompt(chunk, invalid_ids),
+                    _evidence_invalid_id_retry_prompt(chunk, invalid_ids, indexed_source=indexed_chunk),
                     temperature=0.0,
                     num_predict=EVIDENCE_RETRY_TOKENS,
                     num_thread=NUM_THREADS,
                     response_format=_EVIDENCE_FORMAT,
                 )
-                maps.append(_normalize_evidence(data, source_material=chunk))
-                continue
+                chunk_evidence = _normalize_evidence(data, source_material=chunk, sentence_map=sentence_map)
+                locked_now, lineage_now = _merge_chunk_facts(chunk_evidence["facts"])
 
-            raise
+            else:
+                raise
 
-    facts = []
-    seen = set()
-
-    # If extraction is suspiciously sparse despite a large source, do one compact
-    # expansion pass over the same chunks. This preserves the compact JSON contract
-    # while preventing a rich source from collapsing to too few facts.
-    initial_fact_count = sum(len(x.get("facts", [])) for x in maps)
-    if (
-        EVIDENCE_EXPANSION
-        and len(maps)
-        and initial_fact_count <= 2
-        and len(source or "") >= 7000
-    ):
-        print(
-            f"[PIPELINE] Evidence sparse | initial_facts={initial_fact_count} "
-            f"| source_chars={len(source or '')} | requesting compact fact expansion..."
+        unique_units = int(
+            lineage_now.get("unique_information_units", len(locked_now))
         )
-        expanded_maps = []
-        for index, chunk in enumerate(chunks, 1):
-            data = _call(
-                _evidence_expansion_prompt(chunk),
-                temperature=0.0,
-                num_predict=EVIDENCE_TOKENS,
-                num_thread=NUM_THREADS,
-                response_format=_EVIDENCE_FORMAT,
-            )
-            expanded_maps.append(_normalize_evidence(data, source_material=chunk))
+        print(
+            f"[EVIDENCE PROGRESS] chunk={index}/{len(prepared_chunks)} "
+            f"| raw_accumulated={len(facts)} "
+            f"| unique_information_units={unique_units}"
+        )
 
-        # Preserve the initial extraction and add any new valid facts from the
-        # expansion pass. The existing deduplication/limit logic below remains
-        # the single final lock mechanism.
-        maps.extend(expanded_maps)
-
-    for chunk_no, data in enumerate(maps, 1):
-        group = f"C{chunk_no}-{data['primary_group']}"
-
-        for item in data["facts"]:
-            fact = dict(item)
-            fact["group"] = group
-
-            key = (
-                fact["fact"].lower(),
-                fact["excerpt"].lower(),
-            )
-            if key in seen:
-                continue
-
-            seen.add(key)
-            fact["id"] = f"F{len(facts) + 1}"
-            facts.append(fact)
+        # Stop only when the accumulated evidence is substantively sufficient,
+        # not merely because three lexical information units were found. This
+        # prevents generic/meta facts from causing an early stop before a later
+        # publisher chunk may contain the actual concrete development.
+        if _progressive_evidence_sufficient(locked_now, lineage_now):
+            stop_reason = "sufficient_substantive_evidence"
+            facts = [dict(item) for item in locked_now]
+            break
 
     if not facts:
         raise ValueError("Evidence extraction produced no usable facts.")
 
-    # Keep all provenance-verified facts, then collapse only facts that represent
-    # the same underlying information unit. This prevents syndicated/repeated
-    # reporting from inflating evidence count while preserving genuinely new details.
-    locked, lineage_stats = _deduplicate_evidence_facts(facts)
+    # The last successful chunk merge already computed the authoritative
+    # deduplicated evidence + lineage state. Re-running the full pairwise pass here
+    # only repeats work and can never add information that was not already merged.
+    locked = [dict(item) for item in locked_now]
+    lineage_stats = dict(lineage_now)
     redundancy = (
-        1.0 - (lineage_stats["unique_information_units"] / max(1, lineage_stats["raw_facts"]))
+        1.0 - (
+            lineage_stats["unique_information_units"]
+            / max(1, lineage_stats["raw_facts"])
+        )
     )
 
     print(
@@ -1243,58 +1417,73 @@ def _extract_evidence(source):
         f"| candidate_pairs={lineage_stats.get('candidate_pairs', 0)}"
     )
 
-    group_counts = {}
-    for fact in locked:
-        group_counts[fact["group"]] = group_counts.get(fact["group"], 0) + 1
-
-    primary_group = max(
-        group_counts,
-        key=group_counts.get,
-        default="C1-G1",
-    )
-
-    # Re-assign CORE/SUPPORTING only AFTER lineage deduplication.
-    # CORE is a small factual spine, not simply the first N extracted records.
-    # A conservative near-duplicate check keeps paraphrases/restatements out of
-    # the mandatory set even when the semantic lineage judge leaves them separate.
     locked = locked[:EVIDENCE_MAX_FACTS]
-    core_fact_ids = []
+
+    # IMPORTANT: preserve the evidence extractor's explicit CORE/SUPPORTING role.
+    # The previous implementation reset every fact to SUPPORTING and then promoted
+    # the first N facts to CORE. That silently discarded the extractor's semantic
+    # role decision and could turn incidental/background facts into mandatory
+    # coverage requirements. Production then rejected otherwise usable articles
+    # because the writer was forced to express facts that were not actually part
+    # of the story's factual spine.
+    explicit_core = [
+        fact_item for fact_item in locked
+        if fact_item.get("role") == "core" and str(fact_item.get("fact", "")).strip()
+    ]
+
+    # Keep the strongest explicit CORE facts only, while preserving their order and
+    # provenance. Do not manufacture additional CORE facts from list position.
     core_facts = []
-    for fact_item in locked:
-        fact_item["role"] = "supporting"
-
-    for fact_item in locked:
-        if len(core_fact_ids) >= min(CORE_FACTS_MAX, len(locked)):
+    for fact_item in explicit_core:
+        if len(core_facts) >= CORE_FACTS_MAX:
             break
-        fact_text = str(fact_item.get("fact", "")).strip()
-        if not fact_text:
-            continue
 
+        fact_text = str(fact_item.get("fact", "")).strip()
         is_near_duplicate = False
         for core_fact in core_facts:
             jaccard, sequence, containment = _fact_pair_similarity(
-                fact_text, str(core_fact.get("fact", ""))
+                fact_text,
+                str(core_fact.get("fact", "")),
             )
-            if sequence >= 0.72 or (containment and jaccard >= 0.50) or (jaccard >= 0.55 and sequence >= 0.60):
+            if (
+                sequence >= 0.72
+                or (containment and jaccard >= 0.50)
+                or (jaccard >= 0.55 and sequence >= 0.60)
+            ):
                 is_near_duplicate = True
                 break
 
         if is_near_duplicate:
+            # A near-duplicate CORE fact should not consume another mandatory
+            # coverage slot. Leave it SUPPORTING rather than promoting another
+            # arbitrary fact based on position.
+            fact_item["role"] = "supporting"
             continue
 
         fact_item["role"] = "core"
-        core_fact_ids.append(fact_item.get("id", ""))
         core_facts.append(fact_item)
 
+    # Fail-closed legacy fallback: only if the extractor returned no explicit CORE
+    # role at all, make the first usable fact CORE. This keeps malformed/legacy
+    # extraction responses publish-safe without recreating the old first-N behavior.
+    if not core_facts and locked:
+        for fact_item in locked:
+            if str(fact_item.get("fact", "")).strip():
+                fact_item["role"] = "core"
+                core_facts.append(fact_item)
+                break
+
     core_fact_ids = [
-        f["id"] for f in locked if f.get("role") == "core" and f.get("id")
+        f["id"] for f in locked
+        if f.get("role") == "core" and f.get("id")
     ]
     supporting_fact_ids = [
-        f["id"] for f in locked if f.get("role") == "supporting" and f.get("id")
+        f["id"] for f in locked
+        if f.get("role") == "supporting" and f.get("id")
     ]
 
     evidence = {
-        "primary_group": primary_group,
+        "primary_group": locked[0].get("group", "C1-G1") if locked else "C1-G1",
         "facts": locked,
         "core_fact_ids": core_fact_ids,
         "supporting_fact_ids": supporting_fact_ids,
@@ -1304,7 +1493,8 @@ def _extract_evidence(source):
     print(
         f"[PERF] Evidence ready | facts={len(evidence['facts'])} "
         f"| core={len(core_fact_ids)} | supporting={len(supporting_fact_ids)} "
-        f"| primary_group={primary_group}"
+        f"| processed_chunks={processed_chunks}/{len(prepared_chunks)} "
+        f"| stop_reason={stop_reason}"
     )
     print(
         f"[TIMER] Evidence extraction TOTAL | "
@@ -1412,6 +1602,7 @@ _ARTICLE_FORMAT = {
         "paragraphs": {
             "type": "array",
             "minItems": 1,
+            "maxItems": 6,
             "items": {
                 "type": "object",
                 "properties": {
@@ -1422,6 +1613,7 @@ _ARTICLE_FORMAT = {
                     },
                 },
                 "required": ["text", "fact_ids"],
+                "additionalProperties": False,
             },
         },
     },
@@ -1431,6 +1623,7 @@ _ARTICLE_FORMAT = {
         "h1",
         "paragraphs",
     ],
+    "additionalProperties": False,
 }
 
 
@@ -1476,18 +1669,25 @@ HARD FACTUAL LOCK:
 NEWSROOM STYLE:
 - Lead with the actual concrete event.
 - Develop the story using distinct locked facts and useful details.
+- When several distinct developments belong to the same story, give each important
+  development enough precise sentence-level treatment to be genuinely informative;
+  do not merely mention each fact in passing.
+- Do not compress a rich evidence set into one short sentence per fact simply to be brief.
 - Every substantive sentence must add information; never repeat a fact merely with synonyms.
-- Do not pad, compress away useful factual detail, or manufacture context.
+- Do not pad, manufacture context, or add unsupported detail.
 - No generic filler about importance, impact, significance, attention or expectations.
-- Supporting facts are usable information and should be included when they add distinct value.
+- Supporting facts are optional. Include them when they materially improve the reader's understanding, but do not force background details into the article.
 - Keep the article coherent and naturally structured.
 - No word-count target or minimum length.
 
 COVERAGE:
-- Every locked fact must be explicitly communicated in the article body.
+- Every CORE fact must be explicitly communicated in the article body.
+- SUPPORTING facts may be omitted when they are background rather than necessary to understand the concrete development.
 - Attach fact_ids ONLY to paragraphs that genuinely communicate those facts.
 - Do not add an ID merely to satisfy coverage.
 - Before returning, silently verify every locked fact is covered and nothing unsupported was added.
+- Keep the article concise enough to finish the complete JSON object; never stop mid-paragraph or mid-JSON.
+- The final character of the response must close the JSON object.
 
 HEADLINE:
 - title and h1 must be identical.
@@ -1520,8 +1720,8 @@ def _normalize_generated_article(article, evidence):
     if not isinstance(raw_paragraphs, list) or not raw_paragraphs:
         raise ValueError("Article generator returned no paragraphs.")
 
-    # Every locked fact ID is valid paragraph metadata. ALL locked facts are the
-    # mandatory coverage universe; CORE/SUPPORTING is prioritisation only.
+    # Every locked fact ID is valid paragraph metadata. CORE facts are the
+    # mandatory coverage universe; SUPPORTING facts are optional context.
     all_fact_ids = {
         str(f.get("id", "")).strip()
         for f in (evidence.get("facts", []) if isinstance(evidence, dict) else [])
@@ -1538,7 +1738,10 @@ def _normalize_generated_article(article, evidence):
         else set()
     )
     valid_fact_ids = all_fact_ids
-    required_fact_ids = all_fact_ids
+    # Core facts define the mandatory factual spine. Supporting facts remain
+    # available to the writer but are optional, matching generate.py's publication
+    # guard and preventing background context from causing false coverage rejects.
+    required_fact_ids = core_fact_ids or all_fact_ids
     covered = set()
     paragraphs = []
 
@@ -1562,7 +1765,7 @@ def _normalize_generated_article(article, evidence):
             raise ValueError(f"Paragraph {index} has no fact coverage metadata.")
         paragraphs.append(text)
 
-    # ALL locked facts are mandatory for coverage. SUPPORTING facts are not optional.
+    # CORE facts are mandatory for coverage. SUPPORTING facts are optional.
     missing = sorted(
         required_fact_ids - covered,
         key=lambda x: int(x[1:]) if x[1:].isdigit() else 999999,
@@ -1578,6 +1781,16 @@ def _normalize_generated_article(article, evidence):
         "description": article["description"].strip(),
         "h1": article["h1"].strip(),
         "paragraphs": paragraphs,
+        # Internal-only coverage map. It is validated above and removed by
+        # generate.py after the post-generation coverage guard.
+        "_declared_fact_ids": [
+            fid for fid in (
+                fact_id
+                for item in raw_paragraphs
+                for fact_id in (item.get("fact_ids", []) if isinstance(item, dict) else [])
+            )
+            if str(fid).strip() in valid_fact_ids
+        ],
     }
     return clean
 
@@ -1591,18 +1804,56 @@ def _generate_article(evidence, source_context=None):
     word target and no generated-length check is performed here.
     """
     fact_count = len(evidence.get("facts", [])) if isinstance(evidence, dict) else 0
-    # Give richer evidence enough JSON/prose capacity while keeping the CPU path
-    # bounded. This is a token ceiling, not a content requirement.
-    dynamic_tokens = min(460, max(ARTICLE_TOKENS, 340 + fact_count * 30))
-    raw_article = _call(
-        _article_prompt(evidence, source_context=source_context),
-        temperature=0.08,
-        num_predict=dynamic_tokens,
-        num_thread=NUM_THREADS,
-        response_format=_ARTICLE_FORMAT,
-        stage="article_generation",
+    # The previous 360-token hard ceiling was too close to the actual output size:
+    # production showed otherwise-good articles reaching the ceiling mid-JSON.
+    # Keep this as a response-capacity setting, never as a word target.
+    dynamic_tokens = min(
+        ARTICLE_RETRY_TOKENS,
+        max(ARTICLE_TOKENS, 480 + max(0, fact_count - 4) * 30),
     )
-    return _normalize_generated_article(raw_article, evidence)
+
+    prompt = _article_prompt(evidence, source_context=source_context)
+
+    try:
+        raw_article = _call(
+            prompt,
+            temperature=0.08,
+            num_predict=dynamic_tokens,
+            num_thread=NUM_THREADS,
+            response_format=_ARTICLE_FORMAT,
+            stage="article_generation",
+        )
+        return _normalize_generated_article(raw_article, evidence)
+
+    except ValueError as exc:
+        message = str(exc)
+
+        # Recover only from an invalid/incomplete JSON envelope. Do NOT retry
+        # coverage failures, schema/content failures, or factual validation.
+        # A second call is therefore strictly a serialization-capacity recovery,
+        # not a hidden article-quality or factual repair loop.
+        if "Invalid Ollama JSON:" not in message:
+            raise
+
+        retry_tokens = max(
+            ARTICLE_RETRY_TOKENS,
+            dynamic_tokens + 80,
+        )
+
+        print(
+            f"[PIPELINE] Article JSON retry | reason=incomplete_or_invalid_json "
+            f"| predict={retry_tokens}"
+        )
+
+        raw_article = _call(
+            prompt,
+            temperature=0.08,
+            num_predict=retry_tokens,
+            num_thread=NUM_THREADS,
+            response_format=_ARTICLE_FORMAT,
+            stage="article_generation_retry",
+        )
+        return _normalize_generated_article(raw_article, evidence)
 
 
 # ============================================================
@@ -1644,6 +1895,12 @@ def _sanitize_article(article):
         "h1": article["h1"].strip(),
         "paragraphs": [],
     }
+    if isinstance(article.get("_declared_fact_ids"), list):
+        clean["_declared_fact_ids"] = list(dict.fromkeys(
+            str(fid).strip()
+            for fid in article["_declared_fact_ids"]
+            if str(fid).strip()
+        ))
 
     for paragraph in article["paragraphs"]:
         text = paragraph.strip()
@@ -1680,7 +1937,7 @@ def generate(prompt, retries=0, evidence=None):
             f"facts={len(evidence.get('facts', []))}"
         )
     else:
-        print("[PIPELINE] Building balanced evidence lock...")
+        print("[PIPELINE] Building progressive evidence lock...")
         evidence = _extract_evidence(prompt)
 
     print("[PIPELINE] Generating coverage-first evidence-locked article...")

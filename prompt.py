@@ -96,15 +96,33 @@ introduction before the news.
 Then develop the story naturally:
 - lead with what happened;
 - add the most important distinct verified details;
+- develop each materially useful development enough for the reader to understand it;
 - add directly useful context, reaction, status, timing, numbers, location or
   consequences only when explicitly supported;
 - finish when the useful factual coverage is complete.
+
+IMPORTANT EDITORIAL DEPTH RULE:
+Do not confuse factual coverage with merely mentioning a fact. When the locked
+evidence contains several distinct developments that belong to the same story,
+give those developments clear sentence-level treatment and connect them into a
+natural news narrative. Do not compress a rich evidence set into one short
+sentence per fact simply because each fact has technically been mentioned.
+A fact may be stated once, but it should be stated with enough precise detail to
+be informative when the evidence supports that detail.
+
+For a story with several distinct verified developments, the article should
+normally progress through them in a natural order: the main development first,
+followed by the most important supporting developments and useful context.
+Use separate paragraphs when that improves clarity. Do not merge unrelated
+developments merely to keep the article short.
 
 Every substantive sentence must either:
 1. add genuinely new factual information, or
 2. provide necessary attribution for a factual claim.
 
-Facts may be combined naturally in one sentence.
+Facts may be combined naturally in one sentence when they are closely related,
+but do not combine several independent developments into a compressed sentence
+if separate treatment would make the story clearer and more informative.
 
 Write coherent newsroom prose, NOT:
 - a fact list;
@@ -113,7 +131,9 @@ Write coherent newsroom prose, NOT:
 - an analytical essay;
 - a generic explanation of why the story matters.
 
-Do not manufacture depth.
+Do not manufacture depth. Do not repeat facts. Do not add unsupported context.
+The goal is complete, informative treatment of the useful verified evidence,
+not minimum length and not maximum length.
 
 ============================================================
 4. FACT COVERAGE WITHOUT REPETITION
@@ -132,14 +152,16 @@ If two source articles repeat the same information, report it once unless anothe
 source adds a genuinely new detail.
 
 Use additional distinct PRIMARY STORY facts when they materially improve the
-reader's understanding. Do not force every evidence item into the article.
+reader's understanding. When such facts are present, do not merely mention them
+in passing: give each important development enough precise sentence-level
+treatment to make the article genuinely informative.
 
 The target is the most informative natural article supported by the evidence,
-NOT the longest possible article.
+NOT the longest possible article and NOT the shortest possible article.
 
 If the evidence supports a short article, write a short article.
-If it supports richer coverage, use the additional distinct facts.
-Never pad for length.
+If it supports richer coverage, fully develop the useful distinct facts.
+Never pad, but never compress away useful verified detail just to be brief.
 
 ============================================================
 5. DATES AND EVENT STATUS
@@ -261,16 +283,22 @@ Use natural paragraphing.
 
 There is NO fixed paragraph count and NO word-count target.
 
-Choose the number of paragraphs from the editorial flow of the story.
+Choose the number of paragraphs from the editorial flow and factual richness of
+the story.
 
-- One useful fact may be one paragraph.
-- Several distinct facts may require several paragraphs.
+- A genuinely simple story may need only a small number of paragraphs.
+- Several distinct verified developments should normally be developed across
+  several paragraphs when that improves clarity.
+- Do not put one short sentence in each paragraph mechanically; paragraphs should
+  group closely related information naturally.
 - Never split a fact merely to create another paragraph.
 - Never create a paragraph merely to satisfy a structural target.
 - Never add a generic conclusion.
+- Do not shorten a factually rich story merely because no paragraph count or word
+  count is required.
 
-Each paragraph should have a clear informational purpose and should advance the
-same primary story.
+Each paragraph should have a clear informational purpose, contain enough
+sentence-level detail to be useful, and advance the same primary story.
 
 ============================================================
 11. FINAL INTERNAL CHECK
@@ -286,9 +314,11 @@ Before returning the JSON, silently check:
 6. Does every substantive sentence add new information or necessary attribution?
 7. Did I repeat any underlying fact?
 8. Are useful, distinct primary-story facts unnecessarily omitted?
-9. If no useful fact remains, did I stop instead of padding?
-10. Do title and H1 match and satisfy both headline limits?
-11. Does the article read like normal newsroom copy?
+9. Did I give important verified developments enough explicit detail rather than
+   merely mentioning them?
+10. If no useful fact remains, did I stop instead of padding?
+11. Do title and H1 match and satisfy both headline limits?
+12. Does the article read like normal newsroom copy?
 
 Return ONLY valid JSON in exactly this structure:
 
