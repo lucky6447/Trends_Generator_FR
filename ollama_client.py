@@ -18,13 +18,13 @@ import generator_monitor as monitor
 #   -> conservative evidence lineage deduplication
 #   -> deterministic substantive-value gate
 #   -> one newsroom article generation
-#   -> post-generation factual audit (owned by generate.py)
+#   -> deterministic generation-coverage metadata validation
 #
 # Design principles:
 #   * factual closure: the writer cannot add outside information
 #   * newsroom prose: report the story, do not paraphrase a fact list
 #   * no artificial word floor and no length retry
-#   * no repair/regeneration loop in this module
+#   * one-pass article generation after evidence locking
 #   * no cross-event article construction
 #   * preserve multilingual operation
 # ============================================================
@@ -89,7 +89,7 @@ WRITER_SOURCE_CONTEXT_CHARS = max(4000, int(os.getenv("OLLAMA_WRITER_SOURCE_CONT
 ARTICLE_TOKENS = max(480, int(os.getenv("OLLAMA_ARTICLE_TOKENS", "480")))
 # Article generation gets a bounded overflow retry only when the JSON response is
 # actually truncated/malformed. This is a transport/serialization recovery path,
-# not a factual repair or quality regeneration loop.
+# not a second generation or content-quality loop.
 ARTICLE_RETRY_TOKENS = max(
     ARTICLE_TOKENS + 80,
     int(os.getenv("OLLAMA_ARTICLE_RETRY_TOKENS", "640")),
@@ -1553,8 +1553,8 @@ def _article_structure_check(article, evidence):
 
     Article length and paragraph count are editorial outcomes of the evidence and
     the writer. This function only verifies that usable prose exists. Factual
-    coverage is handled by the fact-id lock and the production factual audit in
-    generate.py.
+    coverage is handled by the fact-id lock and deterministic downstream
+    publication checks.
     """
     facts = evidence.get("facts", []) if isinstance(evidence, dict) else []
     fact_count = len(facts) if isinstance(facts, list) else 0
@@ -1592,7 +1592,7 @@ def _article_structure_check(article, evidence):
 # Article generation
 
 # The model writes an internal fact coverage map together with the prose.
-# The map is never published; Python validates it before the factual audit.
+# The map is never published; Python validates it before returning the article.
 _ARTICLE_FORMAT = {
     "type": "object",
     "properties": {
@@ -1791,7 +1791,7 @@ def _normalize_generated_article(article, evidence):
         "h1": article["h1"].strip(),
         "paragraphs": paragraphs,
         # Internal-only coverage map. It is validated above and removed by
-        # generate.py after the post-generation coverage guard.
+        # the caller after generation.
         "_declared_fact_ids": [
             fid for fid in (
                 fact_id
@@ -1840,7 +1840,7 @@ def _generate_article(evidence, source_context=None):
         # Recover only from an invalid/incomplete JSON envelope. Do NOT retry
         # coverage failures, schema/content failures, or factual validation.
         # A second call is therefore strictly a serialization-capacity recovery,
-        # not a hidden article-quality or factual repair loop.
+        # not a hidden article-quality or second-generation loop.
         if "Invalid Ollama JSON:" not in message:
             raise
 
@@ -1870,7 +1870,7 @@ def _generate_article(evidence, source_context=None):
 # ============================================================
 
 # Public compatibility API used by generate.py.
-# These wrappers intentionally contain no LLM factual audit or repair path.
+# These wrappers intentionally contain no post-generation repair path.
 def extract_evidence(source):
     return _extract_evidence(source)
 
@@ -1928,10 +1928,10 @@ def generate(prompt, retries=0, evidence=None):
 
     Flow:
         evidence -> newsroom article -> deterministic structure gate ->
-        return to caller for the single post-generation factual audit
+        return to caller for downstream publication checks
 
-    There is deliberately NO repair, recursive regeneration, second article
-    generation, or duplicate factual audit in this module. No post-generation factual audit is run in this benchmark path.
+    There is deliberately NO repair loop, recursive regeneration, or second
+    article-generation loop in this module.
     single production factual-validation authority in generate.py.
     """
     pipeline_start = time.perf_counter()
@@ -1965,9 +1965,8 @@ def generate(prompt, retries=0, evidence=None):
         article, evidence, label="Coverage-first structure"
     )
 
-    # Factual validation is intentionally NOT performed here.
-    # generate.py owns the single production factual-validation authority.
-    print("[PIPELINE] Article generation complete | factual validation delegated to generate.py")
+    # The module ends after deterministic generation and structure validation.
+    print("[PIPELINE] Article generation complete | one-pass generation")
     print(
         f"[TIMER] PIPELINE TOTAL | "
         f"elapsed={time.perf_counter() - pipeline_start:.2f}s"

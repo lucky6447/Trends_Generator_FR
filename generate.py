@@ -2373,201 +2373,330 @@ def _release_cross_run_story_reservation(reservation):
 
 
 # ============================================================
-# Deterministic Fact Consistency Guard
+# Evidence -> Generation Coverage
 # ============================================================
 
-_FACT_GUARD_STOPWORDS = {
-    "the","and","for","with","from","that","this","was","were","has","have","had",
-    "are","is","its","into","after","before","over","under","about","than","then",
-    "they","their","them","there","which","while","also","been","being","will",
-    "would","could","should","said","says","according","official","officials",
-    "new","latest","news","report","reports","story","article","podcast",
+_EVIDENCE_COVERAGE_STOPWORDS = {
+    "the", "and", "for", "with", "from", "that", "this",
+    "was", "were", "has", "have", "had", "are", "is",
+    "its", "into", "after", "before", "over", "under",
+    "about", "than", "then", "they", "their", "them",
+    "there", "which", "while", "also", "been", "being",
+    "will", "would", "could", "should", "said", "says",
+    "according", "official", "officials", "new", "latest",
+    "news", "report", "reports", "story", "article",
 }
 
-def _measure_fact_expression(article, generation_evidence):
-    """Deterministically verify substantive support for every declared locked fact.
 
-    fact_ids are provenance metadata, not proof of coverage. Each locked fact must
-    have at least one paragraph containing meaningful lexical support from the
-    locked fact/excerpt. This gate is fail-closed and never calls or retries Ollama.
-    """
-    facts = generation_evidence.get("facts", []) if isinstance(generation_evidence, dict) else []
-    facts = [f for f in facts if isinstance(f, dict) and str(f.get("id", "")).strip() and str(f.get("fact", "")).strip()]
-    paragraphs = article.get("paragraphs", []) if isinstance(article, dict) else []
-    paragraphs = [str(p).strip() for p in paragraphs if str(p).strip()]
-    article_text = " ".join(paragraphs).strip()
-    article_words = len(article_text.split())
+def _evidence_coverage_tokens(text):
+    """Return conservative meaningful tokens for evidence coverage."""
+    normalized = unicodedata.normalize(
+        "NFKD",
+        str(text or ""),
+    ).encode("ascii", "ignore").decode("ascii").casefold()
 
-    if not facts or not paragraphs:
-        return {
-            "status": "UNAVAILABLE", "method": "substantive_lexical_fact_support",
-            "locked_facts": len(facts), "expressed_facts": 0, "coverage": None,
-            "information_density": None, "expressed_fact_ids": [],
-            "core_facts": len(generation_evidence.get("core_fact_ids", []) or []),
-            "expressed_core_facts": 0, "core_coverage": None,
-            "supporting_facts": len(generation_evidence.get("supporting_fact_ids", []) or []),
-            "expressed_supporting_facts": 0, "supporting_coverage": None,
-            "article_words": article_words,
-            "unsupported_fact_ids": [str(f.get("id", "")).strip() for f in facts],
-        }
-
-    import re
-    stopwords = {
-        "the","and","for","with","from","that","this","was","were","has","have","had",
-        "are","is","its","into","after","before","over","under","about","than","then",
-        "they","their","them","there","which","while","also","been","being","will","would",
-        "could","should","said","says","according","official","officials","new","latest","news",
-        "story","article","reported","reportedly","report","reports",
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", normalized)
+        if len(token) >= 3
+        and token not in _EVIDENCE_COVERAGE_STOPWORDS
     }
 
-    def tokens(text):
-        return {t.casefold() for t in re.findall(r"[\w’'-]+", str(text or ""), flags=re.UNICODE)
-                if len(t) > 2 and t.casefold() not in stopwords}
 
-    def numbers(text):
-        return set(re.findall(r"\b\d+(?:[.,:/-]\d+)*%?\b", str(text or "")))
+def _evidence_coverage_numbers(text):
+    """Return factual numeric tokens used as a strong coverage signal."""
+    return set(
+        re.findall(
+            r"\b\d+(?:[.,:/-]\d+)*%?\b",
+            str(text or ""),
+        )
+    )
 
-    paragraph_tokens = [tokens(p) for p in paragraphs]
-    paragraph_numbers = [numbers(p) for p in paragraphs]
-    expressed_ids = []
+
+def _check_evidence_generation_coverage(article, generation_evidence):
+    """
+    Lightweight deterministic post-generation evidence coverage check.
+
+    Purpose:
+      Verify that locked evidence facts are actually expressed by the
+      generated article.
+
+    This is NOT:
+      - a factuality checker
+      - an LLM judge
+      - a repair mechanism
+      - a regeneration mechanism
+
+    Policy:
+      - every locked evidence fact is mandatory;
+      - 100% coverage is required;
+      - missing facts cause rejection;
+      - no repair and no regeneration are attempted.
+    """
+    facts = (
+        generation_evidence.get("facts", [])
+        if isinstance(generation_evidence, dict)
+        else []
+    )
+
+    paragraphs = (
+        article.get("paragraphs", [])
+        if isinstance(article, dict)
+        else []
+    )
+
+    facts = [
+        fact
+        for fact in facts
+        if isinstance(fact, dict)
+        and str(fact.get("id", "")).strip()
+        and str(fact.get("fact", "")).strip()
+    ]
+
+    paragraphs = [
+        str(paragraph).strip()
+        for paragraph in paragraphs
+        if str(paragraph).strip()
+    ]
+
+    if not facts:
+        result = {
+            "status": "PASS",
+            "locked_facts": 0,
+            "covered_facts": 0,
+            "coverage": 1.0,
+            "missing_fact_ids": [],
+            "covered_fact_ids": [],
+            "support_debug": {},
+        }
+
+        monitor.candidate_event(
+            "evidence_generation_coverage",
+            **result,
+        )
+
+        print(
+            "[EVIDENCE -> GENERATION COVERAGE] PASS | "
+            "locked=0 | covered=0 | coverage=1.000"
+        )
+
+        return result
+
+    if not paragraphs:
+        missing_ids = [
+            str(fact["id"]).strip()
+            for fact in facts
+        ]
+
+        result = {
+            "status": "REJECT",
+            "locked_facts": len(facts),
+            "covered_facts": 0,
+            "coverage": 0.0,
+            "missing_fact_ids": missing_ids,
+            "covered_fact_ids": [],
+            "support_debug": {},
+        }
+
+        monitor.candidate_event(
+            "evidence_generation_coverage",
+            **result,
+        )
+
+        print(
+            "[EVIDENCE -> GENERATION COVERAGE] REJECT | "
+            f"locked={len(facts)} | covered=0 | "
+            f"coverage=0.000 | missing={missing_ids}"
+        )
+
+        return result
+
+    article_text = " ".join(paragraphs)
+    article_tokens = _evidence_coverage_tokens(article_text)
+    article_numbers = _evidence_coverage_numbers(article_text)
+
+    covered_ids = []
+    missing_ids = []
     support_debug = {}
 
     for fact in facts:
-        fid = str(fact["id"]).strip()
+        fact_id = str(fact["id"]).strip()
         fact_text = str(fact.get("fact", "")).strip()
         excerpt = str(fact.get("excerpt", "")).strip()
-        reference_tokens = tokens(fact_text) | tokens(excerpt)
-        fact_numbers = numbers(fact_text) | numbers(excerpt)
-        best = (0.0, 0, 0, None)
 
-        for idx, p_tokens in enumerate(paragraph_tokens):
-            if not p_tokens or not reference_tokens:
-                continue
-            overlap = len(p_tokens & reference_tokens)
-            score = overlap / max(1, min(len(reference_tokens), 12))
-            number_hits = len(fact_numbers & paragraph_numbers[idx])
-            if fact_numbers and number_hits:
-                score = max(score, min(1.0, 0.45 + 0.10 * number_hits))
-            candidate = (score, overlap, number_hits, idx + 1)
-            if candidate[:3] > best[:3]:
-                best = candidate
+        reference_tokens = (
+            _evidence_coverage_tokens(fact_text)
+            | _evidence_coverage_tokens(excerpt)
+        )
 
-        score, overlap, number_hits, paragraph = best
-        fact_word_count = len(tokens(fact_text))
-        if fact_word_count <= 4:
-            supported = overlap >= 2 or number_hits >= 1
+        fact_numbers = (
+            _evidence_coverage_numbers(fact_text)
+            | _evidence_coverage_numbers(excerpt)
+        )
+
+        overlap = len(reference_tokens & article_tokens)
+        token_coverage = (
+            overlap / len(reference_tokens)
+            if reference_tokens
+            else 0.0
+        )
+        number_match = bool(fact_numbers & article_numbers)
+
+        # Conservative coverage rule:
+        #   - numbered facts require the number + at least two meaningful tokens;
+        #   - short facts require two meaningful tokens;
+        #   - longer facts require at least three meaningful tokens and 25% coverage.
+        if fact_numbers:
+            covered = number_match and overlap >= 2
+        elif len(reference_tokens) <= 4:
+            covered = overlap >= 2
         else:
-            supported = overlap >= 3 and score >= 0.25
+            covered = overlap >= 3 and token_coverage >= 0.25
 
-        support_debug[fid] = {
-            "paragraph": paragraph, "score": round(score, 3),
-            "overlap": overlap, "number_hits": number_hits,
-            "supported": supported,
+        support_debug[fact_id] = {
+            "overlap": overlap,
+            "reference_tokens": len(reference_tokens),
+            "token_coverage": round(token_coverage, 3),
+            "number_match": number_match,
+            "covered": covered,
         }
-        if supported:
-            expressed_ids.append(fid)
 
-    valid_ids = {str(f["id"]).strip() for f in facts}
-    expressed_ids = [fid for fid in expressed_ids if fid in valid_ids]
-    expressed_set = set(expressed_ids)
-    core_ids = {str(v).strip() for v in (generation_evidence.get("core_fact_ids", []) or [])}
-    supporting_ids = {str(v).strip() for v in (generation_evidence.get("supporting_fact_ids", []) or [])}
-    expressed_core = len(core_ids & expressed_set)
-    expressed_supporting = len(supporting_ids & expressed_set)
-    coverage = len(expressed_ids) / len(facts) if facts else None
+        if covered:
+            covered_ids.append(fact_id)
+        else:
+            missing_ids.append(fact_id)
 
-    print(
-        f"[FACT EXPRESSION] substantive lexical support | locked={len(facts)} | "
-        f"expressed={len(expressed_ids)} | coverage={coverage:.3f} | "
-        f"core_coverage={expressed_core / len(core_ids) if core_ids else None!r}"
-    )
-    return {
-        "status": "PASS", "method": "substantive_lexical_fact_support",
-        "locked_facts": len(facts), "expressed_facts": len(expressed_ids),
+    coverage = len(covered_ids) / len(facts) if facts else 1.0
+    status = "PASS" if not missing_ids else "REJECT"
+
+    result = {
+        "status": status,
+        "locked_facts": len(facts),
+        "covered_facts": len(covered_ids),
         "coverage": coverage,
-        "information_density": (len(expressed_ids) / article_words * 100) if article_words else None,
-        "expressed_fact_ids": expressed_ids,
-        "core_facts": len(core_ids), "expressed_core_facts": expressed_core,
-        "core_coverage": expressed_core / len(core_ids) if core_ids else None,
-        "supporting_facts": len(supporting_ids), "expressed_supporting_facts": expressed_supporting,
-        "supporting_coverage": expressed_supporting / len(supporting_ids) if supporting_ids else None,
-        "article_words": article_words,
-        "unsupported_fact_ids": [fid for fid in valid_ids if fid not in expressed_set],
+        "missing_fact_ids": missing_ids,
+        "covered_fact_ids": covered_ids,
         "support_debug": support_debug,
     }
 
-def generate_valid_article(prompt=None, reference_date=None, trend=None, prelocked_evidence=None):
-    """Generate once and publish after deterministic/language/repetition validation.
+    print(
+        f"[EVIDENCE -> GENERATION COVERAGE] {status} | "
+        f"locked={len(facts)} | covered={len(covered_ids)} | "
+        f"coverage={coverage:.3f} | missing={missing_ids}"
+    )
 
-    Fact-expression is measured from the validated fact-ID coverage map. There is
-    no second LLM call, factual repair, or regeneration loop.
+    monitor.candidate_event(
+        "evidence_generation_coverage",
+        status=status,
+        locked_facts=len(facts),
+        covered_facts=len(covered_ids),
+        coverage=coverage,
+        missing_fact_ids=missing_ids,
+    )
+
+    return result
+
+
+def generate_valid_article(prompt=None, reference_date=None, trend=None, prelocked_evidence=None):
+    """Generate once and validate without fact repair or regeneration.
+
+    Locked evidence is authoritative at extraction/lock time. After the single
+    generation pass, a lightweight deterministic coverage check verifies that
+    every locked evidence fact is expressed by the generated article.
     """
     try:
-        generation_evidence = _enrich_evidence_for_generation(prelocked_evidence, trend)
-        article = generate("", evidence=generation_evidence)
-        # The HTML renderer does not parse Markdown. Strip model-emitted
-        # emphasis markers before any validation/rendering so literal "*" and
-        # "**" cannot leak into titles, metadata, or article paragraphs.
+        generation_evidence = _enrich_evidence_for_generation(
+            prelocked_evidence,
+            trend,
+        )
+
+        article = generate(
+            "",
+            evidence=generation_evidence,
+        )
+
         article = _sanitize_article_markdown(article)
         validate_article(article)
-        # Paragraph count is intentionally unrestricted; this gate checks only usable structure.
-        validate_article_structure(article, generation_evidence, label="Initial newsroom article")
+
+        validate_article_structure(
+            article,
+            generation_evidence,
+            label="Initial newsroom article",
+        )
+
         locked_facts = generation_evidence.get("facts", [])
         core_fact_ids = generation_evidence.get("core_fact_ids", [])
         supporting_fact_ids = generation_evidence.get("supporting_fact_ids", [])
-        paragraph_text = " ".join(str(p) for p in article.get("paragraphs", [])).strip()
+        paragraph_text = " ".join(
+            str(p) for p in article.get("paragraphs", [])
+        ).strip()
+
         if isinstance(locked_facts, list) and len(locked_facts) >= 1:
-            print(f"[EVIDENCE COVERAGE] locked_facts={len(locked_facts)} | core_facts={len(core_fact_ids)} | supporting_facts={len(supporting_fact_ids)} | article_words={len(paragraph_text.split())}")
-        fact_expression = _measure_fact_expression(article, generation_evidence)
-        # The validated coverage map is internal-only and must never reach rendering.
-        article.pop("_declared_fact_ids", None)
-        # Every locked evidence fact is mandatory for publication.
-        # This is deliberately not a word floor: article length remains evidence-driven.
-        if fact_expression.get("status") == "PASS":
-            coverage = fact_expression.get("coverage")
-            core_coverage = fact_expression.get("core_coverage")
-            supporting_coverage = fact_expression.get("supporting_coverage")
-            locked_facts = int(fact_expression.get("locked_facts") or 0)
-
-            # Every locked fact must be explicitly expressed by the generated article.
-            # Supporting facts are no longer diagnostic-only.
-            if locked_facts > 0 and (coverage is None or coverage < 1.0):
-                print(
-                    "[FACT CONSISTENCY GUARD] FAIL | "
-                    f"coverage={coverage!r} | "
-                    f"expressed_facts={fact_expression.get('expressed_facts')} | "
-                    f"locked_facts={locked_facts} | "
-                    f"core_coverage={core_coverage!r} | "
-                    f"supporting_coverage={supporting_coverage!r}"
-                )
-                raise Exception("Article omitted one or more locked evidence facts.")
-
             print(
-                "[FACT CONSISTENCY GUARD] PASS | "
-                f"coverage={coverage!r} | "
-                f"core_coverage={core_coverage!r} | "
-                f"supporting_coverage={supporting_coverage!r}"
+                f"[EVIDENCE COVERAGE] locked_facts={len(locked_facts)} | "
+                f"core_facts={len(core_fact_ids)} | "
+                f"supporting_facts={len(supporting_fact_ids)} | "
+                f"article_words={len(paragraph_text.split())}"
             )
-        else:
-            print("[FACT CONSISTENCY GUARD] UNAVAILABLE — publication blocked")
-            raise Exception("Fact-expression validation unavailable; publication blocked.")
-        normalized_headline = _shorten_headline(article.get("title", ""))
-        article["title"] = normalized_headline; article["h1"] = normalized_headline
+
+        evidence_coverage = _check_evidence_generation_coverage(
+            article,
+            generation_evidence,
+        )
+
+        article.pop("_declared_fact_ids", None)
+
+        if evidence_coverage.get("status") != "PASS":
+            print(
+                "[EVIDENCE -> GENERATION COVERAGE] FAIL | "
+                "article discarded; NO REPAIR; NO REGENERATION"
+            )
+            raise Exception(
+                "Generated article omitted one or more locked evidence facts."
+            )
+
+        normalized_headline = _shorten_headline(
+            article.get("title", "")
+        )
+        article["title"] = normalized_headline
+        article["h1"] = normalized_headline
+
         article = enforce_headline_policy(article, trend)
-        validate_article(article); validate_language_integrity(article)
+        validate_article(article)
+        validate_language_integrity(article)
         print("[LANGUAGE GUARD] PASS")
-        repetition = _run_repetition_guard(article, generation_evidence)
+
+        repetition = _run_repetition_guard(
+            article,
+            generation_evidence,
+        )
+
         if repetition.get("status") != "PASS":
-            print("[REPETITION GUARD] FAIL — article discarded; NO REPAIR")
-            print(json.dumps(repetition, ensure_ascii=False, indent=2))
-            raise Exception("Repetition Guard blocked article; publication blocked.")
+            print(
+                "[REPETITION GUARD] FAIL — "
+                "article discarded; NO REPAIR"
+            )
+            print(
+                json.dumps(
+                    repetition,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            raise Exception(
+                "Repetition Guard blocked article; publication blocked."
+            )
+
         validate_language_integrity(article)
         print("[LANGUAGE GUARD] FINAL ARTICLE PASS")
-        article["_fact_expression"] = fact_expression
+
+        article["_evidence_generation_coverage"] = evidence_coverage
         return article
+
     except Exception as e:
         print(f"Validation failed: {e}")
         raise
+
 def run_git(cmd):
     print("\n" + "=" * 60)
     print("Running:", " ".join(cmd))
@@ -2644,7 +2773,7 @@ def _fetch_broad_news_fallback_seeds():
 
 
 def main():
-    monitor.start_run(language=LANGUAGE, model=MODEL, pipeline="universal-fact-lock-v2.9.5-ministral-all-facts-no-word-floor", max_articles=MAX_ARTICLES_PER_RUN)
+    monitor.start_run(language=LANGUAGE, model=MODEL, pipeline="universal-evidence-lock-v3.0-ministral-all-facts-no-word-floor", max_articles=MAX_ARTICLES_PER_RUN)
     processed = load_processed()
 
     # Direct publisher RSS is the permanent discovery root.
@@ -3162,7 +3291,10 @@ def main():
                         prelocked_evidence=evidence_lock,
                     )
 
-                    fact_expression = article.pop("_fact_expression", {})
+                    evidence_coverage = article.pop(
+                        "_evidence_generation_coverage",
+                        {},
+                    )
                     _paragraph_text = " ".join(
                         str(p) for p in article.get("paragraphs", [])
                     ).strip()
@@ -3181,13 +3313,9 @@ def main():
                             else None
                         ),
                         evidence_facts=_locked_facts,
-                        evidence_coverage=fact_expression.get("coverage"),
-                        information_density=fact_expression.get("information_density"),
-                        expressed_facts=fact_expression.get("expressed_facts"),
-                        expressed_core_facts=fact_expression.get("expressed_core_facts"),
-                        core_coverage=fact_expression.get("core_coverage"),
-                        expressed_supporting_facts=fact_expression.get("expressed_supporting_facts"),
-                        supporting_coverage=fact_expression.get("supporting_coverage"),
+                        evidence_coverage=evidence_coverage.get("coverage"),
+                        evidence_covered_facts=evidence_coverage.get("covered_facts"),
+                        evidence_missing_fact_ids=evidence_coverage.get("missing_fact_ids"),
                     )
 
                     base_slug = slugify(keyword)

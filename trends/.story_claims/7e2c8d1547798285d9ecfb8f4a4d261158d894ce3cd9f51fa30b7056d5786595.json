@@ -1,0 +1,67 @@
+{
+  "topic_title": "Economie : la France au bord de la récession ? que dit le gouvernement ?",
+  "evidence_lock": {
+    "primary_group": "G1",
+    "facts": [
+      {
+        "id": "F1",
+        "group": "G1",
+        "fact": "67% des Français estiment que leur pouvoir d'achat a baissé ces derniers mois en raison de la hausse des prix des carburants et de certains produits alimentaires après la sécheresse exceptionnelle de l'été.",
+        "excerpt": "Sous le coup d'une hausse des prix des carburants et de certains produits alimentaires après la sécheresse exceptionnelle de l'été, deux Français sur trois (67%) ont le sentiment que leur pouvoir d'achat a baissé ces derniers mois.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "core",
+        "lineage_members": [
+          "F1",
+          "F3"
+        ],
+        "lineage_source_excerpts": [
+          "Sous le coup d'une hausse des prix des carburants et de certains produits alimentaires après la sécheresse exceptionnelle de l'été, deux Français sur trois (67%) ont le sentiment que leur pouvoir d'achat a baissé ces derniers mois.",
+          "Sous le coup d'une hausse des prix des carburants et de certains produits alimentaires après la sécheresse exceptionnelle de l'été, deux Français sur trois (67%) ont le sentiment que leur pouvoir d'achat a baissé ces derniers mois."
+        ]
+      },
+      {
+        "id": "F2",
+        "group": "G1",
+        "fact": "Ce ressenti est en hausse de 11 points selon un sondage de l'institut Elabe publié jeudi.",
+        "excerpt": "Un ressenti en hausse de 11 points, selon un sondage de l'institut Elabe publié jeudi.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "supporting"
+      },
+      {
+        "id": "F3",
+        "group": "G1",
+        "fact": "Ce ressenti a augmenté de 11 points selon un sondage de l'institut Elabe publié le 2026-09-08 (jeudi).",
+        "excerpt": "Un ressenti en hausse de 11 points, selon un sondage de l'institut Elabe publié jeudi.",
+        "source": "",
+        "date": "",
+        "status": "",
+        "role": "supporting"
+      }
+    ],
+    "core_fact_ids": [
+      "F1"
+    ],
+    "supporting_fact_ids": [
+      "F2",
+      "F3"
+    ],
+    "fact_lineage": {
+      "raw_facts": 4,
+      "unique_information_units": 3,
+      "merged_facts": 1,
+      "merge_pairs": [
+        [
+          "F1",
+          "F3"
+        ]
+      ],
+      "candidate_pairs": 2
+    }
+  },
+  "created_at": 1789202210.7873168,
+  "pid": 14912
+}

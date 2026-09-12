@@ -7,13 +7,13 @@ from ollama import chat
 from config import MODEL
 
 
-FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.6.4-safe-coverage-stage-delete"
+FACT_GUARD_REPAIR_VERSION = "fact-guard-repair-v1.6.5-fast-cpu-safe-coverage-stage-delete"
 
-NUM_THREADS = max(1, int(os.getenv("FACT_GUARD_NUM_THREADS", "16")))
-NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
-NUM_BATCH = max(64, int(os.getenv("FACT_GUARD_NUM_BATCH", "512")))
-REPAIR_CTX = max(4096, int(os.getenv("FACT_GUARD_REPAIR_CTX", "4096")))
-REPAIR_TOKENS = max(220, int(os.getenv("FACT_GUARD_REPAIR_TOKENS", "300")))
+NUM_THREADS = os.getenv("FACT_GUARD_NUM_THREADS", "").strip()
+NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "6144")))
+NUM_BATCH = os.getenv("FACT_GUARD_NUM_BATCH", "").strip()
+REPAIR_CTX = max(4096, int(os.getenv("FACT_GUARD_REPAIR_CTX", "6144")))
+REPAIR_TOKENS = max(200, int(os.getenv("FACT_GUARD_REPAIR_TOKENS", "240")))
 
 
 _ARTICLE_FORMAT = {
@@ -421,21 +421,12 @@ one or more blocking factual errors and/or paragraph-level repetition.
 SOURCE MATERIAL is the ONLY factual authority.
 
 GLOBAL SAFETY RULES:
-- Fix ONLY the listed issue.
-- Preserve all other supported article content exactly where possible.
-- Do NOT rewrite unaffected paragraphs or sentences.
-- Do NOT reorder paragraphs or consolidate/split paragraphs unless strictly
-  required to resolve the listed issue.
-- Do NOT regenerate the article from scratch.
-- Do NOT add any new fact, context, motive, date, number, quote, event,
-  entity, role, or status.
-- Do NOT use outside knowledge.
-- Do NOT infer missing information.
-- Preserve uncertainty when the source is uncertain.
-- Keep the article in its existing language.
-- Issue types may be normalized only for selecting a safe repair rule; the actual issue claim, reason, and source excerpt remain the authoritative repair target.
-- Return ONLY valid article JSON matching the required schema.
-- The universal article schema uses paragraphs only. Do not return intro, sections, FAQ, or other legacy fields.
+- Fix ONLY the listed blocking issue(s), using SOURCE MATERIAL as the only authority.
+- Preserve every unaffected claim, paragraph, title, description and H1.
+- Do NOT regenerate, reorder, expand, condense, or stylistically rewrite the article.
+- Do NOT add/infer any fact, date, number, quote, entity, role, status or context.
+- Preserve uncertainty and existing language.
+- Return ONLY valid article JSON with title, description, h1 and paragraphs.
 
 ISSUE-SPECIFIC RULES:
 {issue_rules}
@@ -459,8 +450,8 @@ ARTICLE:
             "top_k": 40,
             "num_ctx": REPAIR_CTX,
             "num_predict": REPAIR_TOKENS,
-            "num_batch": NUM_BATCH,
-            "num_thread": NUM_THREADS,
+            **({"num_batch": max(64, int(NUM_BATCH))} if NUM_BATCH else {}),
+            **({"num_thread": max(1, int(NUM_THREADS))} if NUM_THREADS else {}),
         },
         format=_ARTICLE_FORMAT,
     )
