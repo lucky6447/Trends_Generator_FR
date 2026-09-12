@@ -23,8 +23,8 @@ from config import MAX_ARTICLES_PER_RUN, LANGUAGE, SOURCE_FIRST, TREND_DIR, RUN_
 from rss import fetch_trends
 from rss_source_discovery import fetch_source_stories
 from news import fetch_news, fetch_news_discovery, hydrate_story_sources, hydrate_news_items
-from ollama_client import generate, extract_evidence, validate_article_structure, substantive_story_value_gate
-from ollama import chat
+from ollama_client import generate
+from ollama_client import OLLAMA_CLIENT
 from config import MODEL
 
 # Minimum confidence required before rescuing a safe semantic sub-cluster.
@@ -91,163 +91,9 @@ def _article_text(article):
     return " ".join(str(value) for value in parts if value).strip()
 
 
-def validate_language_integrity(article):
-    """Fail closed on obvious script leakage, instruction leakage, or clear wrong-language output."""
-    text = _article_text(article)
-    if not text:
-        raise ValueError("Language integrity check failed: empty article text.")
 
-    language = str(LANGUAGE or "").strip().casefold()
-    cyrillic_allowed = language in {"bulgarian", "bg", "български"}
-    language_aliases = {
-        "english": "en", "en": "en", "en-us": "en", "en-gb": "en",
-        "german": "de", "de": "de", "deutsch": "de",
-        "french": "fr", "fr": "fr", "français": "fr",
-        "italian": "it", "it": "it", "italiano": "it",
-        "spanish": "es", "es": "es", "español": "es",
-        "indonesian": "id", "id": "id", "bahasa indonesia": "id",
-        "bulgarian": "bg", "bg": "bg", "български": "bg",
-    }
-    target_lang = language_aliases.get(language, language)
-
-    latin_languages = {"en", "de", "fr", "it", "es", "id"}
-
-    # Deterministic script leakage detection remains unchanged in purpose.
-    forbidden_scripts = []
-    for ch in text:
-        if not ch.isalpha():
-            continue
-        name = unicodedata.name(ch, "")
-        if "CJK UNIFIED IDEOGRAPH" in name or "HIRAGANA" in name or "KATAKANA" in name or "HANGUL" in name:
-            forbidden_scripts.append("CJK/East Asian")
-        elif "ARABIC" in name:
-            forbidden_scripts.append("Arabic")
-        elif "HEBREW" in name:
-            forbidden_scripts.append("Hebrew")
-        elif "DEVANAGARI" in name:
-            forbidden_scripts.append("Devanagari")
-        elif "THAI" in name:
-            forbidden_scripts.append("Thai")
-        elif "CYRILLIC" in name and target_lang in latin_languages:
-            forbidden_scripts.append("Cyrillic")
-
-    lower = text.casefold()
-    leakage_markers = (
-        "return only the required json",
-        "locked evidence:",
-        "final entitlement check",
-        "you are a professional",
-        "write a clear trendcurrent news article",
-        "article generator",
-        "do not pad, speculate, manufacture context",
-    )
-    matched = [marker for marker in leakage_markers if marker in lower]
-
-    if forbidden_scripts:
-        scripts = ", ".join(sorted(set(forbidden_scripts)))
-        raise ValueError(f"Language integrity check failed: forbidden script detected ({scripts}).")
-    if matched:
-        raise ValueError("Language integrity check failed: generator/instruction leakage detected.")
-
-    if target_lang in latin_languages:
-        # The previous guard only checked Unicode script. That cannot distinguish
-        # English from Italian/German/French/Spanish/Indonesian because all use Latin.
-        # This is a deterministic target-language check: common function/content
-        # words and language-specific morphology are scored against the full article.
-        #
-        # Proper names, publisher names and internationally used terms are not enough
-        # to fail the article. We reject only a clear competing-language signal.
-        tokens = re.findall(r"[a-zà-ÿ]+", unicodedata.normalize("NFKC", text).casefold())
-        if len(tokens) >= 18:
-            signatures = {
-                "en": {
-                    "the","and","of","to","in","for","on","with","from","that","this",
-                    "was","were","has","have","had","are","is","as","by","at","after",
-                    "before","will","said","about","into","over","their","they","which",
-                    "also","more","than","its","who","what","when","how","new","news",
-                },
-                "de": {
-                    "der","die","das","und","von","zu","den","dem","des","ein","eine",
-                    "einer","einem","einen","ist","sind","war","wurde","wurden","mit",
-                    "auf","für","im","in","aus","nach","über","auch","nicht","sich",
-                    "als","bei","hat","haben","wie","dass","durch","werden","wird",
-                },
-                "fr": {
-                    "le","la","les","des","du","de","un","une","et","en","dans","pour",
-                    "sur","avec","par","est","sont","était","ont","a","au","aux","ce",
-                    "cette","ces","qui","que","pas","plus","mais","comme","après",
-                    "avant","leur","leurs","dans","entre","vers","selon",
-                },
-                "it": {
-                    "il","lo","la","i","gli","le","di","del","della","dei","degli",
-                    "delle","un","uno","una","e","che","in","con","per","su","da",
-                    "al","alla","agli","alle","è","sono","era","sono","ha","hanno",
-                    "non","anche","come","dopo","prima","nel","nella","nelle","degli",
-                    "questa","questo","quello","secondo",
-                },
-                "es": {
-                    "el","la","los","las","del","de","un","una","unos","unas","y",
-                    "que","en","con","por","para","sobre","desde","entre","al","es",
-                    "son","era","fue","han","ha","no","también","como","más","menos",
-                    "después","antes","esta","este","estos","estas","según",
-                },
-                "id": {
-                    "yang","dan","di","ke","dari","untuk","dengan","pada","dalam",
-                    "ini","itu","akan","telah","adalah","sebagai","oleh","lebih",
-                    "juga","tidak","dapat","bisa","setelah","sebelum","tentang",
-                    "dengan","menjadi","sudah","masih","mereka","para","karena",
-                    "hingga","tersebut","bahwa","atau","serta","terhadap",
-                },
-            }
-
-            # Extra morphology/orthography signals help distinguish closely related
-            # Latin languages when function-word evidence is sparse.
-            morphology = {
-                "en": (r"\b\w+(?:ing|ed|ly)\b",),
-                "de": (r"\b\w+(?:ung|keit|heit|lich|ischen|isch)\b",),
-                "fr": (r"\b\w+(?:ment|tion|ique|eur|euse|aient|ées|és)\b",),
-                "it": (r"\b\w+(?:zione|zioni|mente|ità|ismo|are|ere|ire)\b",),
-                "es": (r"\b\w+(?:ción|ciones|mente|ando|iendo|ado|ido|ación)\b",),
-                "id": (r"\b\w+(?:kan|nya|lah|kah|pun|per|ber|ter|meng|mem|men)\b",),
-            }
-
-            scores = {lang: 0.0 for lang in signatures}
-            token_set = set(tokens)
-            for lang, words in signatures.items():
-                # Function/content words are strong signals. Cap contribution per
-                # repeated word so names or repeated phrasing cannot dominate.
-                hits = sum(1 for word in words if word in token_set)
-                freq_hits = sum(1 for token in tokens if token in words)
-                scores[lang] += hits * 1.0 + min(freq_hits, 10) * 0.35
-
-                for pattern in morphology.get(lang, ()):
-                    scores[lang] += min(len(re.findall(pattern, lower)), 6) * 0.45
-
-            ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-            best_lang, best_score = ranked[0]
-            target_score = scores.get(target_lang, 0.0)
-            second_score = ranked[1][1] if len(ranked) > 1 else 0.0
-
-            # Only fail on a strong and materially separated competing-language
-            # signal. This deliberately favors false negatives over false positives.
-            if (
-                best_lang != target_lang
-                and best_score >= 4.5
-                and best_score >= target_score + 2.5
-                and best_score >= second_score + 0.75
-            ):
-                raise ValueError(
-                    f"Language integrity check failed: target={target_lang} "
-                    f"detected={best_lang} score={best_score:.2f} target_score={target_score:.2f}."
-                )
-
-    # Unknown future languages keep the existing conservative script/leakage behavior.
-    return True
-
-# Article length is determined by the amount of usable verified evidence.
-# There is no artificial word-count target, word-count retry, or minimum
-# evidence-fact gate before substantive story-value judging. Small but concrete
-# stories are allowed to reach the unchanged substantive-value gate.
+# Article length is determined by the usable publisher source material.
+# There is no artificial word-count target or word-count retry.
 
 SKIP_PATTERNS = [
     " vs ",
@@ -862,7 +708,7 @@ SOURCES:
 """
     try:
         started = __import__("time").perf_counter()
-        raw = chat(
+        raw_response = OLLAMA_CLIENT.chat(
             model=MODEL,
             messages=[{"role": "user", "content": prompt}],
             options={
@@ -875,7 +721,7 @@ SOURCES:
             format="json",
         )
         elapsed = __import__("time").perf_counter() - started
-        content = getattr(getattr(raw, "message", None), "content", "") or ""
+        content = getattr(getattr(raw_response, "message", None), "content", "") or ""
         start_json = content.find("{")
         end_json = content.rfind("}")
         if start_json < 0 or end_json <= start_json:
@@ -1826,223 +1672,11 @@ def validate_article(article):
 
 
 # ============================================================
-def _deterministic_temporal_event_guard(evidence, trend=None, reference_date=None):
-    """Reject only a narrow, high-confidence temporal/event mismatch in locked CORE facts.
-
-    This is not a general factual audit. It rejects materially stale CORE events:
-    an explicit topic-year conflict, a current-year CORE event mixed with a materially
-    older CORE event, or a CORE event whose explicit years are all materially older
-    than the current run year without a verified current-year development.
-    SUPPORTING facts are ignored because they may legitimately provide historical
-    context. No LLM call, inference, repair, or regeneration is performed.
-    """
-    if not isinstance(evidence, dict):
-        raise ValueError("Temporal/event guard requires an evidence object.")
-
-    facts = evidence.get("facts", [])
-    if not isinstance(facts, list) or not facts:
-        return {"status": "PASS", "checked": False, "reason": "no locked facts"}
-
-    year_re = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
-    core_facts = []
-    for item in facts:
-        if not isinstance(item, dict):
-            continue
-        if str(item.get("role", "")).strip().casefold() != "core":
-            continue
-        fact_text = str(item.get("fact", "") or "").strip()
-        years = sorted({int(y) for y in year_re.findall(fact_text)})
-        if years:
-            core_facts.append({"id": str(item.get("id", "")), "fact": fact_text, "years": years})
-
-    if not core_facts:
-        return {"status": "PASS", "checked": False, "reason": "no explicit years in CORE facts"}
-
-    topic = str((trend or {}).get("title", "") or "").strip()
-    topic_years = sorted({int(y) for y in year_re.findall(topic)})
-    core_years = sorted({year for item in core_facts for year in item["years"]})
-    current_year = getattr(reference_date, "year", None)
-
-    if topic_years:
-        conflicts = sorted({
-            (topic_year, fact_year)
-            for topic_year in topic_years
-            for fact_year in core_years
-            if abs(topic_year - fact_year) >= 2
-        })
-        if conflicts:
-            print(
-                "[TEMPORAL/EVENT GUARD] REJECT | "
-                f"topic_years={topic_years} | core_years={core_years} | conflicts={conflicts}"
-            )
-            return {
-                "status": "REJECT",
-                "reason": "explicit topic year conflicts with CORE event year",
-                "topic_years": topic_years,
-                "core_years": core_years,
-                "conflicts": conflicts,
-            }
-
-    if current_year is not None and current_year in core_years:
-        older_core_years = [year for year in core_years if year <= current_year - 2]
-        if older_core_years:
-            print(
-                "[TEMPORAL/EVENT GUARD] REJECT | "
-                f"current_year={current_year} | core_years={core_years} | "
-                f"older_core_years={older_core_years}"
-            )
-            return {
-                "status": "REJECT",
-                "reason": "current-year CORE event mixed with materially older CORE event",
-                "current_year": current_year,
-                "core_years": core_years,
-                "older_core_years": older_core_years,
-            }
-
-    # A fresh source is not enough to make an old event a current story.
-    # If every explicit CORE year is materially older than the run year, there
-    # is no verified current-year development in the locked CORE evidence.
-    # Supporting facts may still contain historical context; only CORE facts
-    # determine whether the concrete story itself is stale.
-    if current_year is not None and core_years:
-        materially_old_core_years = [
-            year for year in core_years if year <= current_year - 2
-        ]
-        if materially_old_core_years and current_year not in core_years:
-            print(
-                "[TEMPORAL/EVENT GUARD] REJECT | "
-                f"current_year={current_year} | core_years={core_years} | "
-                f"materially_old_core_years={materially_old_core_years} | "
-                "reason=historical CORE event without current-year development"
-            )
-            return {
-                "status": "REJECT",
-                "reason": "historical CORE event without current-year development",
-                "current_year": current_year,
-                "core_years": core_years,
-                "materially_old_core_years": materially_old_core_years,
-            }
-
-    print(
-        "[TEMPORAL/EVENT GUARD] PASS | "
-        f"topic_years={topic_years or []} | core_years={core_years or []}"
-    )
-    return {"status": "PASS", "checked": True, "topic_years": topic_years, "core_years": core_years}
 
 
 # ============================================================
-def _enrich_evidence_for_generation(evidence, trend):
-    """
-    Add deterministic topic context to the already locked evidence.
-
-    The article generator receives the evidence object, not the original trend prompt.
-    Keeping the exact selected topic inside that object reduces cross-story contamination
-    when Google News returns multiple related pages.
-    """
-    if not isinstance(evidence, dict):
-        raise Exception("Evidence lock is not an object.")
-
-    enriched = dict(evidence)
-    topic = str(trend.get("title", "")).strip()
-
-    if topic:
-        enriched["selected_topic"] = topic
-
-    # IMPORTANT: Source/publisher attribution is not part of the article narrative.
-    # The model must synthesize the locked facts into a continuous news story.
-    # Source names/headlines may be used internally for provenance, but must not
-    # become "X reported..." / "Y said..." prose unless the attribution itself
-    # is an essential verified fact (for example, an official statement).
-    enriched["editorial_generation_policy"] = (
-        "NARRATIVE SYNTHESIS: Write the article as an original, continuous news "
-        "story from the locked verified facts. Do not organize paragraphs by source. "
-        "Do not mention publisher names, websites, source headlines, or phrases such "
-        "as 'reported by', 'according to [publisher]', 'X has reported', 'Y published', "
-        "or similar source-digest wording. State the verified information directly. "
-        "Only retain attribution when who made the statement or which official body "
-        "confirmed it is itself an essential part of the verified fact. Never use a "
-        "source headline to add specificity that the locked evidence does not support."
-    )
-
-    # CORE/SUPPORTING roles are preserved from the locked evidence. Supporting
-    # facts are optional context and must not be promoted to mandatory coverage.
-    #
-    # IMPORTANT: Do not pass publisher/source headlines into article generation.
-    # Headlines are discovery metadata and can contain claims that are stronger,
-    # newer, or more specific than the source body. The locked evidence facts are
-    # the sole factual authority for generation.
-    #
-    return enriched
 
 
-def _run_repetition_guard(article, generation_evidence, event_name="repetition_guard"):
-    """Cheap deterministic post-generation repetition gate.
-
-    This gate is deterministic and blocks only obvious paragraph duplication.
-    It never calls Ollama and never repairs or regenerates the article.
-    """
-    import re
-
-    paragraphs = article.get("paragraphs", []) if isinstance(article, dict) else []
-    paragraphs = [str(p).strip() for p in paragraphs if str(p).strip()]
-    paragraph_count = len(paragraphs)
-
-    def words(text):
-        return [w for w in re.findall(r"[\w’'-]+", text.casefold()) if len(w) > 2]
-
-    def shingles(tokens, n=5):
-        return {tuple(tokens[i:i+n]) for i in range(len(tokens)-n+1)}
-
-    repeated_pairs = []
-    redundant = 0
-    for i in range(paragraph_count):
-        a = words(paragraphs[i])
-        sa = shingles(a)
-        for j in range(i + 1, paragraph_count):
-            b = words(paragraphs[j])
-            if not a or not b:
-                continue
-            sb = shingles(b)
-            if sa and sb:
-                inter = len(sa & sb)
-                union = len(sa | sb)
-                similarity = inter / union if union else 0.0
-            else:
-                aset, bset = set(a), set(b)
-                similarity = len(aset & bset) / max(1, min(len(aset), len(bset)))
-
-            # Very high phrase overlap means the later paragraph is almost certainly
-            # restating the same prose. This intentionally does not try to judge
-            # semantic paraphrase; false positives would be worse than missed nuances.
-            if similarity >= 0.72:
-                repeated_pairs.append([i + 1, j + 1])
-
-    redundant = len({pair[1] for pair in repeated_pairs})
-    status = "REJECT" if repeated_pairs else "PASS"
-    reason = (
-        "obvious paragraph duplication detected" if repeated_pairs
-        else "no obvious paragraph duplication"
-    )
-
-    repetition = {
-        "status": status,
-        "reason": reason,
-        "paragraph_count": paragraph_count,
-        "paragraphs_with_new_information": paragraph_count - redundant,
-        "redundant_paragraphs": redundant,
-        "repeated_information_units": len(repeated_pairs),
-        "repeated_pairs": repeated_pairs,
-        "unique_information_units": max(0, paragraph_count - redundant),
-        "information_density": round((paragraph_count - redundant) / paragraph_count, 2) if paragraph_count else 0.0,
-    }
-
-    print(
-        f"[REPETITION GUARD] {status} | deterministic | "
-        f"paragraphs={paragraph_count} | repeated_pairs={len(repeated_pairs)}"
-    )
-    monitor.candidate_event(event_name, **repetition)
-    return repetition
-# ============================================================
 # Cross-run Story Identity Guard
 #
 # Existing-story title matching is useful but cannot close the race where two
@@ -2108,98 +1742,108 @@ def _cross_run_fact_similarity(a, b):
     return overlap
 
 
-def _cross_run_evidence_duplicate(current_evidence, prior_evidence):
-    """Return whether two evidence locks describe the same concrete story."""
-    if not isinstance(current_evidence, dict) or not isinstance(prior_evidence, dict):
-        return False
-
-    current_facts = current_evidence.get("facts", [])
-    prior_facts = prior_evidence.get("facts", [])
-    if not isinstance(current_facts, list) or not isinstance(prior_facts, list):
-        return False
-
-    current_facts = [str(x).strip() for x in current_facts if str(x).strip()]
-    prior_facts = [str(x).strip() for x in prior_facts if str(x).strip()]
-    if not current_facts or not prior_facts:
-        return False
-
-    matched = 0
-    matched_scores = []
-    for current in current_facts:
-        best = max(
-            (_cross_run_fact_similarity(current, prior) for prior in prior_facts),
-            default=0.0,
-        )
-        if best >= 0.50:
-            matched += 1
-            matched_scores.append(best)
-
-    # Two independently locked factual claims matching strongly is enough.
-    # One matching fact is deliberately insufficient: related stories often
-    # share a person, place, or single event detail.
-    return matched >= 2 and (
-        sum(matched_scores) / len(matched_scores) >= 0.52
-        if matched_scores else False
-    )
 
 
 def _cross_run_claim_lock():
-    """Acquire the process-safe cross-run reservation lock.
+    """Acquire the short-lived cross-run reservation mutex.
 
-    Recover a lock left behind by a hard crash only after a conservative age
-    threshold; the critical section itself normally lasts only milliseconds.
+    The mutex protects only the check+reserve critical section.  It must never
+    block production indefinitely: a lock is reclaimable when its owner PID is
+    gone, or when it is sufficiently old and no live owner can be established.
     """
     claims_dir = TREND_DIR / _CROSS_RUN_STORY_CLAIMS_DIRNAME
     claims_dir.mkdir(parents=True, exist_ok=True)
     lock_path = claims_dir / _CROSS_RUN_STORY_LOCK_NAME
 
-    for _ in range(100):
+    # This critical section normally lasts milliseconds.  Keep retries bounded
+    # so a broken/orphaned lock cannot consume an entire production run.
+    for _ in range(40):
         try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             try:
-                os.write(fd, f"pid={os.getpid()}\ntime={time.time()}\n".encode("ascii"))
+                os.write(
+                    fd,
+                    f"pid={os.getpid()}\\ntime={time.time()}\\n".encode("ascii")
+                )
             finally:
                 os.close(fd)
             return lock_path
+
         except FileExistsError:
             try:
                 age = max(0.0, time.time() - lock_path.stat().st_mtime)
+                lock_pid = None
+
+                try:
+                    lock_text = lock_path.read_text(
+                        encoding="ascii", errors="replace"
+                    )
+                    match = re.search(r"(?m)^pid=(\\d+)\\s*$", lock_text)
+                    if match:
+                        lock_pid = int(match.group(1))
+                except OSError:
+                    pass
+
+                # A live owner gets a very short grace period.  We do not wait
+                # for a potentially broken process forever.
+                if lock_pid is not None and _cross_run_pid_alive(lock_pid):
+                    time.sleep(0.05)
+                    continue
+
+                # Owner is gone/unreadable and the lock is old enough: reclaim.
                 if age >= _CROSS_RUN_STALE_LOCK_SECONDS:
-                    lock_pid = None
                     try:
-                        lock_text = lock_path.read_text(encoding="ascii", errors="replace")
-                        match = re.search(r"(?m)^pid=(\d+)\s*$", lock_text)
-                        if match:
-                            lock_pid = int(match.group(1))
-                    except OSError:
-                        lock_pid = None
-
-                    # Never steal an old lock from a still-running generator.
-                    # The lock is expected to be held only for the tiny
-                    # check+reserve critical section, so an old lock whose
-                    # owner PID is gone is safe to recover after the TTL.
-                    if lock_pid is not None and _cross_run_pid_alive(lock_pid):
-                        time.sleep(0.05)
-                        continue
-
-                    # If the lock is old but its owner PID cannot be read,
-                    # treat it as stale only when it is clearly orphaned.
-                    # This protects against permanent blockage after a hard
-                    # crash while remaining conservative about live locks.
-                    if lock_pid is not None or age >= (_CROSS_RUN_STALE_LOCK_SECONDS * 2):
                         lock_path.unlink()
                         print(
                             f"[CROSS-RUN STORY] stale reservation lock recovered | "
                             f"age={age:.1f}s | pid={lock_pid}"
                         )
-                        continue
+                    except FileNotFoundError:
+                        pass
+                    continue
+
             except FileNotFoundError:
                 continue
             except OSError:
                 pass
+
             time.sleep(0.05)
 
+    # Final recovery attempt.  If the lock is still present but its owner is
+    # not alive, remove it once rather than failing the whole article.
+    try:
+        if lock_path.exists():
+            try:
+                lock_text = lock_path.read_text(
+                    encoding="ascii", errors="replace"
+                )
+                match = re.search(r"(?m)^pid=(\\d+)\\s*$", lock_text)
+                lock_pid = int(match.group(1)) if match else None
+            except Exception:
+                lock_pid = None
+
+            if lock_pid is None or not _cross_run_pid_alive(lock_pid):
+                lock_path.unlink()
+                print(
+                    f"[CROSS-RUN STORY] orphan reservation lock recovered | "
+                    f"pid={lock_pid}"
+                )
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                try:
+                    os.write(
+                        fd,
+                        f"pid={os.getpid()}\\ntime={time.time()}\\n".encode("ascii")
+                    )
+                finally:
+                    os.close(fd)
+                return lock_path
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
     raise RuntimeError("Cross-run story reservation lock is busy.")
+
 
 def _cross_run_pid_alive(pid):
     """Return whether a local process PID currently exists."""
@@ -2256,25 +1900,14 @@ def _cross_run_claims(claims_dir):
 
     return claims
 
-def _reserve_cross_run_story(topic_title, evidence_lock):
-    """
-    Atomically reserve a concrete story across production runs.
-
-    Returns:
-      {"reserved": True, "path": "..."} -> reservation acquired.
-      dict without "reserved" -> an earlier/concurrent story is already covered.
-    """
-    if not isinstance(evidence_lock, dict):
-        return None
-
+def _reserve_cross_run_story(topic_title):
+    """Atomically reserve a story using title identity only."""
     claims_dir = TREND_DIR / _CROSS_RUN_STORY_CLAIMS_DIRNAME
     lock_path = None
     try:
         lock_path = _cross_run_claim_lock()
         existing_titles = _extract_existing_article_titles()
 
-        # First use the same conservative title identity logic already used for
-        # published HTML. This catches identical/near-identical Chris Rokos titles.
         for item in existing_titles:
             matched, ratio, common_count, coverage = _existing_story_title_match(
                 topic_title, item["title"]
@@ -2289,8 +1922,6 @@ def _reserve_cross_run_story(topic_title, evidence_lock):
                     "coverage": coverage,
                 }
 
-        # Then inspect persistent evidence identities. This catches paraphrased
-        # headlines and concurrent runs whose titles differ.
         for path, claim in _cross_run_claims(claims_dir):
             prior_title = str(claim.get("topic_title", "") or "").strip()
             if prior_title:
@@ -2307,30 +1938,10 @@ def _reserve_cross_run_story(topic_title, evidence_lock):
                         "coverage": coverage,
                     }
 
-            if _cross_run_evidence_duplicate(
-                evidence_lock,
-                claim.get("evidence_lock"),
-            ):
-                return {
-                    "reason": "reserved_story_evidence_match",
-                    "existing_title": prior_title,
-                    "path": str(path),
-                }
-
-        # Unique filename avoids collisions between different stories while the
-        # lock guarantees that the duplicate scan + reservation is atomic.
         fingerprint = hashlib.sha256(
             (
                 str(topic_title or "").strip().casefold()
-                + "\n"
-                + "\n".join(
-                    sorted(
-                        str(f).strip().casefold()
-                        for f in evidence_lock.get("facts", [])
-                        if str(f).strip()
-                    )
-                )
-                + f"\n{os.getpid()}\n{time.time_ns()}"
+                + f"\\n{os.getpid()}\\n{time.time_ns()}"
             ).encode("utf-8")
         ).hexdigest()
 
@@ -2339,7 +1950,6 @@ def _reserve_cross_run_story(topic_title, evidence_lock):
             json.dumps(
                 {
                     "topic_title": str(topic_title or "").strip(),
-                    "evidence_lock": evidence_lock,
                     "created_at": time.time(),
                     "pid": os.getpid(),
                 },
@@ -2349,11 +1959,14 @@ def _reserve_cross_run_story(topic_title, evidence_lock):
             encoding="utf-8",
         )
         return {"reserved": True, "path": str(claim_path)}
+    except Exception as exc:
+        print(f"[CROSS-RUN STORY] reservation failed: {exc}")
+        return None
     finally:
         if lock_path is not None:
             try:
-                lock_path.unlink()
-            except FileNotFoundError:
+                _release_cross_run_claim_lock(lock_path)
+            except Exception:
                 pass
 
 
@@ -2373,330 +1986,6 @@ def _release_cross_run_story_reservation(reservation):
 
 
 # ============================================================
-# Evidence -> Generation Coverage
-# ============================================================
-
-_EVIDENCE_COVERAGE_STOPWORDS = {
-    "the", "and", "for", "with", "from", "that", "this",
-    "was", "were", "has", "have", "had", "are", "is",
-    "its", "into", "after", "before", "over", "under",
-    "about", "than", "then", "they", "their", "them",
-    "there", "which", "while", "also", "been", "being",
-    "will", "would", "could", "should", "said", "says",
-    "according", "official", "officials", "new", "latest",
-    "news", "report", "reports", "story", "article",
-}
-
-
-def _evidence_coverage_tokens(text):
-    """Return conservative meaningful tokens for evidence coverage."""
-    normalized = unicodedata.normalize(
-        "NFKD",
-        str(text or ""),
-    ).encode("ascii", "ignore").decode("ascii").casefold()
-
-    return {
-        token
-        for token in re.findall(r"[a-z0-9]+", normalized)
-        if len(token) >= 3
-        and token not in _EVIDENCE_COVERAGE_STOPWORDS
-    }
-
-
-def _evidence_coverage_numbers(text):
-    """Return factual numeric tokens used as a strong coverage signal."""
-    return set(
-        re.findall(
-            r"\b\d+(?:[.,:/-]\d+)*%?\b",
-            str(text or ""),
-        )
-    )
-
-
-def _check_evidence_generation_coverage(article, generation_evidence):
-    """
-    Lightweight deterministic post-generation evidence coverage check.
-
-    Purpose:
-      Verify that locked evidence facts are actually expressed by the
-      generated article.
-
-    This is NOT:
-      - a factuality checker
-      - an LLM judge
-      - a repair mechanism
-      - a regeneration mechanism
-
-    Policy:
-      - every locked evidence fact is mandatory;
-      - 100% coverage is required;
-      - missing facts cause rejection;
-      - no repair and no regeneration are attempted.
-    """
-    facts = (
-        generation_evidence.get("facts", [])
-        if isinstance(generation_evidence, dict)
-        else []
-    )
-
-    paragraphs = (
-        article.get("paragraphs", [])
-        if isinstance(article, dict)
-        else []
-    )
-
-    facts = [
-        fact
-        for fact in facts
-        if isinstance(fact, dict)
-        and str(fact.get("id", "")).strip()
-        and str(fact.get("fact", "")).strip()
-    ]
-
-    paragraphs = [
-        str(paragraph).strip()
-        for paragraph in paragraphs
-        if str(paragraph).strip()
-    ]
-
-    if not facts:
-        result = {
-            "status": "PASS",
-            "locked_facts": 0,
-            "covered_facts": 0,
-            "coverage": 1.0,
-            "missing_fact_ids": [],
-            "covered_fact_ids": [],
-            "support_debug": {},
-        }
-
-        monitor.candidate_event(
-            "evidence_generation_coverage",
-            **result,
-        )
-
-        print(
-            "[EVIDENCE -> GENERATION COVERAGE] PASS | "
-            "locked=0 | covered=0 | coverage=1.000"
-        )
-
-        return result
-
-    if not paragraphs:
-        missing_ids = [
-            str(fact["id"]).strip()
-            for fact in facts
-        ]
-
-        result = {
-            "status": "REJECT",
-            "locked_facts": len(facts),
-            "covered_facts": 0,
-            "coverage": 0.0,
-            "missing_fact_ids": missing_ids,
-            "covered_fact_ids": [],
-            "support_debug": {},
-        }
-
-        monitor.candidate_event(
-            "evidence_generation_coverage",
-            **result,
-        )
-
-        print(
-            "[EVIDENCE -> GENERATION COVERAGE] REJECT | "
-            f"locked={len(facts)} | covered=0 | "
-            f"coverage=0.000 | missing={missing_ids}"
-        )
-
-        return result
-
-    article_text = " ".join(paragraphs)
-    article_tokens = _evidence_coverage_tokens(article_text)
-    article_numbers = _evidence_coverage_numbers(article_text)
-
-    covered_ids = []
-    missing_ids = []
-    support_debug = {}
-
-    for fact in facts:
-        fact_id = str(fact["id"]).strip()
-        fact_text = str(fact.get("fact", "")).strip()
-        excerpt = str(fact.get("excerpt", "")).strip()
-
-        reference_tokens = (
-            _evidence_coverage_tokens(fact_text)
-            | _evidence_coverage_tokens(excerpt)
-        )
-
-        fact_numbers = (
-            _evidence_coverage_numbers(fact_text)
-            | _evidence_coverage_numbers(excerpt)
-        )
-
-        overlap = len(reference_tokens & article_tokens)
-        token_coverage = (
-            overlap / len(reference_tokens)
-            if reference_tokens
-            else 0.0
-        )
-        number_match = bool(fact_numbers & article_numbers)
-
-        # Conservative coverage rule:
-        #   - numbered facts require the number + at least two meaningful tokens;
-        #   - short facts require two meaningful tokens;
-        #   - longer facts require at least three meaningful tokens and 25% coverage.
-        if fact_numbers:
-            covered = number_match and overlap >= 2
-        elif len(reference_tokens) <= 4:
-            covered = overlap >= 2
-        else:
-            covered = overlap >= 3 and token_coverage >= 0.25
-
-        support_debug[fact_id] = {
-            "overlap": overlap,
-            "reference_tokens": len(reference_tokens),
-            "token_coverage": round(token_coverage, 3),
-            "number_match": number_match,
-            "covered": covered,
-        }
-
-        if covered:
-            covered_ids.append(fact_id)
-        else:
-            missing_ids.append(fact_id)
-
-    coverage = len(covered_ids) / len(facts) if facts else 1.0
-    status = "PASS" if not missing_ids else "REJECT"
-
-    result = {
-        "status": status,
-        "locked_facts": len(facts),
-        "covered_facts": len(covered_ids),
-        "coverage": coverage,
-        "missing_fact_ids": missing_ids,
-        "covered_fact_ids": covered_ids,
-        "support_debug": support_debug,
-    }
-
-    print(
-        f"[EVIDENCE -> GENERATION COVERAGE] {status} | "
-        f"locked={len(facts)} | covered={len(covered_ids)} | "
-        f"coverage={coverage:.3f} | missing={missing_ids}"
-    )
-
-    monitor.candidate_event(
-        "evidence_generation_coverage",
-        status=status,
-        locked_facts=len(facts),
-        covered_facts=len(covered_ids),
-        coverage=coverage,
-        missing_fact_ids=missing_ids,
-    )
-
-    return result
-
-
-def generate_valid_article(prompt=None, reference_date=None, trend=None, prelocked_evidence=None):
-    """Generate once and validate without fact repair or regeneration.
-
-    Locked evidence is authoritative at extraction/lock time. After the single
-    generation pass, a lightweight deterministic coverage check verifies that
-    every locked evidence fact is expressed by the generated article.
-    """
-    try:
-        generation_evidence = _enrich_evidence_for_generation(
-            prelocked_evidence,
-            trend,
-        )
-
-        article = generate(
-            "",
-            evidence=generation_evidence,
-        )
-
-        article = _sanitize_article_markdown(article)
-        validate_article(article)
-
-        validate_article_structure(
-            article,
-            generation_evidence,
-            label="Initial newsroom article",
-        )
-
-        locked_facts = generation_evidence.get("facts", [])
-        core_fact_ids = generation_evidence.get("core_fact_ids", [])
-        supporting_fact_ids = generation_evidence.get("supporting_fact_ids", [])
-        paragraph_text = " ".join(
-            str(p) for p in article.get("paragraphs", [])
-        ).strip()
-
-        if isinstance(locked_facts, list) and len(locked_facts) >= 1:
-            print(
-                f"[EVIDENCE COVERAGE] locked_facts={len(locked_facts)} | "
-                f"core_facts={len(core_fact_ids)} | "
-                f"supporting_facts={len(supporting_fact_ids)} | "
-                f"article_words={len(paragraph_text.split())}"
-            )
-
-        evidence_coverage = _check_evidence_generation_coverage(
-            article,
-            generation_evidence,
-        )
-
-        article.pop("_declared_fact_ids", None)
-
-        if evidence_coverage.get("status") != "PASS":
-            print(
-                "[EVIDENCE -> GENERATION COVERAGE] FAIL | "
-                "article discarded; NO REPAIR; NO REGENERATION"
-            )
-            raise Exception(
-                "Generated article omitted one or more locked evidence facts."
-            )
-
-        normalized_headline = _shorten_headline(
-            article.get("title", "")
-        )
-        article["title"] = normalized_headline
-        article["h1"] = normalized_headline
-
-        article = enforce_headline_policy(article, trend)
-        validate_article(article)
-        validate_language_integrity(article)
-        print("[LANGUAGE GUARD] PASS")
-
-        repetition = _run_repetition_guard(
-            article,
-            generation_evidence,
-        )
-
-        if repetition.get("status") != "PASS":
-            print(
-                "[REPETITION GUARD] FAIL — "
-                "article discarded; NO REPAIR"
-            )
-            print(
-                json.dumps(
-                    repetition,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
-            raise Exception(
-                "Repetition Guard blocked article; publication blocked."
-            )
-
-        validate_language_integrity(article)
-        print("[LANGUAGE GUARD] FINAL ARTICLE PASS")
-
-        article["_evidence_generation_coverage"] = evidence_coverage
-        return article
-
-    except Exception as e:
-        print(f"Validation failed: {e}")
-        raise
-
 def run_git(cmd):
     print("\n" + "=" * 60)
     print("Running:", " ".join(cmd))
@@ -2738,7 +2027,7 @@ def _fetch_broad_news_fallback_seeds():
 
     Direct publisher RSS remains first choice. This fallback is supplementary
     only: every returned lead still passes the normal deterministic eligibility,
-    story discovery, evidence, substantive-value, and generation gates.
+    story discovery, source, substantive-value, and generation gates.
     """
     fallback_queries = {
         "en": ["latest news", "breaking news", "top news"],
@@ -2773,7 +2062,7 @@ def _fetch_broad_news_fallback_seeds():
 
 
 def main():
-    monitor.start_run(language=LANGUAGE, model=MODEL, pipeline="universal-evidence-lock-v3.0-ministral-all-facts-no-word-floor", max_articles=MAX_ARTICLES_PER_RUN)
+    monitor.start_run(language=LANGUAGE, model=MODEL, pipeline="direct-source-generation-v1.0-no-fact-guard-no-language-guard", max_articles=MAX_ARTICLES_PER_RUN)
     processed = load_processed()
 
     # Direct publisher RSS is the permanent discovery root.
@@ -3117,16 +2406,16 @@ def main():
                         or len(str(item.get("summary", "")).strip()) >= 120
                     ]
                     if not usable_selected_news:
-                        raise ValueError("Selected story sources have no usable factual text.")
+                        raise ValueError("Selected story sources have no usable source text.")
                     selected_news = usable_selected_news
 
                     print(
-                        f"[TOPIC FILTER] EVIDENCE USABILITY CHECK | {keyword} | "
+                        f"[SOURCE CHECK] SOURCE USABILITY CHECK | {keyword} | "
                         f"story={story_number}/{len(story_candidates)}"
                     )
 
                     if _run_budget_exhausted("before_evidence_extraction"):
-                        raise RuntimeError("run time budget exhausted before evidence extraction")
+                        raise RuntimeError("run time budget exhausted before source packaging")
                     evidence_source = _build_evidence_source(selected_news, {"selected_indices": list(range(len(selected_news)))})
                     evidence_source_chars = sum(
                         len(str(value or ""))
@@ -3144,116 +2433,27 @@ def main():
                         f"[TOPIC FILTER] Evidence source prepared | "
                         f"source_chars={evidence_source_chars}"
                     )
-                    evidence_lock = extract_evidence(evidence_source)
-
-                    temporal_event_check = _deterministic_temporal_event_guard(
-                        evidence_lock,
-                        trend=trend,
-                        reference_date=reference_date,
-                    )
-                    if temporal_event_check.get("status") != "PASS":
-                        trend["_production_status"] = "REJECT"
-                        trend["_production_reject_reason"] = temporal_event_check.get(
-                            "reason", "temporal/event guard rejected evidence"
-                        )
-                        monitor.candidate_event(
-                            "temporal_event_guard",
-                            **temporal_event_check,
-                        )
-                        monitor.finish_candidate(
-                            "REJECT",
-                            reason=f"temporal_event_guard={temporal_event_check.get('reason')}"
-                        )
-                        continue
-
-                    monitor.candidate_event(
-                        "temporal_event_guard",
-                        **temporal_event_check,
-                    )
-
-                    # FAST PATH:
-                    # extract_evidence() now returns the authoritative deduplicated
-                    # evidence + lineage state. Do not run a second generation-side
-                    # semantic dedup pass over the same locked facts.
-                    locked_facts = (
-                        evidence_lock.get("facts", [])
-                        if isinstance(evidence_lock, dict)
-                        else []
-                    )
-                    evidence_fact_count = (
-                        len(locked_facts)
-                        if isinstance(locked_facts, list)
-                        else 0
-                    )
-                    lineage = (
-                        evidence_lock.get("fact_lineage", {})
-                        if isinstance(evidence_lock, dict)
-                        else {}
-                    )
-                    unique_information_units = (
-                        int(lineage.get("unique_information_units", evidence_fact_count))
-                        if isinstance(lineage, dict)
-                        else evidence_fact_count
-                    )
-
-                    print(
-                        f"[TOPIC FILTER] SUBSTANTIVE STORY VALUE CHECK | "
-                        f"{keyword} | story={story_number}"
-                    )
-                    try:
-                        substantive_story_value_gate(evidence_lock)
-                    except Exception as substantive_error:
-                        trend["_production_status"] = "REJECT"
-                        trend["_production_reject_reason"] = str(substantive_error)
-                        monitor.candidate_event(
-                            "substantive_story_value",
-                            status="REJECT",
-                            reason=str(substantive_error),
-                            news_count=len(news),
-                            selected_source_indices=story_selection.get("selected_indices", []),
-                            selected_source_count=story_selection.get("selected_count"),
-                            evidence_source_chars=evidence_source_chars,
-                            evidence_facts=locked_facts,
-                            evidence_fact_count=evidence_fact_count,
-                        )
-                        monitor.finish_candidate(
-                            "REJECT",
-                            reason=f"substantive_value={substantive_error}",
-                        )
-                        continue
-
-                    monitor.candidate_event(
-                        "substantive_story_value",
-                        status="PASS",
-                        news_count=len(news),
-                        selected_source_indices=story_selection.get("selected_indices", []),
-                        selected_source_count=story_selection.get("selected_count"),
-                        evidence_source_chars=evidence_source_chars,
-                        evidence_facts=locked_facts,
-                        evidence_fact_count=evidence_fact_count,
-                        unique_information_units=unique_information_units,
+                    generation_source = json.dumps(
+                        evidence_source,
+                        ensure_ascii=False,
+                        indent=2,
                     )
 
                     # CROSS-RUN STORY PROTECTION:
-                    # Reserve the concrete story only after evidence is locked and
-                    # substantive value passes, but before expensive generation.
-                    # This closes both sequential and concurrent duplicate runs.
-                    cross_run_reservation = _reserve_cross_run_story(
-                        keyword,
-                        evidence_lock,
-                    )
-                    if not cross_run_reservation.get("reserved"):
+                    # Keep only the cheap title-based duplicate protection.
+                    cross_run_reservation = _reserve_cross_run_story(keyword)
+                    if not cross_run_reservation or not cross_run_reservation.get("reserved"):
                         trend["_production_status"] = "REJECT"
                         trend["_production_reject_reason"] = "story already covered across production runs"
                         monitor.candidate_event(
                             "cross_run_story_check",
                             status="REJECT",
-                            reason=cross_run_reservation.get("reason"),
-                            existing_title=cross_run_reservation.get("existing_title"),
-                            existing_file=cross_run_reservation.get("path"),
-                            similarity=cross_run_reservation.get("ratio"),
-                            common_tokens=cross_run_reservation.get("common_tokens"),
-                            coverage=cross_run_reservation.get("coverage"),
+                            reason=(cross_run_reservation or {}).get("reason"),
+                            existing_title=(cross_run_reservation or {}).get("existing_title"),
+                            existing_file=(cross_run_reservation or {}).get("path"),
+                            similarity=(cross_run_reservation or {}).get("ratio"),
+                            common_tokens=(cross_run_reservation or {}).get("common_tokens"),
+                            coverage=(cross_run_reservation or {}).get("coverage"),
                         )
                         monitor.finish_candidate(
                             "REJECT",
@@ -3269,53 +2469,34 @@ def main():
                     )
 
                     print(
-                        f"[TOPIC FILTER] EVIDENCE USABILITY PASS | "
-                        f"facts={evidence_fact_count} | {keyword} | story={story_number}"
+                        f"[TOPIC FILTER] SOURCE READY | "
+                        f"sources={len(selected_news)} | {keyword} | story={story_number}"
                     )
                     monitor.candidate_event(
-                        "evidence_locked",
+                        "source_ready",
                         news_count=len(news),
                         selected_source_indices=story_selection.get("selected_indices", []),
                         selected_source_count=story_selection.get("selected_count"),
-                        evidence_source_chars=evidence_source_chars,
-                        evidence_facts=locked_facts,
-                        evidence_fact_count=evidence_fact_count,
-                        evidence_lock=evidence_lock,
+                        source_chars=evidence_source_chars,
                     )
 
                     if _run_budget_exhausted("before_article_generation"):
                         raise RuntimeError("run time budget exhausted before article generation")
-                    article = generate_valid_article(
-                        reference_date=reference_date,
-                        trend=trend,
-                        prelocked_evidence=evidence_lock,
-                    )
 
-                    evidence_coverage = article.pop(
-                        "_evidence_generation_coverage",
-                        {},
-                    )
+                    article = generate(generation_source)
+
+                    # Lightweight deterministic sanity checks only.
+                    # These are not fact, language, temporal, or repair guards.
+                    validate_article(article)
+                    enforce_headline_policy(article, trend)
+
                     _paragraph_text = " ".join(
                         str(p) for p in article.get("paragraphs", [])
                     ).strip()
-                    _locked_facts = (
-                        evidence_lock.get("facts", [])
-                        if isinstance(evidence_lock, dict)
-                        else []
-                    )
                     monitor.candidate_event(
                         "article_generated",
                         article=article,
                         article_word_count=len(_paragraph_text.split()),
-                        evidence_fact_count=(
-                            len(_locked_facts)
-                            if isinstance(_locked_facts, list)
-                            else None
-                        ),
-                        evidence_facts=_locked_facts,
-                        evidence_coverage=evidence_coverage.get("coverage"),
-                        evidence_covered_facts=evidence_coverage.get("covered_facts"),
-                        evidence_missing_fact_ids=evidence_coverage.get("missing_fact_ids"),
                     )
 
                     base_slug = slugify(keyword)
@@ -3341,7 +2522,7 @@ def main():
                     article["slug"] = slug
 
                     # Images are presentation metadata, not discovery/evidence data.
-                    # Extract them only after the article has passed every quality gate.
+                    # Extract them only after the article has passed lightweight validation.
                     selected_news = hydrate_news_items(selected_news, include_images=True)
                     selected_news = _ensure_publisher_images(selected_news)
                     rendered_html = render_article(article, news=selected_news)

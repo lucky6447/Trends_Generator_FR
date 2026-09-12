@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Any, Dict, List
 
-from ollama import Client
+from ollama import chat
 from config import MODEL
 
 
@@ -27,11 +27,10 @@ from config import MODEL
 # Design:
 #   1) deterministic checks for obvious contradictions
 #   2) independent Ollama audit for semantic/source-grounding issues
-#   3) optional single-shot targeted evidence-coverage repair
-#      (only locked evidence facts; no new facts or regeneration)
+#   3) no automatic article rewriting
 # ============================================================
 
-FACT_GUARD_VERSION = "fact-guard-v1.3.1-single-audit-fast-cpu-safe"
+FACT_GUARD_VERSION = "fact-guard-v1.1.9-conservative-event-date-source-id"
 
 # Performance configuration:
 # Threads and batch are intentionally left to Ollama by default.
@@ -39,16 +38,6 @@ FACT_GUARD_VERSION = "fact-guard-v1.3.1-single-audit-fast-cpu-safe"
 # Explicit environment overrides remain supported for controlled testing.
 FACT_GUARD_NUM_THREADS = os.getenv("FACT_GUARD_NUM_THREADS", "").strip()
 FACT_GUARD_NUM_BATCH = os.getenv("FACT_GUARD_NUM_BATCH", "").strip()
-FACT_GUARD_TIMEOUT_SECONDS = max(60, float(os.getenv("FACT_GUARD_TIMEOUT_SECONDS", "180")))
-# CPU-friendly defaults: the audit only needs a compact JSON verdict. Lowering
-# response capacity materially reduces generation time while preserving the same
-# validation contract. Context is kept large enough for the selected-story source.
-FACT_GUARD_FAST_MODE = os.getenv("FACT_GUARD_FAST_MODE", "1").strip().lower() not in {"0", "false", "no", "off"}
-
-# Use a dedicated Ollama client so every Fact Guard request has a hard HTTP
-# timeout. The previous global chat() call could wait indefinitely when
-# Ollama stalled or became unavailable between runs.
-FACT_GUARD_OLLAMA = Client(timeout=FACT_GUARD_TIMEOUT_SECONDS)
 
 # Benchmark only: when enabled, independent focused audits run concurrently.
 # Default is OFF so the normal production behavior remains unchanged.
@@ -57,8 +46,8 @@ FACT_GUARD_PARALLEL_AUDITS = (
     in {"1", "true", "yes", "on"}
 )
 
-NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "6144")))
-AUDIT_TOKENS = max(160, int(os.getenv("FACT_GUARD_AUDIT_TOKENS", "190" if FACT_GUARD_FAST_MODE else "260")))
+NUM_CTX = max(4096, int(os.getenv("FACT_GUARD_NUM_CTX", "8192")))
+AUDIT_TOKENS = max(300, int(os.getenv("FACT_GUARD_AUDIT_TOKENS", "520")))
 
 print(f"[FACT GUARD] {FACT_GUARD_VERSION}")
 
@@ -972,8 +961,7 @@ def _downgrade_publication_date_only_event_issues(
 
 def _ollama_event_date_audit(source: str, article: Dict[str, Any], reference_date: date | None = None) -> Dict[str, Any]:
     _fact_guard_started = time.perf_counter()
-    print(f"[FACT GUARD TIMER] Ollama START | timeout={FACT_GUARD_TIMEOUT_SECONDS:.0f}s | ctx={NUM_CTX} | predict={AUDIT_TOKENS}")
-    response = FACT_GUARD_OLLAMA.chat(
+    response = chat(
         model=MODEL,
         messages=[{"role": "user", "content": _event_date_audit_prompt(source, article, reference_date)}],
         options=_fact_guard_ollama_options(
@@ -1139,8 +1127,7 @@ ARTICLE:
 
 def _ollama_entity_attribution_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
     _fact_guard_started = time.perf_counter()
-    print(f"[FACT GUARD TIMER] Ollama START | timeout={FACT_GUARD_TIMEOUT_SECONDS:.0f}s | ctx={NUM_CTX} | predict={AUDIT_TOKENS}")
-    response = FACT_GUARD_OLLAMA.chat(
+    response = chat(
         model=MODEL,
         messages=[{"role": "user", "content": _entity_attribution_audit_prompt(source, article)}],
         options=_fact_guard_ollama_options(
@@ -1213,43 +1200,94 @@ _AUDIT_FORMAT = {
 
 
 def _audit_prompt(source: str, article: Dict[str, Any]) -> str:
-    """Compact single-pass semantic Fact Guard prompt.
-
-    The production contract is unchanged: source is the only authority and the
-    audit covers unsupported facts, attribution, numbers, quotes, dates/status,
-    scope, causal claims and cross-event conflation.  The prompt is deliberately
-    compact because prompt evaluation is expensive on local CPU Ollama.
-    """
     return f"""
-You are TrendCurrent's final factual validator.
+You are an independent factual validator for TrendCurrent.
 
-SOURCE MATERIAL is the ONLY factual authority. Audit the ARTICLE for material
-factual errors. Check:
-1. unsupported or contradicted claims, numbers, names, locations, roles or quotes;
-2. wrong person/entity attribution;
-3. wrong event date, temporal state, or recent/current/upcoming framing;
-4. wrong event status, including completed vs pending/cancelled/postponed;
-5. unsupported causal/motive/connection claims;
-6. inflated scope, superlatives, or platform/provider/stage claims;
-7. conflation of facts from different events, rounds, days or matches.
+Your job is NOT to rewrite the article.
+Your job is to determine whether the ARTICLE contains material factual
+claims that are unsupported or contradicted by the SOURCE MATERIAL.
 
-Rules:
+SOURCE MATERIAL is the ONLY factual authority.
+
+STRICT RULES:
 - Do not use outside knowledge.
-- Do not penalize normal paraphrasing or omitted source details.
-- A HIGH/MEDIUM issue requires clear source support showing the article is materially wrong.
-- Use REVIEW when the source is ambiguous; REVIEW does not block publication.
-- Distinguish event dates from publication/update dates and the validation reference date.
-- Do not infer a negative event status from silence.
-- Report at most 3 material issues.
-- Each claim/reason must be concise; source_excerpt must be short and exact.
-- Return ONLY JSON. No explanation outside JSON.
+- Do not assume that a claim is true because it sounds plausible.
+- Do not require identical wording.
+- Normal journalistic paraphrasing is allowed.
+- Flag a claim when the source does not support it.
+- Flag wrong names, roles, dates, numbers, locations, event status,
+  attribution, quotations, causal claims and exaggerated scope.
+- Reconstruct the chronology of important events before judging them.
+- When two or more factual claims are linked by "while", "in contrast",
+  "compared with", "versus", "whereas", "meanwhile", or similar wording,
+  verify the RELATION between the facts, not only each fact in isolation.
+- For time-bound results/statistics, bind each fact to its relevant event,
+  round, matchday, week, date, or status whenever the source provides it.
+  Do not combine a true fact from one temporal state with a true fact from
+  another temporal state as if they occurred in the same state.
+- A fact such as "Player A scored 61" and "Player B scored 74" can both be
+  source-supported while the sentence connecting them is still materially
+  wrong if 61 belongs to Round 2 and 74 belongs to Round 1.
+- Treat cross-round/cross-day/cross-match/cross-week conflation as HIGH when
+  the source explicitly establishes the conflicting temporal assignments.
+  Use REVIEW when the source does not contain enough temporal information.
+- For every person mentioned with a job/team role, verify the ROLE itself,
+  not merely that the person is associated with the club/company/entity.
+- Treat PLAYER vs MANAGER/COACH and similar role substitutions as material
+  factual errors when the source establishes the person's actual role.
+- For transfers, appointments, departures, signings and debuts, determine
+  the event date and the person's state at the article's claimed time.
+  An old/historical transfer must NOT be accepted as a new/current transfer
+  merely because the same person and destination still appear in the source.
+- Be especially careful with:
+  * "record", "lowest/highest ever", "unprecedented", "first-ever"
+  * "nationwide", "all cinemas", "everywhere"
+  * causes, motives or connections inferred from chronology
+  * people whose job title/role may have been changed
+  * old information presented as current
+  * historical transfers/events presented as newly announced
+   * results/statistics from different rounds, dates, matchdays or weeks
+     accidentally combined into one comparison or same-day narrative
+  * reported/expected/planned information presented as confirmed
+- A contextual sentence is NOT automatically wrong merely because it is
+  not word-for-word in the source. Flag it only when it makes a factual
+  claim that the source cannot reasonably support.
+- If a claim is uncertain, prefer severity REVIEW rather than HIGH.
+- HIGH means a clear material factual error or unsupported concrete claim.
+- A clearly wrong person-role attribution is HIGH.
+- A clearly wrong event chronology, such as an old transfer presented as a
+  new/current transfer, is HIGH.
+- REVIEW means the wording requires human/secondary verification.
+- Ignore style, grammar and harmless editorial wording.
 
-Output:
-{{"passed":true,"issues":[]}}
-or
-{{"passed":false,"issues":[{{"severity":"HIGH","type":"unsupported_claim","claim":"short claim","reason":"short reason","source_excerpt":"exact source excerpt"}}]}}
+For every issue, provide a short source excerpt that directly supports
+your conclusion. If no source excerpt can be identified, leave it empty
+and explain why.
 
-SOURCE:
+Return ONLY JSON.
+
+Format:
+{{
+  "passed": true,
+  "issues": []
+}}
+
+or:
+
+{{
+  "passed": false,
+  "issues": [
+    {{
+      "severity": "HIGH",
+      "type": "wrong_role",
+      "claim": "example claim",
+      "reason": "The source identifies the person differently.",
+      "source_excerpt": "short exact excerpt"
+    }}
+  ]
+}}
+
+SOURCE MATERIAL:
 {source}
 
 ARTICLE:
@@ -1257,10 +1295,160 @@ ARTICLE:
 """
 
 
+
+_TEMPORAL_AUDIT_FORMAT = {
+    "type": "object",
+    "properties": {
+        "passed": {"type": "boolean"},
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {"type": "string"},
+                    "type": {"type": "string"},
+                    "claim": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "source_excerpt": {"type": "string"},
+                },
+                "required": [
+                    "severity", "type", "claim", "reason", "source_excerpt"
+                ],
+            },
+        },
+    },
+    "required": ["passed", "issues"],
+}
+
+
+def _temporal_audit_prompt(source: str, article: Dict[str, Any]) -> str:
+    return f"""
+You are a focused temporal-consistency validator for TrendCurrent.
+
+Your ONLY task is to detect factual errors caused by combining individually
+true facts that belong to different temporal/event states.
+
+SOURCE MATERIAL is the ONLY factual authority.
+
+STRICT RULES:
+- Do not use outside knowledge.
+- Do not rewrite the article.
+- Do not reject normal paraphrasing.
+- Bind each relevant result/statistic/event to the source-supported event,
+  round, matchday, week, date, or status whenever available.
+- Inspect whether the ARTICLE connects facts as if they belong to the same
+  temporal state.
+- Pay special attention to "while", "in contrast", "compared with",
+  "versus", "whereas", "meanwhile", "but", and similar relational wording.
+- A fact being individually true is NOT enough. The relationship between
+  connected facts must also be source-supported.
+- Example:
+  Source: A = 61 in Round 2; B = 74 in Round 1; B = 70 in Round 2.
+  Article: "A shot 61, while B struggled with 74."
+  This is HIGH if the wording presents 61 and 74 as results from the same
+  relevant round/day.
+- Do NOT infer a same-round, same-day, same-match, or same-event relationship
+  merely because facts appear in the same source or article.
+- Treat different event instances involving the same person, team, club,
+  organisation, or topic as separate unless the source explicitly supports
+  their connection. This includes separate games, matches, races, appearances,
+  performances, announcements, incidents, or developments on adjacent dates.
+- A fact from Event A must not be attached to Event B merely because the same
+  entity appears in both events.
+- If the article explicitly identifies different rounds/dates/events, that is fine.
+- If the source lacks enough temporal information to decide, use REVIEW.
+- HIGH requires a clear temporal contradiction established by the source.
+- Ignore style and grammar.
+
+For every issue, provide a short exact source excerpt supporting the
+temporal conclusion. If none can be identified, leave it empty.
+
+Return ONLY JSON:
+{{
+  "passed": true,
+  "issues": []
+}}
+
+or:
+{{
+  "passed": false,
+  "issues": [
+    {{
+      "severity": "HIGH",
+      "type": "cross_round_conflation",
+      "claim": "short description of the connected claim",
+      "reason": "why the article combines different temporal states",
+      "source_excerpt": "short exact excerpt"
+    }}
+  ]
+}}
+
+SOURCE MATERIAL:
+{source}
+
+ARTICLE:
+{json.dumps(article, ensure_ascii=False)}
+"""
+
+
+def _ollama_temporal_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
+    _fact_guard_started = time.perf_counter()
+    response = chat(
+        model=MODEL,
+        messages=[{"role": "user", "content": _temporal_audit_prompt(source, article)}],
+        options=_fact_guard_ollama_options(
+            temperature=0.0,
+            num_predict=AUDIT_TOKENS,
+        ),
+        format=_TEMPORAL_AUDIT_FORMAT,
+    )
+
+    raw = response.message.content or ""
+    result = _extract_json_object(raw)
+
+    if not isinstance(result, dict):
+        raise ValueError("Temporal Fact Guard audit returned invalid JSON.")
+
+    issues = result.get("issues", [])
+    if not isinstance(issues, list):
+        issues = []
+
+    clean = []
+    for item in issues:
+        if not isinstance(item, dict):
+            continue
+
+        claim = str(item.get("claim", "")).strip()
+        reason = str(item.get("reason", "")).strip()
+        if not claim or not reason:
+            continue
+
+        severity = str(item.get("severity", "REVIEW")).upper()
+        if severity not in {"HIGH", "MEDIUM", "LOW", "REVIEW"}:
+            severity = "REVIEW"
+
+        clean.append({
+            "severity": severity,
+            "type": str(
+                item.get("type", "cross_fact_temporal_consistency")
+            ).strip() or "cross_fact_temporal_consistency",
+            "claim": claim,
+            "reason": reason,
+            "source_excerpt": str(item.get("source_excerpt", "")).strip(),
+            "deterministic": False,
+            "audit_layer": "focused_temporal",
+        })
+
+    _fact_guard_timer_label("temporal", _fact_guard_started)
+    return {
+        "passed": bool(result.get("passed", False)) and not clean,
+        "issues": clean,
+    }
+
+
 def _ollama_audit(source: str, article: Dict[str, Any]) -> Dict[str, Any]:
     _fact_guard_started = time.perf_counter()
-    print(f"[FACT GUARD TIMER] Ollama START | timeout={FACT_GUARD_TIMEOUT_SECONDS:.0f}s | ctx={NUM_CTX} | predict={AUDIT_TOKENS}")
-    response = FACT_GUARD_OLLAMA.chat(
+    response = chat(
         model=MODEL,
         messages=[{"role": "user", "content": _audit_prompt(source, article)}],
         options=_fact_guard_ollama_options(
@@ -1446,308 +1634,159 @@ def validate(
     article: Dict[str, Any],
     reference_date: date | None = None,
 ) -> Dict[str, Any]:
-    """
-    Production Fact Guard path.
-
-    Exactly ONE Ollama audit is used after deterministic checks. The previous
-    sequential semantic + temporal + event-date + entity audits multiplied
-    inference time without improving the publication contract enough to justify
-    the cost: the broad audit already covers all four domains.
-
-    Fail closed on infrastructure/JSON errors. REVIEW does not block; HIGH and
-    MEDIUM do.
-    """
-    started = time.perf_counter()
-
+    _fact_guard_total_started = time.perf_counter()
     if not isinstance(article, dict):
         raise ValueError("Article must be a JSON object.")
 
+    # Production callers pass the run's explicit validation date.
+    # CLI/manual callers may still use FACT_GUARD_REFERENCE_DATE.
     if reference_date is None:
         reference_date = _parse_reference_date()
 
     deterministic = _deterministic_checks(source, article)
     deterministic += _deterministic_current_state_checks(article, reference_date)
 
-    semantic = _ollama_audit(source, article)
-    all_issues = deterministic + semantic.get("issues", [])
+    temporal_signals = _temporal_consistency_signals(article)
+
+    event_date_signals = _event_date_consistency_signals(article)
+
+    # Existing focused temporal trigger remains unchanged.
+    #
+    # Additional narrow trigger:
+    # If the article contains an explicit event date and event language, and
+    # the supplied source contains multiple distinct dates that are each near
+    # explicit event language, run the temporal audit even when the article has
+    # no score/comparison wording. Publication/update dates alone do not trigger
+    # this path.
+    #
+    # This specifically covers adjacent-event conflation, where two individually
+    # true facts about the same person/team can belong to different event
+    # instances (for example, separate games on consecutive days).
+    #
+    # The helper is ONLY a trigger. The focused temporal audit remains the
+    # authority for deciding whether the facts were actually conflated.
+    run_temporal = (
+        (
+            temporal_signals["temporal"]
+            and temporal_signals["score"]
+            and temporal_signals["relation"]
+        )
+        or
+        (
+            event_date_signals["event_language"]
+            and event_date_signals["explicit_date"]
+            and _source_has_multiple_event_dates(source)
+        )
+    )
+
+    run_event_date = (
+        (
+            event_date_signals["event_language"]
+            and (
+                event_date_signals["explicit_date"]
+                or event_date_signals["freshness_language"]
+            )
+        )
+        or event_date_signals.get("event_status_language", False)
+    )
+
+    run_entity = _entity_attribution_signals(article)
+
+    # The broad semantic audit is always independent and remains mandatory.
+    # The focused audits are also independent of one another. In benchmark
+    # mode they may execute concurrently; their prompts, models, options,
+    # triggers, result parsing and issue normalization are unchanged.
+    if FACT_GUARD_PARALLEL_AUDITS:
+        jobs = {
+            "semantic": lambda: _ollama_audit(source, article),
+        }
+        if run_temporal:
+            jobs["temporal"] = lambda: _ollama_temporal_audit(source, article)
+        if run_event_date:
+            jobs["event_date"] = lambda: _ollama_event_date_audit(
+                source, article, reference_date
+            )
+        if run_entity:
+            jobs["entity_attribution"] = lambda: _ollama_entity_attribution_audit(
+                source, article
+            )
+
+        parallel_started = time.perf_counter()
+        results: Dict[str, Dict[str, Any]] = {}
+
+        with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+            futures = {
+                executor.submit(job): name
+                for name, job in jobs.items()
+            }
+            for future in as_completed(futures):
+                name = futures[future]
+                results[name] = future.result()
+
+        print(
+            f"[FACT GUARD TIMER] parallel audit group END | "
+            f"elapsed={time.perf_counter() - parallel_started:.2f}s | "
+            f"audits={len(jobs)}"
+        )
+
+        semantic = results["semantic"]
+        temporal = results.get("temporal", {"issues": []})
+        event_date = results.get("event_date", {"issues": []})
+        entity_attribution = results.get(
+            "entity_attribution", {"issues": []}
+        )
+    else:
+        semantic = _ollama_audit(source, article)
+
+        temporal = {"issues": []}
+        if run_temporal:
+            temporal = _ollama_temporal_audit(source, article)
+
+        event_date = {"issues": []}
+        if run_event_date:
+            event_date = _ollama_event_date_audit(
+                source, article, reference_date
+            )
+
+        entity_attribution = {"issues": []}
+        if run_entity:
+            entity_attribution = _ollama_entity_attribution_audit(
+                source, article
+            )
+
+    all_issues = (
+        deterministic
+        + semantic.get("issues", [])
+        + temporal.get("issues", [])
+        + event_date.get("issues", [])
+        + entity_attribution.get("issues", [])
+    )
+
+    # Normalize only correlated duplicate reports before counting blockers.
+    # Detection remains independent; this step only makes one underlying
+    # repairable incident count as one blocking issue.
     all_issues = _deduplicate_correlated_blockers(all_issues)
 
+    # REVIEW alone does not automatically reject an article.
+    # HIGH / MEDIUM are publication blockers.
     blocking = [
         issue for issue in all_issues
-        if str(issue.get("severity", "")).upper() in {"HIGH", "MEDIUM"}
-    ]
-    reviews = [
-        issue for issue in all_issues
-        if str(issue.get("severity", "")).upper() == "REVIEW"
+        if issue.get("severity") in {"HIGH", "MEDIUM"}
     ]
 
     status = "FLAG" if blocking else "PASS"
-    print(
-        f"[FACT GUARD] FINAL | status={status} | "
-        f"blocking={len(blocking)} | review={len(reviews)} | "
-        f"elapsed={time.perf_counter() - started:.2f}s | audits=1"
-    )
 
+    _fact_guard_timer_label("TOTAL", _fact_guard_total_started)
     return {
-        "fact_guard_version": FACT_GUARD_VERSION + "-single-audit",
+        "fact_guard_version": FACT_GUARD_VERSION,
         "status": status,
         "passed": status == "PASS",
         "blocking_issues": len(blocking),
-        "review_items": len(reviews),
+        "review_items": len([
+            x for x in all_issues if x.get("severity") == "REVIEW"
+        ]),
         "issues": all_issues,
     }
-
-
-
-# ============================================================
-# Targeted locked-evidence coverage repair
-# ============================================================
-
-_COVERAGE_REPAIR_FORMAT = {
-    "type": "object",
-    "properties": {
-        "title": {"type": "string"},
-        "description": {"type": "string"},
-        "h1": {"type": "string"},
-        "paragraphs": {
-            "type": "array",
-            "minItems": 1,
-            "items": {"type": "string"},
-        },
-    },
-    "required": ["title", "description", "h1", "paragraphs"],
-}
-
-
-def _coverage_repair_schema_ok(article: Dict[str, Any]) -> bool:
-    """Validate the strict universal article shape used by generate.py."""
-    if not isinstance(article, dict):
-        return False
-
-    required = ("title", "description", "h1", "paragraphs")
-    if any(key not in article for key in required):
-        return False
-
-    for key in ("title", "description", "h1"):
-        if not isinstance(article[key], str):
-            return False
-
-    paragraphs = article["paragraphs"]
-    if not isinstance(paragraphs, list) or not 1 <= len(paragraphs) <= 20:
-        return False
-
-    return all(isinstance(p, str) and p.strip() for p in paragraphs)
-
-
-def repair_evidence_coverage(
-    article: Dict[str, Any],
-    generation_evidence: Dict[str, Any],
-    coverage_result: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Perform ONE targeted repair when the generated article omitted locked facts.
-
-    This is deliberately separate from factual-error repair, but lives in the
-    same Fact Guard module so there is no additional repair module.
-
-    Safety contract:
-      - Only fact IDs reported by the deterministic coverage result may be added.
-      - The locked evidence is the ONLY factual authority.
-      - No outside knowledge, inference, new context, or new facts.
-      - Title, description and H1 are immutable.
-      - Paragraph count and order are immutable.
-      - Only paragraph wording may change, and only as much as needed to express
-        the missing locked fact(s).
-      - Exactly ONE Ollama call is made.
-      - The caller MUST rerun the deterministic coverage check.
-      - If the returned article violates any invariant, fail closed.
-    """
-    if not isinstance(article, dict):
-        raise ValueError("Coverage repair requires an article JSON object.")
-    if not isinstance(generation_evidence, dict):
-        raise ValueError("Coverage repair requires generation evidence.")
-    if not isinstance(coverage_result, dict):
-        raise ValueError("Coverage repair requires a coverage result.")
-
-    unsupported_ids = [
-        str(fid).strip()
-        for fid in coverage_result.get("unsupported_fact_ids", [])
-        if str(fid).strip()
-    ]
-    unsupported_ids = list(dict.fromkeys(unsupported_ids))
-    if not unsupported_ids:
-        raise ValueError("Coverage repair requires at least one missing locked fact.")
-
-    facts = generation_evidence.get("facts", [])
-    if not isinstance(facts, list):
-        raise ValueError("Generation evidence facts are unavailable.")
-
-    fact_by_id = {
-        str(f.get("id", "")).strip(): f
-        for f in facts
-        if isinstance(f, dict) and str(f.get("id", "")).strip()
-    }
-
-    missing_facts = []
-    unresolved_ids = []
-    core_ids = {
-        str(fid).strip()
-        for fid in (generation_evidence.get("core_fact_ids", []) or [])
-        if str(fid).strip()
-    }
-    supporting_ids = {
-        str(fid).strip()
-        for fid in (generation_evidence.get("supporting_fact_ids", []) or [])
-        if str(fid).strip()
-    }
-
-    for fid in unsupported_ids:
-        fact = fact_by_id.get(fid)
-        if not fact:
-            unresolved_ids.append(fid)
-            continue
-
-        fact_text = str(fact.get("fact", "")).strip()
-        excerpt = str(fact.get("excerpt", "")).strip()
-        if not fact_text:
-            unresolved_ids.append(fid)
-            continue
-
-        missing_facts.append({
-            "id": fid,
-            "role": (
-                "CORE" if fid in core_ids
-                else "SUPPORTING" if fid in supporting_ids
-                else "LOCKED"
-            ),
-            "fact": fact_text,
-            "excerpt": excerpt,
-        })
-
-    if unresolved_ids:
-        raise ValueError(
-            "Coverage repair could not resolve locked fact IDs: "
-            + ", ".join(unresolved_ids)
-        )
-
-    original_paragraphs = list(article.get("paragraphs", []))
-    if not _coverage_repair_schema_ok(article):
-        raise ValueError("Coverage repair received invalid article schema.")
-
-    evidence_payload = json.dumps(
-        missing_facts,
-        ensure_ascii=False,
-        indent=2,
-    )
-    article_payload = json.dumps(
-        article,
-        ensure_ascii=False,
-        indent=2,
-    )
-
-    prompt = f"""
-You are TrendCurrent's targeted LOCKED-EVIDENCE COVERAGE repair engine.
-
-The article was already generated and is otherwise structurally valid.
-A deterministic coverage guard found that one or more LOCKED EVIDENCE facts
-were not explicitly expressed in the article.
-
-Your ONLY task is to make the smallest paragraph-level edit necessary to
-express the missing locked facts.
-
-SOURCE OF TRUTH:
-The LOCKED EVIDENCE below is the ONLY factual authority.
-Do not use outside knowledge and do not use facts merely implied by the topic.
-
-STRICT SAFETY CONTRACT:
-- Add ONLY the missing locked facts listed below.
-- Do NOT add any fact that is not explicitly present in the locked evidence.
-- Do NOT invent, infer, calculate, generalize, or enrich.
-- Do NOT change the title.
-- Do NOT change the description.
-- Do NOT change the H1.
-- Preserve the exact paragraph count.
-- Preserve paragraph order.
-- Do NOT create, delete, split, merge, or reorder paragraphs.
-- Change only paragraph wording where necessary to express the missing facts.
-- Preserve all already-supported factual content.
-- Do not remove an already-supported fact merely to make room for a missing fact.
-- Prefer inserting a concise source-grounded clause into the most relevant
-  existing paragraph.
-- If a missing fact is already semantically present but the deterministic
-  lexical guard did not recognize it, make the smallest wording adjustment
-  needed to expose the fact using distinctive terms from the locked evidence.
-- Do NOT improve style, flow, completeness, length, SEO, or readability except
-  where strictly necessary for the coverage repair.
-- Keep the article in its existing language.
-- Return ONLY valid article JSON.
-
-MISSING LOCKED FACTS:
-{evidence_payload}
-
-CURRENT ARTICLE:
-{article_payload}
-"""
-
-    started = time.perf_counter()
-    try:
-        response = FACT_GUARD_OLLAMA.chat(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options=_fact_guard_ollama_options(
-                temperature=0.0,
-                num_predict=max(
-                    220,
-                    int(os.getenv("FACT_GUARD_COVERAGE_REPAIR_TOKENS", "360")),
-                ),
-            ),
-            format=_COVERAGE_REPAIR_FORMAT,
-        )
-    except Exception as exc:
-        print(f"[FACT GUARD COVERAGE REPAIR] ERROR | {exc}")
-        raise ValueError("Locked-evidence coverage repair failed.") from exc
-    finally:
-        _fact_guard_timer_label("coverage_repair", started)
-
-    raw = getattr(getattr(response, "message", None), "content", "") or ""
-    repaired = _extract_json_object(raw)
-
-    if not _coverage_repair_schema_ok(repaired):
-        raise ValueError("Coverage repair returned invalid article schema.")
-
-    # Immutable metadata / structure contract.
-    if repaired.get("title") != article.get("title"):
-        raise ValueError("Coverage repair changed immutable title.")
-    if repaired.get("description") != article.get("description"):
-        raise ValueError("Coverage repair changed immutable description.")
-    if repaired.get("h1") != article.get("h1"):
-        raise ValueError("Coverage repair changed immutable H1.")
-
-    repaired_paragraphs = repaired.get("paragraphs", [])
-    if len(repaired_paragraphs) != len(original_paragraphs):
-        raise ValueError("Coverage repair changed paragraph count.")
-
-    # No non-paragraph top-level field may be added/removed/changed.
-    original_non_paragraph = {
-        key: value for key, value in article.items() if key != "paragraphs"
-    }
-    repaired_non_paragraph = {
-        key: value for key, value in repaired.items() if key != "paragraphs"
-    }
-    if repaired_non_paragraph != original_non_paragraph:
-        raise ValueError("Coverage repair changed non-paragraph article fields.")
-
-    changed = sum(
-        1 for old, new in zip(original_paragraphs, repaired_paragraphs)
-        if old != new
-    )
-    print(
-        "[FACT GUARD COVERAGE REPAIR] PASS | "
-        f"missing_locked_facts={len(missing_facts)} | "
-        f"paragraphs_changed={changed}/{len(original_paragraphs)}"
-    )
-
-    return repaired
 
 
 # ============================================================
